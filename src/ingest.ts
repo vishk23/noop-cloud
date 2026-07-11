@@ -24,6 +24,7 @@ export function ingestNoopbak(buf: Buffer, cfg: Pick<Config, "dataDir" | "mirror
   try { zip = new AdmZip(buf); } catch { throw new IngestError("bad_zip"); }
   const entry = zip.getEntries().find((e) => e.entryName.endsWith(".sqlite"));
   if (!entry) throw new IngestError("no_sqlite_entry");
+  if (entry.header.size > cfg.maxIngestBytes) throw new IngestError("too_large", `decompressed entry ${entry.header.size} > ${cfg.maxIngestBytes}`);
   const sqliteBytes = entry.getData();
   if (!sqliteBytes.subarray(0, SQLITE_MAGIC.length).equals(SQLITE_MAGIC)) throw new IngestError("bad_magic");
 

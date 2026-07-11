@@ -22,6 +22,12 @@ export function createApp(cfg: Config): express.Express {
       }
     });
 
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (err?.type === "entity.too.large") return res.status(413).json({ error: "too_large" });
+    console.error("unhandled request error", err?.message ?? err);
+    res.status(500).json({ error: "internal" });
+  });
+
   return app;
 }
 

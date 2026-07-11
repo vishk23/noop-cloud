@@ -37,6 +37,15 @@ describe("ingest", () => {
     const db = new Database(cfg().mirrorPath, { readonly: true });
     expect((db.prepare("SELECT COUNT(*) c FROM dailyMetric").get() as any).c).toBeGreaterThan(0); db.close();
   });
+  it("does not corrupt an existing mirror when a later upload fails AFTER staging (foreign db)", () => {
+    const zip = path.join(dataDir, "ok2.noopbak"); buildNoopbak(zip); ingestNoopbak(fs.readFileSync(zip), cfg());
+    const foreign = path.join(dataDir, "f2.sqlite"); const fdb = new Database(foreign); fdb.exec("CREATE TABLE x(a)"); fdb.close();
+    const z = new AdmZip(); z.addFile("noop-backup.sqlite", fs.readFileSync(foreign));
+    try { ingestNoopbak(z.toBuffer(), cfg()); expect.fail("should throw"); }
+    catch (e: any) { expect(e.code).toBe("foreign_db"); }
+    const db = new Database(cfg().mirrorPath, { readonly: true });
+    expect((db.prepare("SELECT COUNT(*) c FROM dailyMetric").get() as any).c).toBeGreaterThan(0); db.close();
+  });
 });
 
 import http from "node:http"; import { createApp } from "../src/server.js";
@@ -50,4 +59,22 @@ it("POST /ingest requires rw and swaps the mirror", async () => {
     r.end(body);
   });
   server.close(); expect(status).toBe(200);
+});
+
+it("POST /ingest with an oversized body returns 413 JSON, not an HTML error page", async () => {
+  process.env.RO_TOKEN = "ro".padEnd(40, "x"); process.env.RW_TOKEN = "rw".padEnd(40, "y");
+  const c = cfg(); c.roToken = process.env.RO_TOKEN; c.rwToken = process.env.RW_TOKEN; c.port = 0; c.maxIngestBytes = 10;
+  const body = Buffer.alloc(1000);
+  const app = createApp(c); const server = app.listen(0); const port = (server.address() as any).port;
+  const { status, contentType, json } = await new Promise<{ status: number; contentType: string | undefined; json: any }>((resolve) => {
+    const r = http.request({ port, path: "/ingest", method: "POST", headers: { authorization: `Bearer ${c.rwToken}`, "content-type": "application/octet-stream" } }, (res) => {
+      let d = ""; res.on("data", (chunk) => (d += chunk));
+      res.on("end", () => resolve({ status: res.statusCode!, contentType: res.headers["content-type"], json: JSON.parse(d) }));
+    });
+    r.end(body);
+  });
+  server.close();
+  expect(status).toBe(413);
+  expect(contentType).toMatch(/application\/json/);
+  expect(json).toEqual({ error: "too_large" });
 });
