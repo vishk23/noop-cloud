@@ -22,4 +22,22 @@ describe("query tools", () => {
     const r = workoutSummary(cfg, { from: "2026-06-10", to: "2026-06-13" });
     expect(r.workouts.some((w) => w.sport === "running")).toBe(true);
   });
+  it("query tools return structured not-ingested response before first ingest", () => {
+    const emptyDir = path.join(process.cwd(), "test/.tmp/tools-query-empty");
+    fs.rmSync(emptyDir, { recursive: true, force: true });
+    fs.mkdirSync(emptyDir, { recursive: true });
+    const cfg2 = { dataDir: emptyDir, mirrorPath: path.join(emptyDir, "mirror.sqlite"), serverDbPath: path.join(emptyDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
+
+    const metricRes = metricSeries(cfg2, { from: "2026-06-10", to: "2026-06-13" });
+    expect(metricRes.points).toEqual([]);
+    expect(metricRes.notIngested).toBe(true);
+
+    const sleepRes = sleepSummary(cfg2, { from: "2026-06-10", to: "2026-06-13" });
+    expect(sleepRes.sessions).toEqual([]);
+    expect(sleepRes.notIngested).toBe(true);
+
+    const workoutRes = workoutSummary(cfg2, { from: "2026-06-10", to: "2026-06-13" });
+    expect(workoutRes.workouts).toEqual([]);
+    expect(workoutRes.notIngested).toBe(true);
+  });
 });
