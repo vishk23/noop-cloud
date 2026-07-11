@@ -1,10 +1,14 @@
 import { z } from "zod";
+import fs from "node:fs";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "../config.js";
 import { Mirror, Family } from "../mirror.js";
 import { latestIngest } from "../ingest.js";
 
 export function dataFreshness(cfg: Config) {
+  if (!fs.existsSync(cfg.mirrorPath)) {
+    return { mirrorAgeSeconds: null, lastIngestAt: null, latestDataDay: null, sources: [], notIngested: true };
+  }
   const m = new Mirror(cfg.mirrorPath);
   try {
     const li = latestIngest(cfg);
@@ -19,6 +23,9 @@ export function dataFreshness(cfg: Config) {
 }
 
 export function healthSnapshot(cfg: Config, args: { days?: number }) {
+  if (!fs.existsSync(cfg.mirrorPath)) {
+    return { days: [], notIngested: true };
+  }
   const days = Math.max(1, Math.min(args.days ?? 3, 31));
   const m = new Mirror(cfg.mirrorPath);
   try {

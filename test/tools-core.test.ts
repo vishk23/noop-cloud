@@ -23,4 +23,18 @@ describe("core tools", () => {
     expect(last.whoop?.recovery).toBe(66);
     expect(last.oura?.restingHr).toBe(53);
   });
+  it("tools return structured not-ingested response before first ingest", () => {
+    const emptyDir = path.join(process.cwd(), "test/.tmp/tools-empty");
+    fs.rmSync(emptyDir, { recursive: true, force: true });
+    fs.mkdirSync(emptyDir, { recursive: true });
+    const emptyCfg = { dataDir: emptyDir, mirrorPath: path.join(emptyDir, "mirror.sqlite"), serverDbPath: path.join(emptyDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
+
+    const freshness = dataFreshness(emptyCfg);
+    expect(freshness.sources).toEqual([]);
+    expect(freshness.notIngested).toBe(true);
+
+    const snapshot = healthSnapshot(emptyCfg, { days: 3 });
+    expect(snapshot.days).toEqual([]);
+    expect(snapshot.notIngested).toBe(true);
+  });
 });
