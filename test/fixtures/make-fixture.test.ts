@@ -27,4 +27,17 @@ describe("fixtures", () => {
     const entries = new AdmZip(p).getEntries();
     expect(entries[0].entryName).toBe("noop-backup.sqlite");
   });
+
+  it("workout rows have non-null epoch timestamps (2-digit hours)", () => {
+    const p = path.join(tmp, "m2.sqlite");
+    buildMirrorSqlite(p);
+    const db = new Database(p, { readonly: true });
+    const rows = db.prepare("SELECT startTs, endTs FROM workout").all() as any[];
+    db.close();
+    expect(rows.length).toBe(2);
+    for (const r of rows) {
+      expect(r.startTs).toBeGreaterThan(1_700_000_000);
+      expect(r.endTs).toBeGreaterThan(r.startTs);
+    }
+  });
 });

@@ -3,7 +3,7 @@ import AdmZip from "adm-zip";
 import fs from "node:fs";
 
 const DAYS = ["2026-06-10", "2026-06-11", "2026-06-12", "2026-06-13"];
-const tsOf = (day: string, h = 3) => Math.floor(new Date(`${day}T0${h}:00:00Z`).getTime() / 1000);
+const tsOf = (day: string, h = 3) => Math.floor(new Date(`${day}T${String(h).padStart(2, "0")}:00:00Z`).getTime() / 1000);
 
 export function buildMirrorSqlite(target: string): void {
   if (fs.existsSync(target)) fs.rmSync(target);
