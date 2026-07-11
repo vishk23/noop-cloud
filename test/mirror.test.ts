@@ -28,4 +28,18 @@ describe("Mirror", () => {
   it("reports latest data day across sources", () => {
     const m = new Mirror(p); expect(m.latestDataDay()).toBe("2026-06-13"); m.close();
   });
+  it("covers sleep/workout/metricSeries/hrCoverage against the fixture schema", () => {
+    const m = new Mirror(p);
+    const sleeps = m.sleepSummary({ from: "2026-06-10", to: "2026-06-13" });
+    expect(sleeps.length).toBe(8);
+    expect(sleeps[0].family).toBeDefined();
+    const workouts = m.workoutSummary({ from: "2026-06-10", to: "2026-06-13" });
+    expect(workouts.length).toBe(2);
+    expect(workouts.map((w) => w.sport).sort()).toEqual(["running", "walking"]);
+    const points = m.metricSeries({ deviceId: "oura-api", key: "oura_readiness", from: "2026-06-10", to: "2026-06-13" });
+    expect(points.length).toBe(4);
+    expect(points[0].value).toBe(78);
+    expect(m.hrCoverageDays("oura-api")).toBe(4);
+    m.close();
+  });
 });
