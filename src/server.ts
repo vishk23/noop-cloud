@@ -1,8 +1,10 @@
 import express from "express";
 import fs from "node:fs";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Config, loadConfig } from "./config.js";
 import { requireScope } from "./auth.js";
 import { ingestNoopbak, IngestError } from "./ingest.js";
+import { buildMcpServer } from "./mcp.js";
 
 export function createApp(cfg: Config): express.Express {
   fs.mkdirSync(cfg.dataDir, { recursive: true });
@@ -21,6 +23,20 @@ export function createApp(cfg: Config): express.Express {
         res.status(500).json({ error: "ingest_failed" });
       }
     });
+
+  app.post("/mcp", requireScope(cfg, "ro"), express.json({ limit: "4mb" }), async (req, res) => {
+    const server = buildMcpServer(cfg);
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    res.on("close", () => { transport.close(); server.close(); });
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    } catch (e) {
+      console.error("mcp error", e);
+      if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "internal error" }, id: null });
+    }
+  });
+  app.all("/mcp", (_req, res) => res.status(405).json({ error: "method_not_allowed" }));
 
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     if (err?.type === "entity.too.large") return res.status(413).json({ error: "too_large" });
