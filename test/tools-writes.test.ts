@@ -35,9 +35,8 @@ describe("write tools + scope", () => {
     expect(roNames).not.toContain("confirm_edit");
     // rw implies ro: the always-on tools stay visible to a read-write caller too.
     expect(rwNames).toContain("propose_edit");
-    // confirm_edit/reject_edit/undo_edit are registered by registerResolutionTools, which
-    // Task 4 leaves as a deliberate no-op seam (see the plan's Task 4/5 split) — Task 5's
-    // test/tools-resolve.test.ts is where rw-visibility of those three is verified.
+    expect(rwNames).toContain("confirm_edit");
+    expect(rwNames).toContain("undo_edit");
   });
   it("propose_edit validates, snapshots, and stages; list_pending shows it", async () => {
     const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;

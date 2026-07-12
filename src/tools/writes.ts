@@ -4,7 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "../config.js";
 import { EDIT_KINDS, EditKind, payloadSchema } from "../edits/kinds.js";
 import { captureBefore, renderDiff, EditTargetError } from "../edits/diff.js";
-import { createProposal, listPending, journalSince } from "../staging.js";
+import { createProposal, listPending, journalSince, getProposal, resolveProposal, appendJournal, markUndone } from "../staging.js";
 
 const asTool = (obj: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }], structuredContent: obj as Record<string, unknown> });
 
@@ -53,4 +53,43 @@ export function registerWriteTools(server: McpServer, cfg: Config, scope: "ro" |
 }
 
 // Task 5 implements: confirm_edit, reject_edit, undo_edit
-export function registerResolutionTools(_server: McpServer, _cfg: Config): void {}
+export function registerResolutionTools(server: McpServer, cfg: Config): void {
+  server.registerTool("confirm_edit", {
+    title: "Confirm a proposed edit",
+    description: "Apply a pending proposal to the edit journal + overlay. Requires the read-write credential. The mirror itself is never modified; corrections reach the phone in Phase 3.",
+    inputSchema: { id: z.string().min(1) },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+  }, async (a) => {
+    const resolved = resolveProposal(cfg, a.id, "confirmed");
+    if (!resolved) return asTool({ error: "not_pending" });
+    try {
+      const seq = appendJournal(cfg, { editId: resolved.id, kind: resolved.kind, payloadJSON: resolved.payloadJSON, beforeJSON: resolved.beforeJSON, rationale: resolved.rationale });
+      return asTool({ id: resolved.id, seq, applied: true, diff: resolved.diffText });
+    } catch {
+      return asTool({ id: resolved.id, applied: true, note: "already applied" }); // UNIQUE(editId) — idempotent
+    }
+  });
+
+  server.registerTool("reject_edit", {
+    title: "Reject a proposed edit",
+    description: "Discard a pending proposal (no journal entry, no data change).",
+    inputSchema: { id: z.string().min(1) },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, async (a) => {
+    const r = resolveProposal(cfg, a.id, "rejected");
+    return asTool(r ? { id: a.id, rejected: true } : { error: "not_pending" });
+  });
+
+  server.registerTool("undo_edit", {
+    title: "Undo a confirmed edit",
+    description: "Reverse a journal entry by appending an undo record (history is never deleted).",
+    inputSchema: { seq: z.number().int().min(1) },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+  }, async (a) => {
+    const target = journalSince(cfg, a.seq - 1).find((e) => e.seq === a.seq);
+    if (!target || target.kind === "undo" || target.undoneBySeq !== null) return asTool({ error: "not_undoable" });
+    const bySeq = appendJournal(cfg, { editId: "undo_" + crypto.randomBytes(5).toString("hex"), kind: "undo", payloadJSON: JSON.stringify({ targetSeq: a.seq }), beforeJSON: null, rationale: null });
+    markUndone(cfg, a.seq, bySeq);
+    return asTool({ undoneSeq: a.seq, bySeq });
+  });
+}
