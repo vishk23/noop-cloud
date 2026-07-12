@@ -13,7 +13,9 @@ const res = await fetch("https://api.anthropic.com/v1/messages", {
   },
   body: JSON.stringify({
     model: "claude-sonnet-5",
-    max_tokens: 1024,
+    // Generous cap: the tool loop (freshness + snapshot + sleep/workout + compare) burns tokens
+    // before the summary starts; 1024 risked a silent max_tokens truncation.
+    max_tokens: 4096,
     messages: [{ role: "user", content: "Write my morning health report. Call data_freshness first and state the mirror age; if it is older than 36 hours, say so plainly. Then summarize the last 3 days (recovery/strain, sleep, resting HR + HRV trend, workouts) and flag any source disagreements via compare_sources. Under 200 words. No medical advice." }],
     mcp_servers: [{
       type: "url", url: `${NOOP_CLOUD_URL.replace(/\/$/, "")}/mcp`, name: "noop-cloud",
@@ -24,6 +26,11 @@ const res = await fetch("https://api.anthropic.com/v1/messages", {
 });
 if (!res.ok) { console.error("anthropic error", res.status, await res.text()); process.exit(1); }
 const data = await res.json();
+// A truncated turn (max_tokens) or unexpected stop must fail loudly, not push a partial report.
+if (data.stop_reason && data.stop_reason !== "end_turn") {
+  console.error("anthropic stop_reason", data.stop_reason, "— refusing to push a truncated report");
+  process.exit(1);
+}
 const text = (data.content ?? []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim() || "(empty report)";
 
 if (dryRun || !NTFY_TOPIC) { console.log(text); process.exit(0); }
