@@ -1,16 +1,12 @@
 import fs from "node:fs"; import path from "node:path"; import crypto from "node:crypto";
 import Database from "better-sqlite3"; import AdmZip from "adm-zip";
 import type { Config } from "./config.js";
+import { openServerDb } from "./serverdb.js";
 
+export { openServerDb } from "./serverdb.js";
 export class IngestError extends Error { constructor(public code: string, msg?: string) { super(msg ?? code); } }
 const SQLITE_MAGIC = Buffer.from("SQLite format 3\0", "binary");
 
-export function openServerDb(cfg: Pick<Config, "serverDbPath">): Database.Database {
-  const db = new Database(cfg.serverDbPath);
-  db.pragma("journal_mode = WAL");
-  db.exec("CREATE TABLE IF NOT EXISTS ingestLog (id INTEGER PRIMARY KEY AUTOINCREMENT, receivedAt INTEGER, bytes INTEGER, latestDay TEXT)");
-  return db;
-}
 export function latestIngest(cfg: Pick<Config, "serverDbPath">) {
   const db = openServerDb(cfg);
   const r = db.prepare("SELECT receivedAt, bytes, latestDay FROM ingestLog ORDER BY id DESC LIMIT 1").get() as any;
