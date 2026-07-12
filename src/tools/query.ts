@@ -43,7 +43,7 @@ export function workoutSummary(cfg: Config, args: { from: string; to: string }) 
         const patch = overlay.patchedWorkouts.get(workoutKeyOf(w.deviceId, w.startTs, w.sport));
         const merged = patch ? { ...w, ...patch.patch, edited: true, editId: patch.editId } : w;
         const durationS = (merged as any).endTs && merged.startTs ? (merged as any).endTs - merged.startTs : merged.durationS;
-        return { ...merged, startIso: new Date(merged.startTs * 1000).toISOString(), durationMin: durationS != null ? Math.round(durationS / 60) : null };
+        return { ...merged, durationS, startIso: new Date(merged.startTs * 1000).toISOString(), durationMin: durationS != null ? Math.round(durationS / 60) : null };
       });
     const added = overlay.addedWorkouts
       .filter((w) => w.startTs >= lo && w.startTs <= hi)
