@@ -1,4 +1,4 @@
-app = "noop-cloud"
+app = "vk-noop-cloud"
 primary_region = "iad"
 
 [build]
