@@ -51,3 +51,25 @@ Local dry-run (prints, no push):
 ```bash
 ANTHROPIC_API_KEY=… NOOP_CLOUD_URL=https://<app>.fly.dev NOOP_RO_TOKEN=… node scripts/report.mjs --dry-run
 ```
+
+## Editing your data (Phase 2)
+
+The AI can *propose* corrections; nothing changes until you confirm with the read-write credential.
+The mirror (your uploaded data) is never modified — confirmed edits live in an append-only journal
+and an overlay that read tools reflect (marked `edited: true` / `added: true`). Every proposal
+records the original row (`before`), a human-readable diff, and the rationale; `undo_edit` reverses
+by appending, so the audit trail is complete forever.
+
+- Read-only callers (routines, cron, shared agents) can `propose_edit`, `list_pending`, `edit_journal`.
+- `confirm_edit` / `reject_edit` / `undo_edit` exist **only** for read-write callers — invisible otherwise.
+- `GET /edits?since=<seq>` (read token) streams the journal for downstream sync.
+- Honesty note: `health_snapshot` / `compare_sources` aggregate the phone's own daily rollups; those
+  numbers update after the phone applies your edits (Phase 3) and re-uploads.
+
+### Granular evidence & edits
+
+`hr_series` (raw or bucketed heart-rate for any window, ≤7 days) and `sleep_detail` (a night's full
+hypnogram + in-sleep HR) let the AI check the actual sensor evidence — e.g. "HR stayed at 48bpm and
+flat until 06:00, so that 03:00 'wake' was movement, not waking." Then `edit_sleep_stages` rewrites
+the night's stage timeline and `delete_hr_range` throws out artifact heart-rate stretches — through
+the same propose → confirm → journal → undo rail as every other edit.
