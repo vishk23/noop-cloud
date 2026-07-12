@@ -15,7 +15,9 @@ export function openServerDb(cfg: Pick<Config, "serverDbPath">): Database.Databa
     CREATE TABLE IF NOT EXISTS editJournal (
       seq INTEGER PRIMARY KEY AUTOINCREMENT, editId TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
       payloadJSON TEXT NOT NULL, beforeJSON TEXT, rationale TEXT,
-      appliedAt INTEGER NOT NULL, undoneBySeq INTEGER);
+      appliedAt INTEGER NOT NULL, undoneBySeq INTEGER, ackedAt INTEGER);
   `);
+  const cols = db.prepare("PRAGMA table_info(editJournal)").all() as any[];
+  if (!cols.some((c) => c.name === "ackedAt")) db.exec("ALTER TABLE editJournal ADD COLUMN ackedAt INTEGER");
   return db;
 }

@@ -10,7 +10,7 @@ export interface ProposalRow {
 }
 export interface JournalRow {
   seq: number; editId: string; kind: string; payloadJSON: string;
-  beforeJSON: string | null; rationale: string | null; appliedAt: number; undoneBySeq: number | null;
+  beforeJSON: string | null; rationale: string | null; appliedAt: number; undoneBySeq: number | null; ackedAt: number | null;
 }
 
 function withDb<T>(cfg: C, fn: (db: ReturnType<typeof openServerDb>) => T): T {
@@ -60,4 +60,12 @@ export function activeEdits(cfg: C): JournalRow[] {
 }
 export function markUndone(cfg: C, targetSeq: number, bySeq: number): void {
   withDb(cfg, (db) => db.prepare("UPDATE editJournal SET undoneBySeq = ? WHERE seq = ? AND undoneBySeq IS NULL").run(bySeq, targetSeq));
+}
+export function ackEdits(cfg: C, seqs: number[]): number {
+  return withDb(cfg, (db) => {
+    const stmt = db.prepare("UPDATE editJournal SET ackedAt = ? WHERE seq = ? AND ackedAt IS NULL");
+    const now = Math.floor(Date.now() / 1000);
+    let n = 0; for (const s of seqs) n += stmt.run(now, s).changes;
+    return n;
+  });
 }

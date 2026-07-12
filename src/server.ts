@@ -6,7 +6,7 @@ import { Config, loadConfig } from "./config.js";
 import { requireScope, tokenScope } from "./auth.js";
 import { ingestNoopbak, IngestError } from "./ingest.js";
 import { buildMcpServer } from "./mcp.js";
-import { journalSince } from "./staging.js";
+import { journalSince, ackEdits } from "./staging.js";
 
 export function createApp(cfg: Config): express.Express {
   fs.mkdirSync(cfg.dataDir, { recursive: true });
@@ -47,6 +47,14 @@ export function createApp(cfg: Config): express.Express {
     if (!Number.isInteger(since) || since < 0) return res.status(400).json({ error: "bad_since" });
     const edits = journalSince(cfg, since);
     res.json({ edits, latestSeq: edits.length ? edits[edits.length - 1].seq : since });
+  });
+
+  app.post("/edits/ack", requireScope(cfg, "rw"), express.json({ limit: "64kb" }), (req, res) => {
+    const seqs = (req.body as any)?.seqs;
+    if (!Array.isArray(seqs) || seqs.length === 0 || seqs.length > 500 || !seqs.every((s) => Number.isInteger(s) && s > 0)) {
+      return res.status(400).json({ error: "bad_seqs" });
+    }
+    res.json({ acked: ackEdits(cfg, seqs) });
   });
 
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
