@@ -1,0 +1,18 @@
+name: morning-report
+on:
+  schedule:
+    - cron: "0 13 * * *"   # 13:00 UTC daily — adjust to your morning; also wakes the Fly machine
+  workflow_dispatch: {}
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - run: node scripts/report.mjs
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NOOP_CLOUD_URL: ${{ secrets.NOOP_CLOUD_URL }}
+          NOOP_RO_TOKEN: ${{ secrets.NOOP_RO_TOKEN }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}

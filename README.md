@@ -34,3 +34,16 @@ Then ask: "call data_freshness, then health_snapshot for the last 7 days."
 `data_freshness`, `health_snapshot`, `metric_series`, `sleep_summary`, `workout_summary`,
 `compare_sources`, plus ChatGPT Deep Research `search`/`fetch`. Prompts: `morning_report`,
 `corroborate_sources`, `find_messy_data`. All read-only in this phase.
+
+## Morning report
+
+A GitHub Actions cron (`.github/workflows/morning-report.yml`) calls the Anthropic Messages API
+with this server as an MCP connector (read-only token, tool-allowlisted) and pushes the result to
+[ntfy](https://ntfy.sh). Set repo secrets `ANTHROPIC_API_KEY`, `NOOP_CLOUD_URL`, `NOOP_RO_TOKEN`,
+`NTFY_TOPIC` and subscribe to the topic in the ntfy app.
+
+Local dry-run (prints, no push):
+
+```bash
+ANTHROPIC_API_KEY=… NOOP_CLOUD_URL=https://<app>.fly.dev NOOP_RO_TOKEN=… node scripts/report.mjs --dry-run
+```
