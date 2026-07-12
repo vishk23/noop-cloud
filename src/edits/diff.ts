@@ -9,6 +9,19 @@ export class EditTargetError extends Error {
 
 const iso = (ts: number) => new Date(ts * 1000).toISOString().slice(0, 16).replace("T", " ") + "Z";
 
+/** Merge consecutive same-stage segments and sum minutes: "light 60m/deep 120m/rem 120m/light 120m". */
+function stageSummary(stages: { start: number; end: number; stage: string }[] | null | undefined): string {
+  if (!stages || !stages.length) return "no stages";
+  const merged: { stage: string; minutes: number }[] = [];
+  for (const s of stages) {
+    const minutes = Math.round((s.end - s.start) / 60);
+    const last = merged[merged.length - 1];
+    if (last && last.stage === s.stage) last.minutes += minutes;
+    else merged.push({ stage: s.stage, minutes });
+  }
+  return merged.map((m) => `${m.stage} ${m.minutes}m`).join("/");
+}
+
 /** Read-only peek at the mirror for the row an edit targets. null for kinds with no target. */
 export function captureBefore(cfg: Pick<Config, "mirrorPath">, kind: EditKind, payload: any): object | null {
   if (kind === "add_workout" || kind === "set_baseline_note") return null;
@@ -18,10 +31,14 @@ export function captureBefore(cfg: Pick<Config, "mirrorPath">, kind: EditKind, p
     let row: unknown;
     if (kind === "fix_workout" || kind === "delete_workout") {
       row = db.prepare("SELECT * FROM workout WHERE deviceId=? AND startTs=? AND sport=?").get(payload.deviceId, payload.startTs, payload.sport);
-    } else if (kind === "adjust_sleep_bounds") {
+    } else if (kind === "adjust_sleep_bounds" || kind === "edit_sleep_stages") {
       row = db.prepare("SELECT * FROM sleepSession WHERE deviceId=? AND startTs=?").get(payload.deviceId, payload.startTs);
     } else if (kind === "delete_metric_point") {
       row = db.prepare("SELECT * FROM metricSeries WHERE deviceId=? AND day=? AND key=?").get(payload.deviceId, payload.day, payload.key);
+    } else if (kind === "delete_hr_range") {
+      row = db.prepare("SELECT COUNT(*) AS count FROM hrSample WHERE deviceId=? AND ts>=? AND ts<=?").get(payload.deviceId, payload.fromTs, payload.toTs);
+      if ((row as { count: number }).count === 0) throw new EditTargetError("target_not_found", `${kind}: no HR samples in range`);
+      return row as object;
     }
     if (!row) throw new EditTargetError("target_not_found", `${kind}: no matching row in the mirror`);
     return row as object;
@@ -48,5 +65,11 @@ export function renderDiff(kind: EditKind, payload: any, before: any): string {
       return `DELETE metric ${payload.key}=${before.value} on ${payload.day} (${payload.deviceId})`;
     case "set_baseline_note":
       return `NOTE${payload.deviceId ? ` [${payload.deviceId}]` : ""}: ${payload.note}`;
+    case "edit_sleep_stages": {
+      const oldStages = before.stagesJSON ? JSON.parse(before.stagesJSON) : null;
+      return `RESTAGE sleep @ ${iso(before.startTs)} (${payload.deviceId}): ${stageSummary(oldStages)} ⇒ ${stageSummary(payload.stages)}`;
+    }
+    case "delete_hr_range":
+      return `DELETE ${before.count} HR samples ${iso(payload.fromTs)} → ${iso(payload.toTs)} (${payload.deviceId})`;
   }
 }

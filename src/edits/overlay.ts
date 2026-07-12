@@ -12,9 +12,7 @@ export interface Overlay {
   addedWorkouts: { editId: string; deviceId: "noop-cloud"; startTs: number; endTs: number; sport: string; energyKcal: number | null; distanceM: number | null; notes: string | null }[];
   deletedMetricPoints: Set<string>;
   baselineNotes: { note: string; deviceId: string | null; at: number }[];
-  // filled by edit kinds in 2b Task 2
   stageEdits: Map<string, { stages: { start: number; end: number; stage: string }[]; editId: string }>;
-  // filled by edit kinds in 2b Task 2
   deletedHrRanges: { deviceId: string; fromTs: number; toTs: number; editId: string }[];
 }
 
@@ -41,6 +39,8 @@ export function computeOverlay(cfg: Pick<Config, "serverDbPath">): Overlay {
       }
       case "delete_metric_point": o.deletedMetricPoints.add(pointKeyOf(p.deviceId, p.day, p.key)); break;
       case "set_baseline_note": o.baselineNotes.push({ note: p.note, deviceId: p.deviceId ?? null, at: e.appliedAt }); break;
+      case "edit_sleep_stages": o.stageEdits.set(sleepKeyOf(p.deviceId, p.startTs), { stages: p.stages, editId: e.editId }); break;
+      case "delete_hr_range": o.deletedHrRanges.push({ deviceId: p.deviceId, fromTs: p.fromTs, toTs: p.toTs, editId: e.editId }); break;
     }
   }
   return o;
