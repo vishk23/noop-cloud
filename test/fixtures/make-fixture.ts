@@ -73,6 +73,17 @@ export function buildMirrorSqlite(target: string): void {
   }
   const hr = db.prepare("INSERT INTO hrSample VALUES (?,?,?)");
   for (const day of DAYS) for (let i = 0; i < 5; i++) hr.run("oura-api", tsOf(day, 3) + i * 300, 55 + i);
+
+  // Granular night data (2026-06-13, my-whoop): stages on the sleep row + 5-min HR across the night.
+  const night = tsOf("2026-06-13", 3);
+  const stages = JSON.stringify([
+    { start: night, end: night + 3600, stage: "light" },
+    { start: night + 3600, end: night + 10800, stage: "deep" },
+    { start: night + 10800, end: night + 18000, stage: "rem" },
+    { start: night + 18000, end: night + 25200, stage: "light" },
+  ]);
+  db.prepare("UPDATE sleepSession SET stagesJSON = ? WHERE deviceId = 'my-whoop' AND startTs = ?").run(stages, night);
+  for (let t = night; t <= night + 25200; t += 300) hr.run("my-whoop", t, 46 + Math.round(8 * Math.abs(Math.sin(t / 3000))));
   db.close();
 }
 

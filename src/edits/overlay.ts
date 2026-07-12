@@ -12,10 +12,14 @@ export interface Overlay {
   addedWorkouts: { editId: string; deviceId: "noop-cloud"; startTs: number; endTs: number; sport: string; energyKcal: number | null; distanceM: number | null; notes: string | null }[];
   deletedMetricPoints: Set<string>;
   baselineNotes: { note: string; deviceId: string | null; at: number }[];
+  // filled by edit kinds in 2b Task 2
+  stageEdits: Map<string, { stages: { start: number; end: number; stage: string }[]; editId: string }>;
+  // filled by edit kinds in 2b Task 2
+  deletedHrRanges: { deviceId: string; fromTs: number; toTs: number; editId: string }[];
 }
 
 export function computeOverlay(cfg: Pick<Config, "serverDbPath">): Overlay {
-  const o: Overlay = { sleepBounds: new Map(), deletedWorkouts: new Set(), patchedWorkouts: new Map(), addedWorkouts: [], deletedMetricPoints: new Set(), baselineNotes: [] };
+  const o: Overlay = { sleepBounds: new Map(), deletedWorkouts: new Set(), patchedWorkouts: new Map(), addedWorkouts: [], deletedMetricPoints: new Set(), baselineNotes: [], stageEdits: new Map(), deletedHrRanges: [] };
   for (const e of activeEdits(cfg)) {
     const p = JSON.parse(e.payloadJSON);
     switch (e.kind) {
