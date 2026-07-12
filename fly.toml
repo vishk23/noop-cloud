@@ -18,14 +18,14 @@ primary_region = "iad"
   auto_start_machines = true
   min_machines_running = 0
 
+  # Service-level check: gates deploys and routing (a top-level [checks] block is monitoring-only).
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/healthz"
+
 [[vm]]
   size = "shared-cpu-1x"
   memory = "512mb"
-
-[checks.health]
-  type = "http"
-  port = 8080
-  method = "get"
-  path = "/healthz"
-  interval = "30s"
-  timeout = "5s"
