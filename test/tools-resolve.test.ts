@@ -34,7 +34,7 @@ describe("confirm/reject/undo", () => {
     const c = await mcp(port, cfg().rwToken, 2, "confirm_edit", { id: p.id });
     expect(c.applied).toBe(true); expect(c.seq).toBeGreaterThan(0);
     const c2 = await mcp(port, cfg().rwToken, 3, "confirm_edit", { id: p.id });
-    expect(c2.error).toBe("not_pending"); // single-shot resolution
+    expect(c2.applied).toBe(true); expect(c2.note).toBe("already applied"); // idempotent retry
     const j1 = await mcp(port, cfg().rwToken, 4, "edit_journal", {});
     expect(j1.edits.length).toBe(1);
     const u = await mcp(port, cfg().rwToken, 5, "undo_edit", { seq: c.seq });

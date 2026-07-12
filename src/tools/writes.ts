@@ -61,12 +61,20 @@ export function registerResolutionTools(server: McpServer, cfg: Config): void {
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
   }, async (a) => {
     const resolved = resolveProposal(cfg, a.id, "confirmed");
-    if (!resolved) return asTool({ error: "not_pending" });
+    if (!resolved) {
+      const existing = getProposal(cfg, a.id);
+      if (existing?.status === "confirmed") return asTool({ id: a.id, applied: true, note: "already applied" });
+      return asTool({ error: "not_pending" });
+    }
     try {
       const seq = appendJournal(cfg, { editId: resolved.id, kind: resolved.kind, payloadJSON: resolved.payloadJSON, beforeJSON: resolved.beforeJSON, rationale: resolved.rationale });
       return asTool({ id: resolved.id, seq, applied: true, diff: resolved.diffText });
-    } catch {
-      return asTool({ id: resolved.id, applied: true, note: "already applied" }); // UNIQUE(editId) — idempotent
+    } catch (e: any) {
+      if (typeof e?.code === "string" && e.code.startsWith("SQLITE_CONSTRAINT")) {
+        return asTool({ id: resolved.id, applied: true, note: "already applied" });
+      }
+      console.error("confirm_edit journal write failed", e?.message ?? e);
+      return asTool({ error: "journal_write_failed", id: resolved.id });
     }
   });
 
