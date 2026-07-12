@@ -8,6 +8,14 @@ function safeEqual(a: string, b: string): boolean {
   return crypto.timingSafeEqual(ab, bb);
 }
 
+export function tokenScope(cfg: Config, authHeader: string | undefined): "rw" | "ro" | null {
+  const m = /^Bearer (.+)$/.exec(authHeader ?? "");
+  if (!m) return null;
+  if (safeEqual(m[1], cfg.rwToken)) return "rw";
+  if (safeEqual(m[1], cfg.roToken)) return "ro";
+  return null;
+}
+
 export function requireScope(cfg: Config, scope: "ro" | "rw"): RequestHandler {
   return (req, res, next) => {
     const h = req.header("authorization") ?? "";

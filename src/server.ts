@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Config, loadConfig } from "./config.js";
-import { requireScope } from "./auth.js";
+import { requireScope, tokenScope } from "./auth.js";
 import { ingestNoopbak, IngestError } from "./ingest.js";
 import { buildMcpServer } from "./mcp.js";
 
@@ -26,7 +26,8 @@ export function createApp(cfg: Config): express.Express {
     });
 
   app.post("/mcp", requireScope(cfg, "ro"), express.json({ limit: "4mb" }), async (req, res) => {
-    const server = buildMcpServer(cfg);
+    const scope = tokenScope(cfg, req.header("authorization")) ?? "ro"; // requireScope already vetted it
+    const server = buildMcpServer(cfg, scope);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => { transport.close().catch(() => {}); server.close().catch(() => {}); });
     try {

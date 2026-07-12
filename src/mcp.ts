@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "./config.js";
 import { registerTools } from "./tools/index.js";
 
-export function buildMcpServer(cfg: Config): McpServer {
+export function buildMcpServer(cfg: Config, scope: "ro" | "rw"): McpServer {
   const server = new McpServer({ name: "noop-cloud", version: "0.1.0" });
 
   server.registerPrompt("morning_report", {
@@ -34,6 +34,6 @@ export function buildMcpServer(cfg: Config): McpServer {
       "duplicate workouts across sources on the same day, and daily values that break trend. Do not change anything — just list findings." } }],
   }));
 
-  registerTools(server, cfg);
+  registerTools(server, cfg, scope);
   return server;
 }
