@@ -4,20 +4,31 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "../config.js";
 import { Mirror, Family } from "../mirror.js";
 import { latestIngest } from "../ingest.js";
+import { listPending, journalSince } from "../staging.js";
+import { computeOverlay } from "../edits/overlay.js";
 
 export function dataFreshness(cfg: Config) {
   if (!fs.existsSync(cfg.mirrorPath)) {
-    return { mirrorAgeSeconds: null, lastIngestAt: null, latestDataDay: null, sources: [], notIngested: true };
+    const baselineNotes = computeOverlay(cfg).baselineNotes;
+    const j = journalSince(cfg, 0);
+    const journalSeq = j.length ? j[j.length - 1].seq : 0;
+    return { mirrorAgeSeconds: null, lastIngestAt: null, latestDataDay: null, sources: [], pendingEdits: listPending(cfg).length, journalSeq, baselineNotes, notIngested: true };
   }
   const m = new Mirror(cfg.mirrorPath);
   try {
     const li = latestIngest(cfg);
     const now = Math.floor(Date.now() / 1000);
+    const baselineNotes = computeOverlay(cfg).baselineNotes;
+    const j = journalSince(cfg, 0);
+    const journalSeq = j.length ? j[j.length - 1].seq : 0;
     return {
       mirrorAgeSeconds: li ? now - li.receivedAt : null,
       lastIngestAt: li ? new Date(li.receivedAt * 1000).toISOString() : null,
       latestDataDay: m.latestDataDay(),
       sources: m.sources().map((s) => ({ deviceId: s.deviceId, family: s.family, latestDay: s.latestDay })),
+      pendingEdits: listPending(cfg).length,
+      journalSeq,
+      baselineNotes,
     };
   } finally { m.close(); }
 }
