@@ -39,14 +39,14 @@ export function fetch(cfg: Config, args: { id: string }) {
 export function registerSearchFetch(server: McpServer, cfg: Config): void {
   server.registerTool("search", {
     title: "Search",
-    description: "ChatGPT Deep Research search: find day-records. Returns {id,title,url}. Use a YYYY-MM-DD in the query to target a day.",
+    description: "ChatGPT Deep Research search: find day-records. Returns {id,title,url}. Use a YYYY-MM-DD in the query to target a day. Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads.",
     inputSchema: { query: z.string() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => { const r = search(cfg, a); return { content: [{ type: "text", text: JSON.stringify(r) }], structuredContent: r }; });
 
   server.registerTool("fetch", {
     title: "Fetch",
-    description: "ChatGPT Deep Research fetch: full text of a record by id (e.g. day:2026-06-13).",
+    description: "ChatGPT Deep Research fetch: full text of a record by id (e.g. day:2026-06-13). Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads.",
     inputSchema: { id: z.string() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => { const r = fetch(cfg, a); return { content: [{ type: "text", text: JSON.stringify(r) }], structuredContent: r }; });

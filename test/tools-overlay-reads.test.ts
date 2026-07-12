@@ -45,6 +45,12 @@ describe("overlay-aware reads", () => {
     expect(f.journalSeq).toBeGreaterThanOrEqual(5);
     expect(f.baselineNotes[0].note).toContain("RHR");
   });
+  it("workout_summary keeps the stored durationS for an un-edited workout (stored ≠ wall-time span)", () => {
+    const w = workoutSummary(cfg, { from: "2026-06-11", to: "2026-06-11" }).workouts.find((x: any) => x.sport === "walking") as any;
+    expect(w.durationS).toBe(2000);
+    expect(w.durationMin).toBe(33);
+    expect(w).not.toHaveProperty("edited");
+  });
   it("workout_summary applies fix_workout patches and recomputes BOTH durations", () => {
     const WALK_TS = Math.floor(new Date("2026-06-11T17:00:00Z").getTime() / 1000);
     appendJournal(cfg, { editId: "e_fix", kind: "fix_workout", payloadJSON: JSON.stringify({ deviceId: "oura-api", startTs: WALK_TS, sport: "walking", patch: { endTs: WALK_TS + 4800 } }), beforeJSON: null, rationale: null });

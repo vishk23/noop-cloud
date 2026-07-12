@@ -56,7 +56,7 @@ export function compareSources(cfg: Config, args: { from: string; to: string; me
 export function registerCompareSources(server: McpServer, cfg: Config): void {
   server.registerTool("compare_sources", {
     title: "Compare sources",
-    description: "Per-day WHOOP vs Oura vs Apple side by side for chosen metrics, with a spread %. The corroboration workhorse.",
+    description: "Per-day WHOOP vs Oura vs Apple side by side for chosen metrics, with a spread %. The corroboration workhorse. Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads.",
     inputSchema: { from: DAY, to: DAY, metrics: z.array(z.string()).optional().describe("dailyMetric columns, e.g. restingHr, avgHrv, totalSleepMin, steps.") },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(compareSources(cfg, a)));

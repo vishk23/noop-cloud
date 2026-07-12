@@ -33,6 +33,7 @@ describe("write tools + scope", () => {
     const rwNames = rw.result.tools.map((t: any) => t.name);
     expect(roNames).toContain("propose_edit");
     expect(roNames).not.toContain("confirm_edit");
+    expect(roNames).not.toContain("reject_edit");
     // rw implies ro: the always-on tools stay visible to a read-write caller too.
     expect(rwNames).toContain("propose_edit");
     expect(rwNames).toContain("confirm_edit");

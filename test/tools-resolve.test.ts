@@ -3,6 +3,7 @@ import fs from "node:fs"; import path from "node:path"; import http from "node:h
 import { buildNoopbak } from "./fixtures/make-fixture.js";
 import { ingestNoopbak } from "../src/ingest.js";
 import { createApp } from "../src/server.js";
+import { resolveProposal } from "../src/staging.js";
 
 const dataDir = path.join(process.cwd(), "test/.tmp/resolve");
 function cfg() { return { dataDir, mirrorPath: path.join(dataDir, "mirror.sqlite"), serverDbPath: path.join(dataDir, "server.sqlite"), maxIngestBytes: 262_144_000, roToken: "ro".padEnd(40, "x"), rwToken: "rw".padEnd(40, "y"), port: 0 } as any; }
@@ -50,5 +51,17 @@ describe("confirm/reject/undo", () => {
     expect(r.rejected).toBe(true);
     const j = await mcp(port, cfg().rwToken, 10, "edit_journal", {});
     expect(j.edits.filter((e: any) => e.editId === p.id).length).toBe(0);
+  });
+  it("confirm_edit self-heals a crash-window proposal (resolved but never journaled)", async () => {
+    const p = await mcp(port, cfg().roToken, 11, "propose_edit", { kind: "set_baseline_note", payload: { note: "crash window test" }, rationale: "test" });
+    // Simulate a crash: the proposal is marked confirmed directly, bypassing confirm_edit's
+    // appendJournal — as if the process died between resolveProposal and appendJournal.
+    resolveProposal(cfg(), p.id, "confirmed");
+    const c = await mcp(port, cfg().rwToken, 12, "confirm_edit", { id: p.id });
+    expect(c.applied).toBe(true);
+    expect(c.note).toBe("recovered — applied on retry");
+    expect(c.seq).toBeGreaterThan(0);
+    const j = await mcp(port, cfg().rwToken, 13, "edit_journal", {});
+    expect(j.edits.some((e: any) => e.editId === p.id)).toBe(true);
   });
 });

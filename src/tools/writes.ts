@@ -4,7 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "../config.js";
 import { EDIT_KINDS, EditKind, payloadSchema } from "../edits/kinds.js";
 import { captureBefore, renderDiff, EditTargetError } from "../edits/diff.js";
-import { createProposal, listPending, journalSince, getProposal, resolveProposal, appendJournal, markUndone } from "../staging.js";
+import { createProposal, listPending, journalSince, getProposal, resolveProposal, appendJournal, markUndone, journalEntryFor } from "../staging.js";
 
 const asTool = (obj: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }], structuredContent: obj as Record<string, unknown> });
 
@@ -23,7 +23,11 @@ export function registerWriteTools(server: McpServer, cfg: Config, scope: "ro" |
     if (!parsed.success) return asTool({ error: "invalid_payload", detail: parsed.error.issues.map((i) => i.message).join("; ") });
     let before: object | null;
     try { before = captureBefore(cfg, a.kind as EditKind, parsed.data); }
-    catch (e) { return asTool({ error: e instanceof EditTargetError ? e.code : "capture_failed" }); }
+    catch (e) {
+      if (e instanceof EditTargetError) return asTool({ error: e.code }); // expected: no matching row
+      console.error("propose_edit capture failed", e instanceof Error ? e.message : e);
+      return asTool({ error: "capture_failed" });
+    }
     const id = "edit_" + crypto.randomBytes(5).toString("hex");
     const diff = renderDiff(a.kind as EditKind, parsed.data, before);
     createProposal(cfg, { id, kind: a.kind, payloadJSON: JSON.stringify(parsed.data), rationale: a.rationale, beforeJSON: before ? JSON.stringify(before) : null, diffText: diff });
@@ -63,7 +67,14 @@ export function registerResolutionTools(server: McpServer, cfg: Config): void {
     const resolved = resolveProposal(cfg, a.id, "confirmed");
     if (!resolved) {
       const existing = getProposal(cfg, a.id);
-      if (existing?.status === "confirmed") return asTool({ id: a.id, applied: true, note: "already applied" });
+      if (existing?.status === "confirmed") {
+        const row = journalEntryFor(cfg, a.id);
+        if (row) return asTool({ id: a.id, seq: row.seq, applied: true, note: "already applied" });
+        // Crash window: the proposal was marked confirmed but the process died before the journal
+        // write landed. Self-heal by applying it now from the proposal's own stored fields.
+        const seq = appendJournal(cfg, { editId: existing.id, kind: existing.kind, payloadJSON: existing.payloadJSON, beforeJSON: existing.beforeJSON, rationale: existing.rationale });
+        return asTool({ id: a.id, seq, applied: true, note: "recovered — applied on retry" });
+      }
       return asTool({ error: "not_pending" });
     }
     try {
@@ -88,6 +99,9 @@ export function registerResolutionTools(server: McpServer, cfg: Config): void {
     return asTool(r ? { id: a.id, rejected: true } : { error: "not_pending" });
   });
 
+  // Phase-3 replay must treat undo rows as idempotent: a crash between appendJournal(undo) and
+  // markUndone below can leave a duplicate undo row targeting the same seq on retry — markUndone's
+  // `undoneBySeq IS NULL` guard makes the second markUndone a no-op, and this is harmless.
   server.registerTool("undo_edit", {
     title: "Undo a confirmed edit",
     description: "Reverse a journal entry by appending an undo record (history is never deleted).",

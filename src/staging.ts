@@ -52,6 +52,9 @@ export function appendJournal(cfg: C, e: { editId: string; kind: string; payload
 export function journalSince(cfg: C, since: number): JournalRow[] {
   return withDb(cfg, (db) => db.prepare("SELECT * FROM editJournal WHERE seq > ? ORDER BY seq").all(since) as JournalRow[]);
 }
+export function journalEntryFor(cfg: C, editId: string): JournalRow | null {
+  return withDb(cfg, (db) => (db.prepare("SELECT * FROM editJournal WHERE editId = ?").get(editId) as JournalRow | undefined) ?? null);
+}
 export function activeEdits(cfg: C): JournalRow[] {
   return withDb(cfg, (db) => db.prepare("SELECT * FROM editJournal WHERE undoneBySeq IS NULL AND kind != 'undo' ORDER BY seq").all() as JournalRow[]);
 }

@@ -78,7 +78,7 @@ export function registerCoreTools(server: McpServer, cfg: Config): void {
 
   server.registerTool("health_snapshot", {
     title: "Health snapshot",
-    description: "Recent per-day roll-up (recovery, strain, sleep, resting HR, HRV) grouped by source family.",
+    description: "Recent per-day roll-up (recovery, strain, sleep, resting HR, HRV) grouped by source family. Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads.",
     inputSchema: { days: z.number().int().min(1).max(31).optional().describe("How many recent days (default 3).") },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (args) => asTool(healthSnapshot(cfg, args)));

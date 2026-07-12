@@ -64,7 +64,7 @@ export function buildMirrorSqlite(target: string): void {
   const wo = db.prepare(`INSERT INTO workout (deviceId,startTs,sport,endTs,source,durationS,energyKcal,distanceM)
     VALUES (?,?,?,?,?,?,?,?)`);
   wo.run("my-whoop", tsOf("2026-06-12", 18), "running", tsOf("2026-06-12", 18) + 1800, "whoop", 1800, 320, 5000);
-  wo.run("oura-api", tsOf("2026-06-11", 17), "walking", tsOf("2026-06-11", 17) + 2400, "oura", 2400, 180, 3000);
+  wo.run("oura-api", tsOf("2026-06-11", 17), "walking", tsOf("2026-06-11", 17) + 2400, "oura", 2000, 180, 3000);
 
   const ms = db.prepare("INSERT INTO metricSeries VALUES (?,?,?,?)");
   for (const day of DAYS) {
