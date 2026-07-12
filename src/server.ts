@@ -6,6 +6,7 @@ import { Config, loadConfig } from "./config.js";
 import { requireScope, tokenScope } from "./auth.js";
 import { ingestNoopbak, IngestError } from "./ingest.js";
 import { buildMcpServer } from "./mcp.js";
+import { journalSince } from "./staging.js";
 
 export function createApp(cfg: Config): express.Express {
   fs.mkdirSync(cfg.dataDir, { recursive: true });
@@ -39,6 +40,14 @@ export function createApp(cfg: Config): express.Express {
     }
   });
   app.all("/mcp", (_req, res) => res.status(405).json({ error: "method_not_allowed" }));
+
+  app.get("/edits", requireScope(cfg, "ro"), (req, res) => {
+    const raw = req.query.since;
+    const since = raw === undefined ? 0 : Number(raw);
+    if (!Number.isInteger(since) || since < 0) return res.status(400).json({ error: "bad_since" });
+    const edits = journalSince(cfg, since);
+    res.json({ edits, latestSeq: edits.length ? edits[edits.length - 1].seq : since });
+  });
 
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     if (err?.type === "entity.too.large") return res.status(413).json({ error: "too_large" });
