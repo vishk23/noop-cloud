@@ -26,6 +26,12 @@ export function ingestNoopbak(buf: Buffer, cfg: Pick<Config, "dataDir" | "mirror
   if (!entry) throw new IngestError("no_sqlite_entry");
   if (entry.header.size > cfg.maxIngestBytes) throw new IngestError("too_large", `decompressed entry ${entry.header.size} > ${cfg.maxIngestBytes}`);
   const sqliteBytes = entry.getData();
+  // entry.header.size comes from the (attacker-controlled) central directory header and can be
+  // forged — including forged to 0 — which would skip the earlier header-size check entirely and
+  // bypass adm-zip's own maxOutputLength bounding. Re-check the ACTUAL decompressed size here.
+  if (sqliteBytes.length === 0 || sqliteBytes.length > cfg.maxIngestBytes) {
+    throw new IngestError("too_large", `decompressed entry ${sqliteBytes.length} bytes`);
+  }
   if (!sqliteBytes.subarray(0, SQLITE_MAGIC.length).equals(SQLITE_MAGIC)) throw new IngestError("bad_magic");
 
   // Stage to a temp file, validate, then atomically rename into place.

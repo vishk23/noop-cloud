@@ -23,11 +23,29 @@ export function compareSources(cfg: Config, args: { from: string; to: string; me
     const days = [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([day, drows]) => {
       const metricsOut: Record<string, any> = {};
       for (const metric of metrics) {
+        // A family can have multiple same-family deviceIds (e.g. WHOOP strap + derived
+        // "-noop" lineage). Collect all non-null values per family and use their mean as
+        // the family's value, but keep every raw per-device reading visible via `perDevice`
+        // so intra-family disagreement isn't silently averaged away.
+        const byFamily = new Map<string, number[]>();
+        const perDevice: Record<string, number> = {};
+        for (const r of drows) {
+          const v = (r as any)[metric];
+          if (v === null || v === undefined) continue;
+          const arr = byFamily.get(r.family) ?? [];
+          arr.push(v);
+          byFamily.set(r.family, arr);
+          perDevice[r.deviceId] = v;
+        }
         const cell: Record<string, number> = {};
-        for (const r of drows) { const v = (r as any)[metric]; if (v !== null && v !== undefined) cell[r.family] = v; }
+        let multiDevice = false;
+        for (const [fam, famVals] of byFamily) {
+          cell[fam] = Math.round((famVals.reduce((s, x) => s + x, 0) / famVals.length) * 10) / 10;
+          if (famVals.length > 1) multiDevice = true;
+        }
         const vals = Object.values(cell);
         const spreadPct = vals.length >= 2 ? Math.round(((Math.max(...vals) - Math.min(...vals)) / (vals.reduce((s, x) => s + x, 0) / vals.length)) * 1000) / 10 : 0;
-        metricsOut[metric] = { ...cell, spreadPct };
+        metricsOut[metric] = multiDevice ? { ...cell, spreadPct, perDevice } : { ...cell, spreadPct };
       }
       return { day, metrics: metricsOut };
     });

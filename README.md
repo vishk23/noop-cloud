@@ -42,6 +42,10 @@ with this server as an MCP connector (read-only token, tool-allowlisted) and pus
 [ntfy](https://ntfy.sh). Set repo secrets `ANTHROPIC_API_KEY`, `NOOP_CLOUD_URL`, `NOOP_RO_TOKEN`,
 `NTFY_TOPIC` and subscribe to the topic in the ntfy app.
 
+`NTFY_TOPIC` is a SECRET, not a public slug — ntfy topics are unauthenticated, so anyone who
+knows or guesses it can subscribe to `https://ntfy.sh/<topic>` and read your daily health push;
+generate one like `noop-$(openssl rand -hex 16)` instead of a guessable name.
+
 Local dry-run (prints, no push):
 
 ```bash

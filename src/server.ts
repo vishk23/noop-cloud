@@ -1,5 +1,6 @@
 import express from "express";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Config, loadConfig } from "./config.js";
 import { requireScope } from "./auth.js";
@@ -27,7 +28,7 @@ export function createApp(cfg: Config): express.Express {
   app.post("/mcp", requireScope(cfg, "ro"), express.json({ limit: "4mb" }), async (req, res) => {
     const server = buildMcpServer(cfg);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    res.on("close", () => { transport.close(); server.close(); });
+    res.on("close", () => { transport.close().catch(() => {}); server.close().catch(() => {}); });
     try {
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
@@ -48,7 +49,10 @@ export function createApp(cfg: Config): express.Express {
 }
 
 // Entry point (ignored by tests, which import createApp directly).
-if (process.argv[1] && process.argv[1].endsWith("server.js")) {
+// process.argv[1].endsWith("server.js") alone never matches under `tsx` (dev runs server.ts),
+// so this also checks the resolved module URL and a ".ts" suffix.
+const isMain = process.argv[1] && (process.argv[1] === fileURLToPath(import.meta.url) || process.argv[1].endsWith("/server.js") || process.argv[1].endsWith("/server.ts"));
+if (isMain) {
   const cfg = loadConfig();
   createApp(cfg).listen(cfg.port, () => console.log(`noop-cloud on :${cfg.port}`));
 }

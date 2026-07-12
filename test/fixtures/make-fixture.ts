@@ -27,6 +27,7 @@ export function buildMirrorSqlite(target: string): void {
   db.prepare("INSERT INTO grdb_migrations VALUES (?)").run("v25-oura-raw");
   const pd = db.prepare("INSERT INTO pairedDevice VALUES (?,?,?,?)");
   pd.run("my-whoop", "WHOOP", "5.0", "strap");
+  pd.run("my-whoop-noop", "WHOOP", "5.0", "derived");
   pd.run("oura-api", "Oura", "Oura (cloud)", "cloudImport");
   pd.run("apple-health", "Apple", "Apple Health", "appleHealth");
 
@@ -40,6 +41,14 @@ export function buildMirrorSqlite(target: string): void {
   for (const day of DAYS) {
     // WHOOP is the scored source: recovery/strain present.
     dm.run(base("my-whoop", day, { restingHr: 51, avgHrv: 70, recovery: 66, strain: 12.5 }));
+    // WHOOP derived lineage — same family, second deviceId, scores only (no raw vitals).
+    // Mirrors real mirrors where e.g. "my-whoop-noop" carries recovery/strain while the
+    // strap device "my-whoop" carries sleep/steps/HR — same-family, disjoint fields.
+    dm.run(base("my-whoop-noop", day, {
+      totalSleepMin: null, efficiency: null, restingHr: null, avgHrv: null,
+      recovery: 58, strain: 11.0, spo2Pct: null, skinTempDevC: null, respRateBpm: null,
+      steps: null, activeKcalEst: null,
+    }));
     // Oura cloud: honest data, recovery/strain null; slightly different RHR/HRV.
     dm.run(base("oura-api", day, { restingHr: 53, avgHrv: 62 }));
     // Apple: steps only-ish.

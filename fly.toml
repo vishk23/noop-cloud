@@ -6,6 +6,7 @@ primary_region = "iad"
 [env]
   DATA_DIR = "/data"
   PORT = "8080"
+  MAX_INGEST_BYTES = "805306368"
 
 [[mounts]]
   source = "noop_data"
@@ -28,4 +29,4 @@ primary_region = "iad"
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  memory = "1gb"

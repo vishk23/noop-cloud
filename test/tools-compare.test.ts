@@ -23,6 +23,14 @@ describe("compare_sources", () => {
     expect(r.days[0].metrics.avgHrv.apple).toBeUndefined();
     expect(r.days[0].metrics.avgHrv.whoop).toBe(70);
   });
+  it("averages same-family multi-device values and surfaces the disagreement via perDevice", () => {
+    // recovery: only WHOOP-family devices report it — my-whoop=66, my-whoop-noop=58.
+    // whoop cell should be their mean, with the raw per-device split visible (not hidden).
+    const r = compareSources(cfg, { from: "2026-06-13", to: "2026-06-13", metrics: ["recovery"] });
+    const recovery = r.days[0].metrics.recovery;
+    expect(recovery.whoop).toBe(62);
+    expect(recovery.perDevice).toEqual({ "my-whoop": 66, "my-whoop-noop": 58 });
+  });
 });
 
 describe("compare_sources guard: empty mirror", () => {

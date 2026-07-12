@@ -23,6 +23,16 @@ describe("core tools", () => {
     expect(last.whoop?.recovery).toBe(66);
     expect(last.oura?.restingHr).toBe(53);
   });
+  it("health_snapshot merges same-family multi-device rows without erasing real data", () => {
+    // my-whoop (strap: sleep/HR/recovery) and my-whoop-noop (derived: recovery/strain only,
+    // all else null) are both family "whoop". The merge must not let my-whoop-noop's nulls
+    // clobber my-whoop's real values, and both deviceIds must be listed as sources.
+    const r = healthSnapshot(cfg, { days: 1 });
+    const last = r.days[r.days.length - 1];
+    expect(last.whoop.totalSleepMin).toBe(420);
+    expect(last.whoop.recovery).toBe(66);
+    expect(last.whoop.sources).toEqual(["my-whoop", "my-whoop-noop"]);
+  });
   it("tools return structured not-ingested response before first ingest", () => {
     const emptyDir = path.join(process.cwd(), "test/.tmp/tools-empty");
     fs.rmSync(emptyDir, { recursive: true, force: true });

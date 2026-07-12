@@ -35,10 +35,20 @@ export function healthSnapshot(cfg: Config, args: { days?: number }) {
     const from = new Date(new Date(`${to}T00:00:00Z`).getTime() - (days - 1) * 86_400_000).toISOString().slice(0, 10);
     const rows = m.dailyMetrics({ from, to });
     const byDay = new Map<string, any>();
+    // A family (e.g. "whoop") can have MULTIPLE deviceIds contributing on the same day
+    // (e.g. a strap device + a derived "-noop" lineage). Merge field-wise, preferring the
+    // first non-null value in (day, deviceId) order, so no lineage's real data is erased
+    // by another lineage's nulls. `sources` records every deviceId that contributed.
+    const FIELDS = ["restingHr", "avgHrv", "totalSleepMin", "efficiency", "recovery", "strain", "steps"] as const;
     for (const r of rows) {
       const d = byDay.get(r.day) ?? { day: r.day };
       const fam: Family = r.family;
-      d[fam] = { restingHr: r.restingHr, avgHrv: r.avgHrv, totalSleepMin: r.totalSleepMin, efficiency: r.efficiency, recovery: r.recovery, strain: r.strain, steps: r.steps };
+      const cell = d[fam] ?? { sources: [] as string[] };
+      for (const f of FIELDS) {
+        if (cell[f] === undefined || cell[f] === null) cell[f] = (r as any)[f];
+      }
+      cell.sources.push(r.deviceId);
+      d[fam] = cell;
       byDay.set(r.day, d);
     }
     return { from, to, days: [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day)) };

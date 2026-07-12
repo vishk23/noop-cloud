@@ -12,7 +12,7 @@ export interface Config {
 
 function required(name: string): string {
   const v = process.env[name];
-  if (!v || v.length < 16) throw new Error(`${name} must be set (>=16 chars)`);
+  if (!v || v.length < 32) throw new Error(`${name} must be set (>=32 chars)`);
   return v;
 }
 
