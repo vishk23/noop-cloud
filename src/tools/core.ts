@@ -5,7 +5,7 @@ import type { Config } from "../config.js";
 import { Mirror, Family } from "../mirror.js";
 import { latestIngest } from "../ingest.js";
 import { listPending, journalSince } from "../staging.js";
-import { computeOverlay } from "../edits/overlay.js";
+import { computeOverlay, pointKeyOf } from "../edits/overlay.js";
 
 export function dataFreshness(cfg: Config) {
   if (!fs.existsSync(cfg.mirrorPath)) {
@@ -38,6 +38,7 @@ export function healthSnapshot(cfg: Config, args: { days?: number }) {
     return { days: [], notIngested: true };
   }
   const days = Math.max(1, Math.min(args.days ?? 3, 31));
+  const overlay = computeOverlay(cfg);
   const m = new Mirror(cfg.mirrorPath);
   try {
     const latest = m.latestDataDay();
@@ -56,7 +57,12 @@ export function healthSnapshot(cfg: Config, args: { days?: number }) {
       const fam: Family = r.family;
       const cell = d[fam] ?? { sources: [] as string[] };
       for (const f of FIELDS) {
-        if (cell[f] === undefined || cell[f] === null) cell[f] = (r as any)[f];
+        if (cell[f] === undefined || cell[f] === null) {
+          // A dailyMetric column deleted via delete_metric_point must not surface here even
+          // though the raw row still carries it — same overlay compare_sources applies
+          // (src/tools/compare.ts).
+          if (!overlay.deletedMetricPoints.has(pointKeyOf(r.deviceId, r.day, f))) cell[f] = (r as any)[f];
+        }
       }
       cell.sources.push(r.deviceId);
       d[fam] = cell;

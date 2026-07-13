@@ -3,6 +3,7 @@ import fs from "node:fs";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "../config.js";
 import { Mirror } from "../mirror.js";
+import { computeOverlay, pointKeyOf } from "../edits/overlay.js";
 
 const urlFor = (day: string) => `noop-cloud://day/${day}`;
 
@@ -27,10 +28,15 @@ export function fetch(cfg: Config, args: { id: string }) {
     return { id: args.id, title: "No data", text: "No data ingested yet.", url: "noop-cloud://empty", metadata: { notIngested: true } };
   }
   const day = args.id.replace(/^day:/, "");
+  const overlay = computeOverlay(cfg);
   const m = new Mirror(cfg.mirrorPath);
   try {
     const rows = m.dailyMetrics({ from: day, to: day });
-    const lines = rows.map((r) => `${r.family}: resting HR ${r.restingHr ?? "—"}, HRV ${r.avgHrv ?? "—"}, sleep ${r.totalSleepMin ?? "—"} min, recovery ${r.recovery ?? "—"}, strain ${r.strain ?? "—"}, steps ${r.steps ?? "—"}`);
+    // A dailyMetric column deleted via delete_metric_point must not leak through this ChatGPT
+    // Deep Research digest either — same overlay compare_sources/health_snapshot apply.
+    const col = (r: (typeof rows)[number], field: string) =>
+      overlay.deletedMetricPoints.has(pointKeyOf(r.deviceId, r.day, field)) ? null : (r as any)[field];
+    const lines = rows.map((r) => `${r.family}: resting HR ${col(r, "restingHr") ?? "—"}, HRV ${col(r, "avgHrv") ?? "—"}, sleep ${col(r, "totalSleepMin") ?? "—"} min, recovery ${col(r, "recovery") ?? "—"}, strain ${col(r, "strain") ?? "—"}, steps ${col(r, "steps") ?? "—"}`);
     const text = rows.length ? `Biometrics for ${day}\n${lines.join("\n")}` : `No data for ${day}.`;
     return { id: args.id, title: `Biometrics for ${day}`, text, url: urlFor(day), metadata: { day, sources: rows.map((r) => r.family) } };
   } finally { m.close(); }

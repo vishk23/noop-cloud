@@ -93,6 +93,16 @@ describe("compare_sources overlay: fallback respects delete_metric_point", () =>
     // spreadPct computed with only one value should be 0
     expect(vo2max.spreadPct).toBe(0);
   });
+
+  it("a dailyMetric column deleted via delete_metric_point disappears from compare_sources", () => {
+    // Same overlay mechanism as the metricSeries case above, but now targeting a dailyMetric
+    // COLUMN directly (post-hoc audit fix): oura-api's restingHr=53 on 2026-06-13.
+    appendJournal(overlayCfg, { editId: "e_rhr_del", kind: "delete_metric_point", payloadJSON: JSON.stringify({ deviceId: "oura-api", day: "2026-06-13", key: "restingHr" }), beforeJSON: null, rationale: null });
+    const r = compareSources(overlayCfg, { from: "2026-06-13", to: "2026-06-13", metrics: ["restingHr"] });
+    const restingHr = r.days[0].metrics.restingHr;
+    expect(restingHr.oura).toBeUndefined();
+    expect(restingHr.whoop).toBe(51); // unaffected — a different device/family
+  });
 });
 
 describe("compare_sources day universe: metricSeries-only day (post-hoc audit fix)", () => {

@@ -3,6 +3,16 @@ import { z } from "zod";
 export const EDIT_KINDS = ["fix_workout", "delete_workout", "add_workout", "adjust_sleep_bounds", "delete_metric_point", "set_baseline_note", "edit_sleep_stages", "delete_hr_range"] as const;
 export type EditKind = (typeof EDIT_KINDS)[number];
 
+// delete_metric_point's `key` originally only ever named a metricSeries key. It now also accepts
+// one of these dailyMetric column names, letting a single bad dailyMetric value (e.g. a spiked
+// restingHr) be blanked directly instead of only ever being reachable through the metricSeries
+// fallback path. Curated allowlist, not every dailyMetric column (see mirror.ts's
+// dailyMetricColumns() for the full introspected set): scoped to the columns worth a targeted
+// point-delete, not incidental ones like respRateBpm/activeKcalEst.
+export const DAILY_METRIC_EDITABLE_COLUMNS = ["restingHr", "avgHrv", "spo2Pct", "steps", "totalSleepMin", "efficiency", "skinTempDevC", "recovery", "strain"] as const;
+const DAILY_METRIC_EDITABLE_COLUMN_SET = new Set<string>(DAILY_METRIC_EDITABLE_COLUMNS);
+export function isDailyMetricColumnKey(key: string): boolean { return DAILY_METRIC_EDITABLE_COLUMN_SET.has(key); }
+
 const DAY = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "YYYY-MM-DD");
 const workoutKey = { deviceId: z.string().min(1), startTs: z.number().int(), sport: z.string().min(1) };
 const sleepStage = z.object({ start: z.number().int(), end: z.number().int(), stage: z.enum(["awake", "light", "deep", "rem"]) });

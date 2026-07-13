@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import Database from "better-sqlite3";
 import type { Config } from "../config.js";
-import type { EditKind } from "./kinds.js";
+import { isDailyMetricColumnKey, EditKind } from "./kinds.js";
 
 export class EditTargetError extends Error {
   constructor(public code: "target_not_found" | "not_ingested", msg?: string) { super(msg ?? code); }
@@ -34,7 +34,17 @@ export function captureBefore(cfg: Pick<Config, "mirrorPath">, kind: EditKind, p
     } else if (kind === "adjust_sleep_bounds" || kind === "edit_sleep_stages") {
       row = db.prepare("SELECT * FROM sleepSession WHERE deviceId=? AND startTs=?").get(payload.deviceId, payload.startTs);
     } else if (kind === "delete_metric_point") {
-      row = db.prepare("SELECT * FROM metricSeries WHERE deviceId=? AND day=? AND key=?").get(payload.deviceId, payload.day, payload.key);
+      // key can now name an allowlisted dailyMetric column (in addition to its original
+      // metricSeries-key meaning) — column names win when a key matches one, since that's the
+      // confirmed-bogus-data-point use case this branch exists for. See DAILY_METRIC_EDITABLE_COLUMNS.
+      if (isDailyMetricColumnKey(payload.key)) {
+        const dm = db.prepare("SELECT * FROM dailyMetric WHERE deviceId=? AND day=?").get(payload.deviceId, payload.day) as any;
+        const value = dm ? dm[payload.key] : null;
+        row = (value === null || value === undefined) ? undefined : { source: "dailyMetric", deviceId: payload.deviceId, day: payload.day, key: payload.key, value };
+      } else {
+        const seriesRow = db.prepare("SELECT * FROM metricSeries WHERE deviceId=? AND day=? AND key=?").get(payload.deviceId, payload.day, payload.key);
+        row = seriesRow ? { source: "metricSeries", ...(seriesRow as object) } : undefined;
+      }
     } else if (kind === "delete_hr_range") {
       row = db.prepare("SELECT COUNT(*) AS count FROM hrSample WHERE deviceId=? AND ts>=? AND ts<=?").get(payload.deviceId, payload.fromTs, payload.toTs);
       if ((row as { count: number }).count === 0) throw new EditTargetError("target_not_found", `${kind}: no HR samples in range`);
@@ -61,8 +71,10 @@ export function renderDiff(kind: EditKind, payload: any, before: any): string {
       if (payload.newEndTs !== undefined) bits.push(`end ${iso(before.endTs)} ⇒ ${iso(payload.newEndTs)}`);
       return `ADJUST sleep @ ${iso(before.startTs)} (${payload.deviceId}): ${bits.join(", ")}`;
     }
-    case "delete_metric_point":
-      return `DELETE metric ${payload.key}=${before.value} on ${payload.day} (${payload.deviceId})`;
+    case "delete_metric_point": {
+      const label = before.source === "dailyMetric" ? "dailyMetric column" : "metricSeries key";
+      return `DELETE ${label} ${payload.key}=${before.value} on ${payload.day} (${payload.deviceId})`;
+    }
     case "set_baseline_note":
       return `NOTE${payload.deviceId ? ` [${payload.deviceId}]` : ""}: ${payload.note}`;
     case "edit_sleep_stages": {
