@@ -16,6 +16,11 @@ export interface DailyMetricRow {
 export interface SleepRow { deviceId: string; family: Family; startTs: number; endTs: number; efficiency: number | null; restingHr: number | null; avgHrv: number | null; userEdited: number; }
 export interface WorkoutRow { deviceId: string; family: Family; startTs: number; endTs: number; sport: string; source: string | null; durationS: number | null; energyKcal: number | null; distanceM: number | null; }
 export interface MetricPointRow { deviceId: string; family: Family; day: string; key: string; value: number; }
+// Real column is `counter` (WHOOP step_motion_counter@57): a CUMULATIVE u16 running counter, not a
+// per-sample step count — see countPostureChanges' sibling stepDeltas() in tools/granular.ts.
+// activityClass is a nullable INTEGER enum (0=still, 1=walk, 2=run), added in a later migration.
+export interface StepSampleRow { deviceId: string; ts: number; counter: number; activityClass: number | null; }
+export interface GravitySampleRow { deviceId: string; ts: number; x: number; y: number; z: number; }
 
 const withFamily = <T extends { deviceId: string }>(r: T) => ({ ...r, family: sourceFamily(r.deviceId) });
 
@@ -62,5 +67,25 @@ export class Mirror {
   }
   sleepSessionAt(deviceId: string, startTs: number) {
     return (this.db.prepare("SELECT deviceId, startTs, endTs, efficiency, restingHr, avgHrv, userEdited, stagesJSON FROM sleepSession WHERE deviceId = ? AND startTs = ?").get(deviceId, startTs) as any) ?? null;
+  }
+
+  // Real phone schema carries stepSample/gravitySample from CoreMotion, but any mirror ingested
+  // before this feature shipped won't have them — check sqlite_master rather than assume present.
+  hasTable(name: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+  }
+  stepSamplesRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }): StepSampleRow[] {
+    if (!this.hasTable("stepSample")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, counter, activityClass FROM stepSample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+  gravitySamplesRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }): GravitySampleRow[] {
+    if (!this.hasTable("gravitySample")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, x, y, z FROM gravitySample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
   }
 }

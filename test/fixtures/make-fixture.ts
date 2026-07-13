@@ -23,6 +23,8 @@ export function buildMirrorSqlite(target: string): void {
     CREATE TABLE metricSeries (deviceId TEXT, day TEXT, key TEXT, value REAL, PRIMARY KEY(deviceId, day, key));
     CREATE TABLE appleDaily (deviceId TEXT, day TEXT, steps INTEGER, restingHr REAL, PRIMARY KEY(deviceId, day));
     CREATE TABLE pairedDevice (id TEXT PRIMARY KEY, brand TEXT, model TEXT, sourceKind TEXT);
+    CREATE TABLE stepSample (deviceId TEXT, ts INTEGER, counter INTEGER, activityClass INTEGER, PRIMARY KEY(deviceId, ts));
+    CREATE TABLE gravitySample (deviceId TEXT, ts INTEGER, x DOUBLE, y DOUBLE, z DOUBLE, synced INTEGER DEFAULT 0, PRIMARY KEY(deviceId, ts));
   `);
   db.prepare("INSERT INTO grdb_migrations VALUES (?)").run("v25-oura-raw");
   const pd = db.prepare("INSERT INTO pairedDevice VALUES (?,?,?,?)");
@@ -84,6 +86,38 @@ export function buildMirrorSqlite(target: string): void {
   ]);
   db.prepare("UPDATE sleepSession SET stagesJSON = ? WHERE deviceId = 'my-whoop' AND startTs = ?").run(stages, night);
   for (let t = night; t <= night + 25200; t += 300) hr.run("my-whoop", t, 46 + Math.round(8 * Math.abs(Math.sin(t / 3000))));
+
+  // Motion evidence for the same night (my-whoop), CoreMotion/WHOOP-shaped: wrist posture (gravity)
+  // is stable 03:00-05:00Z aside from a 03:30-03:40Z posture-change blip (a "stayed in bed" night).
+  // stepSample.counter is the real step_motion_counter@57 column — a CUMULATIVE u16 counter, NOT a
+  // per-sample step count (see stepDeltas() in src/tools/granular.ts) — so a baseline sample plus
+  // three post-walk samples give wrap-aware deltas of 20/30/25 (sum 75), landing just after the
+  // sleepSession's real end (night+25200 = 10:00Z, set above) so an in-session step sum is
+  // legitimately 0: the walk happens after wake. Both tables are new and absent from any mirror
+  // ingested before this feature shipped.
+  const grav = db.prepare("INSERT INTO gravitySample VALUES (?,?,?,?,?,?)");
+  const BLIP_START = night + 1800, BLIP_END = night + 2400; // 03:30–03:40Z
+  for (let t = night; t <= night + 7200; t += 5) { // 03:00–05:00Z, ~1 row/5s
+    const blip = t >= BLIP_START && t < BLIP_END;
+    grav.run("my-whoop", t, blip ? 0.9 : 0.0, 0.0, blip ? 0.2 : 1.0, 0);
+  }
+  const step = db.prepare("INSERT INTO stepSample VALUES (?,?,?,?)");
+  const wake = night + 25200; // sleepSession endTs for my-whoop on this night
+  step.run("my-whoop", wake + 240, 1000, null); // 10:04Z baseline — no predecessor, contributes 0
+  step.run("my-whoop", wake + 300, 1020, 1);    // 10:05Z, delta 20 (activityClass 1 = walk)
+  step.run("my-whoop", wake + 360, 1050, 1);    // 10:06Z, delta 30
+  step.run("my-whoop", wake + 420, 1075, 1);    // 10:07Z, delta 25
+
+  // Isolated wrap/gap fixture for stepDeltas() (2026-06-10 noon — clear of every other motion-tool
+  // test window): a real u16 wrap (65530 -> 10, delta 16), a >=512 "gap" jump that MUST be dropped
+  // (10 -> 20000, delta 19990 — a sync-session boundary/reboot, not real motion), then a real delta
+  // after it (20000 -> 20015, delta 15). Wrap-aware, gap-filtered sum = 16 + 15 = 31.
+  const wrapDay = tsOf("2026-06-10", 12);
+  step.run("my-whoop", wrapDay, 65530, null);
+  step.run("my-whoop", wrapDay + 60, 10, null);
+  step.run("my-whoop", wrapDay + 120, 20000, null);
+  step.run("my-whoop", wrapDay + 180, 20015, null);
+
   db.close();
 }
 

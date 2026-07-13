@@ -70,6 +70,11 @@ by appending, so the audit trail is complete forever.
 
 `hr_series` (raw or bucketed heart-rate for any window, ≤7 days) and `sleep_detail` (a night's full
 hypnogram + in-sleep HR) let the AI check the actual sensor evidence — e.g. "HR stayed at 48bpm and
-flat until 06:00, so that 03:00 'wake' was movement, not waking." Then `edit_sleep_stages` rewrites
-the night's stage timeline and `delete_hr_range` throws out artifact heart-rate stretches — through
-the same propose → confirm → journal → undo rail as every other edit.
+flat until 06:00, so that 03:00 'wake' was movement, not waking." `motion_series` (bucketed step
+counts + wrist posture/gravity) adds movement evidence — combined with `hr_series` it distinguishes
+"awake in bed" (no steps, unchanged posture) from "up and about" (steps, posture change);
+`sleep_detail` folds the same evidence into `motion: { steps, postureChanges }` for a session.
+Motion tools return empty/`null` (never throw) against a mirror uploaded before this feature shipped.
+Then `edit_sleep_stages` rewrites the night's stage timeline and `delete_hr_range` throws out
+artifact heart-rate stretches — through the same propose → confirm → journal → undo rail as every
+other edit.
