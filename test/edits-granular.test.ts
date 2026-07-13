@@ -12,6 +12,15 @@ const dataDir = path.join(process.cwd(), "test/.tmp/edits-granular");
 const cfg = { dataDir, mirrorPath: path.join(dataDir, "mirror.sqlite"), serverDbPath: path.join(dataDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
 const NIGHT = Math.floor(new Date("2026-06-13T03:00:00Z").getTime() / 1000);
 const NEW_STAGES = [{ start: NIGHT, end: NIGHT + 10800, stage: "deep" }, { start: NIGHT + 10800, end: NIGHT + 25200, stage: "light" }];
+// Contiguous ascending stage segments starting at NIGHT, cycling through every stage enum value —
+// used to exercise the segment-count cap (edit_sleep_stages.stages.max) without also having to hand
+// -build a semantically realistic hypnogram.
+const CYCLE = ["light", "deep", "rem", "awake"] as const;
+function buildStages(n: number) {
+  const stages: { start: number; end: number; stage: string }[] = [];
+  for (let i = 0; i < n; i++) stages.push({ start: NIGHT + i * 60, end: NIGHT + (i + 1) * 60, stage: CYCLE[i % CYCLE.length] });
+  return stages;
+}
 
 beforeAll(() => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfg); });
 
@@ -21,6 +30,16 @@ describe("granular edit kinds", () => {
     expect(payloadSchema("edit_sleep_stages").safeParse({ deviceId: "my-whoop", startTs: NIGHT, stages: NEW_STAGES }).success).toBe(true);
     expect(payloadSchema("edit_sleep_stages").safeParse({ deviceId: "d", startTs: 1, stages: [{ start: 5, end: 4, stage: "deep" }] }).success).toBe(false);
     expect(payloadSchema("delete_hr_range").safeParse({ deviceId: "my-whoop", fromTs: NIGHT, toTs: NIGHT + 30000 }).success).toBe(false); // >6h
+  });
+  it("edit_sleep_stages accepts a real fragmented night's 114 segments (cap raised from 96 to 256)", () => {
+    // Audit-exposed: a genuinely fragmented 9.4h night produced 114 stage segments and was rejected
+    // outright by the old 96 cap — this wasn't a malformed payload, just fine-grained real data.
+    const r = payloadSchema("edit_sleep_stages").safeParse({ deviceId: "my-whoop", startTs: NIGHT, stages: buildStages(114) });
+    expect(r.success).toBe(true);
+  });
+  it("edit_sleep_stages still rejects beyond the 256 cap", () => {
+    const r = payloadSchema("edit_sleep_stages").safeParse({ deviceId: "my-whoop", startTs: NIGHT, stages: buildStages(257) });
+    expect(r.success).toBe(false);
   });
   it("captureBefore + renderDiff for both kinds", () => {
     const b1 = captureBefore(cfg, "edit_sleep_stages", { deviceId: "my-whoop", startTs: NIGHT, stages: NEW_STAGES }) as any;

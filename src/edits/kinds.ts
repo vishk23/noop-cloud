@@ -38,7 +38,11 @@ const schemas: Record<EditKind, z.ZodTypeAny> = {
   set_baseline_note: z.object({ note: z.string().min(1).max(500), deviceId: z.string().min(1).optional() }).strict(),
   edit_sleep_stages: z.object({
     deviceId: z.string().min(1), startTs: z.number().int(),
-    stages: z.array(sleepStage).min(1).max(96),
+    // Raised from 96 after a real fragmented night (5.0 strap, fine-grained hypnogram) produced 114
+    // stage segments and got rejected outright (audit-exposed: the cap was rejecting genuine data, not
+    // just malformed payloads). 256 bounds the payload at ~15KB (each stage segment serializes to
+    // roughly 60 bytes of JSON) while covering even a heavily fragmented 9-10h night.
+    stages: z.array(sleepStage).min(1).max(256),
   }).strict()
     .refine((p) => p.stages.every((s) => s.end > s.start), "every stage must have end > start")
     .refine((p) => p.stages.every((s, i) => i === 0 || p.stages[i - 1].end === s.start), "stages must be ascending and contiguous"),
