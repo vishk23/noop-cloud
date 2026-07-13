@@ -72,6 +72,15 @@ export function buildMirrorSqlite(target: string): void {
   for (const day of DAYS) {
     ms.run("oura-api", day, "ref_sleep_score", 82);
     ms.run("oura-api", day, "oura_readiness", 78);
+    // Real phone behavior: Apple Health import writes steps to metricSeries+appleDaily, NOT
+    // dailyMetric — this fixture's apple-health dailyMetric row above (steps: 8200) is an
+    // intentional pin for the precedence test, so this 9100 value stays shadowed. See
+    // compareSources' metricSeries fallback in src/tools/compare.ts.
+    ms.run("apple-health", day, "steps", 9100);
+    // vo2max has no dailyMetric column at all (for any family) — pure-fallback proof, and with a
+    // second family below it also exercises spreadPct math over fallback-only values.
+    ms.run("apple-health", day, "vo2max", 41);
+    ms.run("my-whoop", day, "vo2max", 45);
   }
   const hr = db.prepare("INSERT INTO hrSample VALUES (?,?,?)");
   for (const day of DAYS) for (let i = 0; i < 5; i++) hr.run("oura-api", tsOf(day, 3) + i * 300, 55 + i);

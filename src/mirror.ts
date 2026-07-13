@@ -57,6 +57,13 @@ export class Mirror {
     if (opts.key) { where.push("key = ?"); args.push(opts.key); }
     return (this.db.prepare(`SELECT deviceId,day,key,value FROM metricSeries WHERE ${where.join(" AND ")} ORDER BY day, key`).all(...args) as any[]).map(withFamily);
   }
+  // Batched lookup for compareSources' metricSeries fallback: one query for every requested
+  // metric name across the whole day range, instead of a per-day/per-metric loop.
+  metricSeriesForKeys(opts: { keys: string[]; from: string; to: string }): MetricPointRow[] {
+    if (opts.keys.length === 0) return [];
+    const placeholders = opts.keys.map(() => "?").join(",");
+    return (this.db.prepare(`SELECT deviceId,day,key,value FROM metricSeries WHERE day >= ? AND day <= ? AND key IN (${placeholders}) ORDER BY day, key`).all(opts.from, opts.to, ...opts.keys) as any[]).map(withFamily);
+  }
   latestDataDay(): string | null { return (this.db.prepare("SELECT MAX(day) AS d FROM dailyMetric").get() as any)?.d ?? null; }
   hrCoverageDays(deviceId: string): number { return (this.db.prepare("SELECT COUNT(DISTINCT date(ts,'unixepoch')) AS c FROM hrSample WHERE deviceId = ?").get(deviceId) as any).c; }
   hrSamplesRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }): { deviceId: string; ts: number; bpm: number }[] {

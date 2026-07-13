@@ -20,6 +20,12 @@ export function compareSources(cfg: Config, args: { from: string; to: string; me
     const rows = m.dailyMetrics({ from: args.from, to: args.to });
     const byDay = new Map<string, DailyMetricRow[]>();
     for (const r of rows) { const a = byDay.get(r.day) ?? []; a.push(r); byDay.set(r.day, a); }
+    // Fallback source: some devices route a metric to metricSeries instead of the dailyMetric
+    // column (e.g. the phone's Apple Health import writes steps to metricSeries+appleDaily, not
+    // dailyMetric). One query for the whole range/metric set, grouped by "day|key" below.
+    const seriesRows = m.metricSeriesForKeys({ keys: metrics, from: args.from, to: args.to });
+    const seriesByDayKey = new Map<string, typeof seriesRows>();
+    for (const r of seriesRows) { const k = `${r.day}|${r.key}`; const a = seriesByDayKey.get(k) ?? []; a.push(r); seriesByDayKey.set(k, a); }
     const days = [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([day, drows]) => {
       const metricsOut: Record<string, any> = {};
       for (const metric of metrics) {
@@ -36,6 +42,17 @@ export function compareSources(cfg: Config, args: { from: string; to: string; me
           arr.push(v);
           byFamily.set(r.family, arr);
           perDevice[r.deviceId] = v;
+        }
+        // metricSeries fallback: only for families dailyMetric had nothing for (dailyMetric wins
+        // when present). Snapshot the dailyMetric-covered families BEFORE merging fallback rows in,
+        // so multiple fallback devices in the same (uncovered) family still merge correctly.
+        const dailyFamilies = new Set(byFamily.keys());
+        for (const r of seriesByDayKey.get(`${day}|${metric}`) ?? []) {
+          if (dailyFamilies.has(r.family)) continue;
+          const arr = byFamily.get(r.family) ?? [];
+          arr.push(r.value);
+          byFamily.set(r.family, arr);
+          perDevice[r.deviceId] = r.value;
         }
         const cell: Record<string, number> = {};
         let multiDevice = false;
@@ -56,8 +73,8 @@ export function compareSources(cfg: Config, args: { from: string; to: string; me
 export function registerCompareSources(server: McpServer, cfg: Config): void {
   server.registerTool("compare_sources", {
     title: "Compare sources",
-    description: "Per-day WHOOP vs Oura vs Apple side by side for chosen metrics, with a spread %. The corroboration workhorse. Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads.",
-    inputSchema: { from: DAY, to: DAY, metrics: z.array(z.string()).optional().describe("dailyMetric columns, e.g. restingHr, avgHrv, totalSleepMin, steps.") },
+    description: "Per-day WHOOP vs Oura vs Apple side by side for chosen metrics, with a spread %. The corroboration workhorse. Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads. Falls back to metricSeries keys (e.g. Apple steps) when a source lacks the dailyMetric column.",
+    inputSchema: { from: DAY, to: DAY, metrics: z.array(z.string()).optional().describe("dailyMetric columns (e.g. restingHr, avgHrv, totalSleepMin, steps) or metricSeries keys — falls back to metricSeries per-family when a source has no dailyMetric value.") },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(compareSources(cfg, a)));
 }

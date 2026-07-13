@@ -31,6 +31,30 @@ describe("compare_sources", () => {
     expect(recovery.whoop).toBe(62);
     expect(recovery.perDevice).toEqual({ "my-whoop": 66, "my-whoop-noop": 58 });
   });
+  it("falls back to metricSeries for a metric with no dailyMetric column at all (pure fallback)", () => {
+    // vo2max exists only in metricSeries (apple-health=41, my-whoop=45) — proves the fallback
+    // path works generically, not just for the steps special case.
+    const r = compareSources(cfg, { from: "2026-06-13", to: "2026-06-13", metrics: ["vo2max"] });
+    const vo2max = r.days[0].metrics.vo2max;
+    expect(vo2max.apple).toBe(41);
+    expect(vo2max.whoop).toBe(45);
+  });
+  it("prefers dailyMetric over the metricSeries fallback when both exist (Apple steps precedence)", () => {
+    // Fixture pins apple-health dailyMetric.steps=8200 AND metricSeries steps=9100 for the same
+    // day/device. dailyMetric must win — the 9100 fallback value must not leak through.
+    const r = compareSources(cfg, { from: "2026-06-13", to: "2026-06-13", metrics: ["steps"] });
+    const steps = r.days[0].metrics.steps;
+    expect(steps.apple).toBe(8200);
+    expect(steps.whoop).toBe(8000); // sanity: dailyMetric-only families unaffected by the fallback path
+  });
+  it("spreadPct math includes fallback values identically to dailyMetric values", () => {
+    // Both whoop (45) and apple (41) for vo2max come purely from the metricSeries fallback.
+    const r = compareSources(cfg, { from: "2026-06-13", to: "2026-06-13", metrics: ["vo2max"] });
+    const vo2max = r.days[0].metrics.vo2max;
+    const expected = Math.round(((45 - 41) / ((45 + 41) / 2)) * 1000) / 10;
+    expect(vo2max.spreadPct).toBe(expected);
+    expect(vo2max.spreadPct).toBeGreaterThan(0);
+  });
 });
 
 describe("compare_sources guard: empty mirror", () => {
