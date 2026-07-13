@@ -118,6 +118,18 @@ export function buildMirrorSqlite(target: string): void {
   step.run("my-whoop", wrapDay + 120, 20000, null);
   step.run("my-whoop", wrapDay + 180, 20015, null);
 
+  // Activity-class (#316/@63, 0=still/1=walk/2=run) diversity fixture, INSIDE the plain 2026-06-11
+  // my-whoop sleepSession bounds (03:00-10:00Z, no stages/HR/gravity of its own) so it exercises both
+  // sleep_detail.motion and motion_series against the same rows. One baseline (no predecessor, class
+  // null, contributes 0) then one delta per class: still=10, walk=30, run=50, unclassified=5 — sum 95,
+  // matching `steps`. All four offsets land in one 300s bucket (04:00:00-04:04:00Z).
+  const actBase = tsOf("2026-06-11", 3) + 3600; // 04:00Z, inside [03:00Z, 10:00Z)
+  step.run("my-whoop", actBase, 5000, null);      // 04:00Z baseline
+  step.run("my-whoop", actBase + 60, 5010, 0);    // 04:01Z, delta 10, still
+  step.run("my-whoop", actBase + 120, 5040, 1);   // 04:02Z, delta 30, walk
+  step.run("my-whoop", actBase + 180, 5090, 2);   // 04:03Z, delta 50, run
+  step.run("my-whoop", actBase + 240, 5095, null);// 04:04Z, delta 5, unclassified
+
   db.close();
 }
 

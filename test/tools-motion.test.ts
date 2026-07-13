@@ -76,6 +76,21 @@ describe("motion_series", () => {
     expect(r.notIngested).toBe(true);
   });
 
+  it("splits wrap-aware deltas into walk/run/still/unclassified ticks by the class of the ENDING sample", () => {
+    const actBase = Math.floor(new Date("2026-06-11T04:00:00Z").getTime() / 1000);
+    const r = motionSeries(cfg, { from: "2026-06-11T04:00:00Z", to: "2026-06-11T04:05:00Z", deviceId: "my-whoop", bucketSeconds: 300 }) as any;
+    expect(r.buckets.length).toBe(1);
+    const bucket = r.buckets[0];
+    expect(bucket.ts).toBe(actBase);
+    expect(bucket.steps).toBe(95); // 10 (still) + 30 (walk) + 50 (run) + 5 (unclassified)
+    expect(bucket.stillTicks).toBe(10);
+    expect(bucket.walkTicks).toBe(30);
+    expect(bucket.runTicks).toBe(50);
+    expect(bucket.unclassifiedTicks).toBe(5);
+    expect(bucket.stillTicks + bucket.walkTicks + bucket.runTicks + bucket.unclassifiedTicks).toBe(bucket.steps);
+    expect(bucket.n).toBe(5); // baseline + 4 classed samples, all raw-row evidence
+  });
+
   it("tolerates a mirror missing stepSample/gravitySample (pre-feature mirror) — empty, not throw", () => {
     const oldDir = path.join(process.cwd(), "test/.tmp/motion-old");
     fs.rmSync(oldDir, { recursive: true, force: true }); fs.mkdirSync(oldDir, { recursive: true });
@@ -114,5 +129,18 @@ describe("sleep_detail motion evidence", () => {
     expect(r.session.deviceId).toBe("oura-api");
     expect(r.motion).not.toBeNull();
     expect(r.motion.postureChanges).toBeGreaterThanOrEqual(1); // the 03:30 blip, borrowed from my-whoop
+  });
+
+  it("reports the walk/run/still/unclassified tick split for a session with classed step samples, no truncation", () => {
+    const day11 = Math.floor(new Date("2026-06-11T03:00:00Z").getTime() / 1000);
+    const r = sleepDetail(cfg, { deviceId: "my-whoop", startTs: day11 }) as any;
+    expect(r.motion).not.toBeNull();
+    expect(r.motion.steps).toBe(95);
+    expect(r.motion.stillTicks).toBe(10);
+    expect(r.motion.walkTicks).toBe(30);
+    expect(r.motion.runTicks).toBe(50);
+    expect(r.motion.unclassifiedTicks).toBe(5);
+    expect(r.motion.postureChanges).toBe(0); // no gravity rows seeded for this session
+    expect(r.motion.truncated).toBeUndefined();
   });
 });

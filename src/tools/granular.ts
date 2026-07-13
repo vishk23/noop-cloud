@@ -10,6 +10,20 @@ const toTs = (s: string, endOfDay = false) => /^\d{4}-\d{2}-\d{2}$/.test(s)
   ? Math.floor(new Date(`${s}T${endOfDay ? "23:59:59" : "00:00:00"}Z`).getTime() / 1000)
   : Math.floor(new Date(s).getTime() / 1000);
 const MAX_SPAN_S = 7 * 86_400, RAW_CAP = 5000;
+// sleepDetail's step/gravity reads only (NOT hr_series' RAW_CAP above, and NOT sleepDetail's own HR
+// read, which stays RAW_CAP): a sleep session is time-bounded (~14h max in practice) unlike hr_series'
+// open-ended window, and real motion cadence runs ~2 rows/sec — 14h * 3600 * 2 ≈ 100k rows, so 500k
+// gives ~5x headroom. Raised from RAW_CAP(5000) after a live mirror proved 5000 silently undercounts
+// steps/postureChanges 3-4x on a real ~22k-row night (post-hoc review Critical, 2026-07-12): the read
+// was truncated with no signal, so sleep_detail reported 17 steps / 5 postureChanges against a true
+// 70 / 15.
+const MOTION_RAW_CAP = 500_000;
+// motion_series spans up to 7 days (MAX_SPAN_S) with no per-session bound, so unlike sleepDetail this
+// can still truncate on a wide window with dense motion (e.g. >1.5 days of continuous ~2 rows/sec
+// motion at the old default). Kept at 200k rather than raised — surfaced via `truncated`/`hint`
+// instead, since a caller who hits this should narrow the window or bucket more coarsely, not silently
+// pull an unbounded read.
+const SERIES_CAP = 200_000;
 const round3 = (x: number) => Math.round(x * 1000) / 1000;
 
 function dropDeleted(samples: { deviceId: string; ts: number; bpm: number }[], ranges: { deviceId: string; fromTs: number; toTs: number }[]) {
@@ -49,22 +63,44 @@ function countPostureChanges(rows: { ts: number; x: number; y: number; z: number
 // reboot, not real motion — byte-indistinguishable from a wrap, so this is an approximation), and
 // the first sample per device has no predecessor and contributes nothing.
 const MAX_STEP_DELTA = 512;
-function stepDeltas(rows: { deviceId: string; ts: number; counter: number }[]): { deviceId: string; ts: number; delta: number }[] {
-  const byDevice = new Map<string, { ts: number; counter: number }[]>();
+// activityClass rides through each returned delta as the ENDING sample's class (see classifyTicks
+// below for why the ending sample, not the starting one, owns the delta).
+function stepDeltas(rows: { deviceId: string; ts: number; counter: number; activityClass?: number | null }[]): { deviceId: string; ts: number; delta: number; activityClass: number | null }[] {
+  const byDevice = new Map<string, { ts: number; counter: number; activityClass: number | null }[]>();
   for (const r of rows) {
     const arr = byDevice.get(r.deviceId) ?? [];
-    arr.push({ ts: r.ts, counter: r.counter });
+    arr.push({ ts: r.ts, counter: r.counter, activityClass: r.activityClass ?? null });
     byDevice.set(r.deviceId, arr);
   }
-  const out: { deviceId: string; ts: number; delta: number }[] = [];
+  const out: { deviceId: string; ts: number; delta: number; activityClass: number | null }[] = [];
   for (const [deviceId, arr] of byDevice) {
     arr.sort((a, b) => a.ts - b.ts);
     for (let i = 1; i < arr.length; i++) {
       const delta = (arr[i].counter - arr[i - 1].counter) & 0xFFFF;
-      if (delta >= 1 && delta < MAX_STEP_DELTA) out.push({ deviceId, ts: arr[i].ts, delta });
+      if (delta >= 1 && delta < MAX_STEP_DELTA) out.push({ deviceId, ts: arr[i].ts, delta, activityClass: arr[i].activityClass });
     }
   }
   return out;
+}
+
+// stepSample.activityClass is the strap's per-record @63 activity-class enum (community finding
+// #316, ported from Packages/WhoopProtocol/Sources/WhoopProtocol/Streams.swift in the NOOP app repo):
+// 0=still, 1=walk, 2=run, null when the byte was invalid/absent or the row predates the v19/(Android
+// v13) migration that added the column. The app itself never attributes activityClass at delta
+// granularity — its only consumer (Repository.swift's stepActivityClassLatest) picks the single
+// latest non-null class over a whole day for one icon — so there is no app-side "which sample owns a
+// multi-sample delta" convention to port. This function's choice, not a mirrored one: each wrap-aware
+// delta's tick count is attributed to the class of the sample ENDING that delta (arr[i], not
+// arr[i-1]), since that's the sample whose motion the counter distance actually measures up to.
+function classifyTicks(deltas: { delta: number; activityClass: number | null }[]): { walkTicks: number; runTicks: number; stillTicks: number; unclassifiedTicks: number } {
+  let walkTicks = 0, runTicks = 0, stillTicks = 0, unclassifiedTicks = 0;
+  for (const d of deltas) {
+    if (d.activityClass === 1) walkTicks += d.delta;
+    else if (d.activityClass === 2) runTicks += d.delta;
+    else if (d.activityClass === 0) stillTicks += d.delta;
+    else unclassifiedTicks += d.delta;
+  }
+  return { walkTicks, runTicks, stillTicks, unclassifiedTicks };
 }
 
 export function hrSeries(cfg: Config, args: { from: string; to: string; deviceId?: string; bucketSeconds?: number }) {
@@ -115,13 +151,18 @@ export function sleepDetail(cfg: Config, args: { deviceId: string; startTs: numb
     // sibling deviceId (e.g. "my-whoop") — confirmed against the live production mirror, where a
     // strict args.deviceId filter here silently reads as "no motion" for every real session instead
     // of falling back to whatever device actually carries the raw stream in this time window.
-    const stepsOwn = m.stepSamplesRange({ fromTs: startTs, toTs: endTs, deviceId: args.deviceId, limit: RAW_CAP });
-    const stepsAny = stepsOwn.length ? stepsOwn : m.stepSamplesRange({ fromTs: startTs, toTs: endTs, limit: RAW_CAP });
-    const gravityOwn = m.gravitySamplesRange({ fromTs: startTs, toTs: endTs, deviceId: args.deviceId, limit: RAW_CAP });
-    const gravityAny = gravityOwn.length ? gravityOwn : m.gravitySamplesRange({ fromTs: startTs, toTs: endTs, limit: RAW_CAP });
+    const stepsOwn = m.stepSamplesRange({ fromTs: startTs, toTs: endTs, deviceId: args.deviceId, limit: MOTION_RAW_CAP });
+    const stepsAny = stepsOwn.length ? stepsOwn : m.stepSamplesRange({ fromTs: startTs, toTs: endTs, limit: MOTION_RAW_CAP });
+    const gravityOwn = m.gravitySamplesRange({ fromTs: startTs, toTs: endTs, deviceId: args.deviceId, limit: MOTION_RAW_CAP });
+    const gravityAny = gravityOwn.length ? gravityOwn : m.gravitySamplesRange({ fromTs: startTs, toTs: endTs, limit: MOTION_RAW_CAP });
+    const deltasAny = stepDeltas(stepsAny);
     const motion = hasMotion ? {
-      steps: stepDeltas(stepsAny).reduce((sum, d) => sum + d.delta, 0),
+      steps: deltasAny.reduce((sum, d) => sum + d.delta, 0),
+      ...classifyTicks(deltasAny),
       postureChanges: countPostureChanges(gravityAny),
+      // Either read landing exactly on the cap means it was clipped, not necessarily complete — see
+      // MOTION_RAW_CAP above for the sizing rationale.
+      ...(stepsAny.length === MOTION_RAW_CAP || gravityAny.length === MOTION_RAW_CAP ? { truncated: true } : {}),
     } : null;
     return {
       session: { deviceId: row.deviceId, family: sourceFamily(row.deviceId), startTs, endTs, durationMin: Math.round((endTs - startTs) / 60), efficiency: row.efficiency, restingHr: row.restingHr, avgHrv: row.avgHrv, ...(adj ? { edited: true, editId: adj.editId } : {}) },
@@ -140,22 +181,31 @@ export function motionSeries(cfg: Config, args: { from: string; to: string; devi
   const b = Math.min(3600, Math.max(60, args.bucketSeconds ?? 300));
   const m = new Mirror(cfg.mirrorPath);
   try {
-    const stepsRaw = m.stepSamplesRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: 200_000 });
+    const stepsRaw = m.stepSamplesRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: SERIES_CAP });
     const deltas = stepDeltas(stepsRaw);
-    const gravity = m.gravitySamplesRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: 200_000 });
-    type Cell = { ts: number; deviceId: string; steps: number; n: number; gx: number[]; gy: number[]; gz: number[] };
+    const gravity = m.gravitySamplesRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: SERIES_CAP });
+    type Cell = { ts: number; deviceId: string; steps: number; walkTicks: number; runTicks: number; stillTicks: number; unclassifiedTicks: number; n: number; gx: number[]; gy: number[]; gz: number[] };
     const byBucket = new Map<string, Cell>();
     const cellFor = (deviceId: string, ts: number) => {
       const bucketTs = Math.floor(ts / b) * b;
       const key = `${deviceId}|${bucketTs}`;
       let c = byBucket.get(key);
-      if (!c) { c = { ts: bucketTs, deviceId, steps: 0, n: 0, gx: [], gy: [], gz: [] }; byBucket.set(key, c); }
+      if (!c) { c = { ts: bucketTs, deviceId, steps: 0, walkTicks: 0, runTicks: 0, stillTicks: 0, unclassifiedTicks: 0, n: 0, gx: [], gy: [], gz: [] }; byBucket.set(key, c); }
       return c;
     };
     // Every raw stepSample row is motion evidence (bucket presence + n), even when its own delta
-    // isn't computable (first sample per device); the wrap-aware deltas separately add to `steps`.
+    // isn't computable (first sample per device); the wrap-aware deltas separately add to `steps` and,
+    // per classifyTicks above, to exactly one of walkTicks/runTicks/stillTicks/unclassifiedTicks (the
+    // four always sum to `steps`).
     for (const s of stepsRaw) { const c = cellFor(s.deviceId, s.ts); c.n += 1; }
-    for (const d of deltas) { const c = cellFor(d.deviceId, d.ts); c.steps += d.delta; }
+    for (const d of deltas) {
+      const c = cellFor(d.deviceId, d.ts);
+      c.steps += d.delta;
+      if (d.activityClass === 1) c.walkTicks += d.delta;
+      else if (d.activityClass === 2) c.runTicks += d.delta;
+      else if (d.activityClass === 0) c.stillTicks += d.delta;
+      else c.unclassifiedTicks += d.delta;
+    }
     for (const g of gravity) { const c = cellFor(g.deviceId, g.ts); c.gx.push(g.x); c.gy.push(g.y); c.gz.push(g.z); c.n += 1; }
     const avg = (xs: number[]) => round3(xs.reduce((a, x) => a + x, 0) / xs.length);
     const spread = (xs: number[]) => (xs.length ? Math.max(...xs) - Math.min(...xs) : 0);
@@ -163,10 +213,13 @@ export function motionSeries(cfg: Config, args: { from: string; to: string; devi
       .sort((a, c) => a.ts - c.ts || a.deviceId.localeCompare(c.deviceId))
       .map((x) => ({
         ts: x.ts, deviceId: x.deviceId, family: sourceFamily(x.deviceId), steps: x.steps,
+        walkTicks: x.walkTicks, runTicks: x.runTicks, stillTicks: x.stillTicks, unclassifiedTicks: x.unclassifiedTicks,
         ...(x.gx.length ? { postureX: avg(x.gx), postureY: avg(x.gy), postureZ: avg(x.gz), postureVar: round3((spread(x.gx) + spread(x.gy) + spread(x.gz)) / 3) } : {}),
         n: x.n,
       }));
-    return { buckets };
+    // Either source read landing exactly on SERIES_CAP means it was clipped — a wide window with dense
+    // motion (see SERIES_CAP above) — so later buckets in the range may be missing entirely.
+    return { buckets, ...(stepsRaw.length === SERIES_CAP || gravity.length === SERIES_CAP ? { truncated: true, hint: "narrow the from/to window or increase bucketSeconds" } : {}) };
   } finally { m.close(); }
 }
 
@@ -180,14 +233,14 @@ export function registerGranularTools(server: McpServer, cfg: Config): void {
 
   server.registerTool("sleep_detail", {
     title: "Sleep night detail",
-    description: "One night's full evidence: bounds, stage-by-stage hypnogram, in-sleep heart-rate, and motion (step count + wrist-posture changes) during the session. Reflects confirmed stage edits, bound adjustments, and HR deletions.",
+    description: "One night's full evidence: bounds, stage-by-stage hypnogram, in-sleep heart-rate, and motion (step count + walk/run/still/unclassified tick breakdown + wrist-posture changes) during the session. Reflects confirmed stage edits, bound adjustments, and HR deletions. motion.truncated:true means the raw step/gravity read hit its cap and the count may be incomplete.",
     inputSchema: { deviceId: z.string(), startTs: z.number().int() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(sleepDetail(cfg, a)));
 
   server.registerTool("motion_series", {
     title: "Motion series",
-    description: "Movement evidence for a time range: step counts + wrist posture (gravity) per bucket. Use with hr_series to distinguish 'awake in bed' (no steps, unchanged posture) from 'up and about' (steps, posture change).",
+    description: "Movement evidence for a time range: step counts (+ walk/run/still/unclassified tick breakdown) + wrist posture (gravity) per bucket. Use with hr_series to distinguish 'awake in bed' (no steps, unchanged posture) from 'up and about' (steps, posture change). truncated:true means a wide window with dense motion hit the read cap — narrow the range or widen bucketSeconds.",
     inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(motionSeries(cfg, a)));
