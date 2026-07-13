@@ -29,4 +29,28 @@ describe("edit kinds", () => {
     expect(d).toContain("06:00");
     expect(d.toLowerCase()).toContain("end");
   });
+
+  // delete_metric_point's key now also names a dailyMetric column (post-hoc audit fix): these
+  // three cases pin captureBefore/renderDiff's branching between the new dailyMetric-column path
+  // and the original metricSeries-key path.
+  it("captureBefore resolves delete_metric_point against a dailyMetric column when the key is allowlisted", () => {
+    // oura-api restingHr on 2026-06-13 is 53 in the fixture (make-fixture.ts).
+    const before = captureBefore(cfg, "delete_metric_point", { deviceId: "oura-api", day: "2026-06-13", key: "restingHr" }) as any;
+    expect(before.value).toBe(53);
+    expect(before.source).toBe("dailyMetric");
+    const d = renderDiff("delete_metric_point", { deviceId: "oura-api", day: "2026-06-13", key: "restingHr" }, before);
+    expect(d).toContain("dailyMetric column");
+    expect(d).toContain("53");
+  });
+  it("captureBefore still resolves delete_metric_point against metricSeries for a non-column key", () => {
+    const before = captureBefore(cfg, "delete_metric_point", { deviceId: "oura-api", day: "2026-06-13", key: "oura_readiness" }) as any;
+    expect(before.value).toBe(78);
+    expect(before.source).toBe("metricSeries");
+    const d = renderDiff("delete_metric_point", { deviceId: "oura-api", day: "2026-06-13", key: "oura_readiness" }, before);
+    expect(d).toContain("metricSeries key");
+  });
+  it("captureBefore errors on a dailyMetric column delete with no value at that row", () => {
+    // apple-health avgHrv is null for every day in the fixture.
+    expect(() => captureBefore(cfg, "delete_metric_point", { deviceId: "apple-health", day: "2026-06-13", key: "avgHrv" })).toThrow(EditTargetError);
+  });
 });

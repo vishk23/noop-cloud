@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "../config.js";
-import { EDIT_KINDS, EditKind, payloadSchema } from "../edits/kinds.js";
+import { EDIT_KINDS, EditKind, payloadSchema, DAILY_METRIC_EDITABLE_COLUMNS } from "../edits/kinds.js";
 import { captureBefore, renderDiff, EditTargetError } from "../edits/diff.js";
 import { createProposal, listPending, journalSince, getProposal, resolveProposal, appendJournal, markUndone, journalEntryFor } from "../staging.js";
 
@@ -11,7 +11,7 @@ const asTool = (obj: unknown) => ({ content: [{ type: "text" as const, text: JSO
 export function registerWriteTools(server: McpServer, cfg: Config, scope: "ro" | "rw"): void {
   server.registerTool("propose_edit", {
     title: "Propose a data edit",
-    description: "Stage a correction (nothing is applied until a human confirms with the read-write credential). Kinds: " + EDIT_KINDS.join(", ") + ". Returns a human-readable diff and the proposal id.",
+    description: "Stage a correction (nothing is applied until a human confirms with the read-write credential). Kinds: " + EDIT_KINDS.join(", ") + ". delete_metric_point's key can name either a metricSeries key or one of these dailyMetric columns to blank a single bad value: " + DAILY_METRIC_EDITABLE_COLUMNS.join(", ") + " — column deletes apply immediately to every server-side read (compare_sources, health_snapshot, metric_series fallback paths, fetch) but the phone-side sync doesn't understand column deletes yet (Phase 3 work): it will surface needsAttention and ack without changing local data. Returns a human-readable diff and the proposal id.",
     inputSchema: {
       kind: z.enum(EDIT_KINDS),
       payload: z.record(z.unknown()).describe("Kind-specific payload; see the kind's schema."),

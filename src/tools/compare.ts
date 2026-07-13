@@ -47,6 +47,11 @@ export function compareSources(cfg: Config, args: { from: string; to: string; me
         for (const r of drows) {
           const v = (r as any)[metric];
           if (v === null || v === undefined) continue;
+          // delete_metric_point can target a dailyMetric column directly (not just a metricSeries
+          // key) — a deleted column value must not count toward the family average, and must free
+          // the family up for the metricSeries fallback below exactly like a genuinely-null
+          // dailyMetric value already does.
+          if (overlay.deletedMetricPoints.has(pointKeyOf(r.deviceId, r.day, metric))) continue;
           const arr = byFamily.get(r.family) ?? [];
           arr.push(v);
           byFamily.set(r.family, arr);
