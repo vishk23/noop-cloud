@@ -29,6 +29,10 @@ describe("granular reads", () => {
     expect(r.session.durationMin).toBeGreaterThan(0);
     expect(r.stages.length).toBeGreaterThanOrEqual(3);
     expect(r.hrDuringSleep.length).toBeGreaterThanOrEqual(80);
+    // Sparse night (well under the 5000-sample decimation cap): untouched, no decimation flags.
+    expect(r.hrDecimated).toBeUndefined();
+    expect(r.hrStride).toBeUndefined();
+    expect(r.hrTotalSamples).toBeUndefined();
   });
   it("sleep_detail notFound for a ghost session", () => {
     expect((sleepDetail(cfg, { deviceId: "my-whoop", startTs: 1 }) as any).notFound).toBe(true);
