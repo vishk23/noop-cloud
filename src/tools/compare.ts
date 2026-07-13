@@ -88,8 +88,8 @@ export function compareSources(cfg: Config, args: { from: string; to: string; me
 export function registerCompareSources(server: McpServer, cfg: Config): void {
   server.registerTool("compare_sources", {
     title: "Compare sources",
-    description: "Per-day WHOOP vs Oura vs Apple side by side for chosen metrics, with a spread %. The corroboration workhorse. Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads. Falls back to metricSeries keys (e.g. Apple steps) when a source lacks the dailyMetric column.",
-    inputSchema: { from: DAY, to: DAY, metrics: z.array(z.string()).optional().describe("dailyMetric columns (e.g. restingHr, avgHrv, totalSleepMin, steps) or metricSeries keys — falls back to metricSeries per-family when a source has no dailyMetric value.") },
+    description: "Per-day WHOOP vs Oura vs Apple side by side for chosen metrics, with a spread %. The corroboration workhorse. Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads. Falls back to metricSeries keys (e.g. Apple steps) when a source lacks the dailyMetric column. Common dailyMetric columns: restingHr, avgHrv, spo2Pct, steps, totalSleepMin, efficiency, skinTempDevC, recovery, strain. Common metricSeries keys: oura_*/ref_* scores, body_age, fitness_age, sleep_performance, steps_est, vitality. Call data_freshness for the full dailyMetricColumns/metricSeriesKeys lists.",
+    inputSchema: { from: DAY, to: DAY, metrics: z.array(z.string()).optional().describe("dailyMetric columns (restingHr, avgHrv, spo2Pct, steps, totalSleepMin, efficiency, skinTempDevC, recovery, strain, ...) or metricSeries keys (oura_*/ref_* scores, body_age, fitness_age, sleep_performance, steps_est, vitality, vo2max, ...) — falls back to metricSeries per-family when a source has no dailyMetric value. See data_freshness for the full lists.") },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(compareSources(cfg, a)));
 }

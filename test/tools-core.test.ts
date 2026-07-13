@@ -15,6 +15,22 @@ describe("core tools", () => {
     expect(r.sources.map((s) => s.deviceId)).toContain("oura-api");
     expect(r.mirrorAgeSeconds).toBeGreaterThanOrEqual(0);
   });
+  it("data_freshness surfaces dailyMetric columns + metricSeries keys for discoverability (post-hoc audit fix)", () => {
+    // The audit that motivated this wasted a whole agent-run failing to find skinTempDevC because
+    // nothing listed valid dailyMetric column / metricSeries key names.
+    const r = dataFreshness(cfg) as any;
+    expect(r.dailyMetricColumns.length).toBeGreaterThan(0);
+    expect(r.dailyMetricColumns).toContain("skinTempDevC");
+    expect(r.dailyMetricColumns).toContain("restingHr");
+    expect(r.dailyMetricColumns).not.toContain("deviceId"); // identity columns excluded
+    expect(r.dailyMetricColumns).not.toContain("day");
+
+    expect(r.metricSeriesKeys.length).toBeGreaterThan(0);
+    const byKey = Object.fromEntries(r.metricSeriesKeys.map((k: any) => [k.key, k.counts]));
+    expect(byKey.vo2max).toBeDefined();
+    expect(byKey.vo2max.apple).toBeGreaterThan(0);
+    expect(byKey.vo2max.whoop).toBeGreaterThan(0);
+  });
   it("health_snapshot rolls up recent days by family", () => {
     const r = healthSnapshot(cfg, { days: 2 });
     expect(r.days.length).toBe(2);

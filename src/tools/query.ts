@@ -56,7 +56,7 @@ export function workoutSummary(cfg: Config, args: { from: string; to: string }) 
 export function registerQueryTools(server: McpServer, cfg: Config): void {
   server.registerTool("metric_series", {
     title: "Metric series",
-    description: "Long-format metric points for a date range. Any source (incl. oura-api) and key (e.g. ref_sleep_score, oura_readiness). Reflects confirmed server-side edits; dailyMetric-derived numbers update only after Phase-3 phone sync.",
+    description: "Long-format metric points for a date range. Any source (incl. oura-api) and key (e.g. ref_sleep_score, oura_readiness, body_age, fitness_age, sleep_performance, steps_est, vitality, or other oura_*/ref_* scores). Reflects confirmed server-side edits; dailyMetric-derived numbers update only after Phase-3 phone sync. Call data_freshness for the full metricSeriesKeys list (per-family counts) and dailyMetricColumns (the columns compare_sources/health_snapshot read directly).",
     inputSchema: { ...range, deviceId: z.string().optional(), key: z.string().optional() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(metricSeries(cfg, a)));
