@@ -7,9 +7,24 @@ import { latestIngest } from "../ingest.js";
 import { listPending, journalSince } from "../staging.js";
 import { computeOverlay, pointKeyOf } from "../edits/overlay.js";
 
+// set_baseline_note is append-only in the journal (staging.ts never deletes/rewrites rows), but
+// surfacing full history means a stale note sits right next to its own replacement — audit-exposed: a
+// fixture-era note stayed visible alongside its oura-api correction. computeOverlay's baselineNotes
+// is already in application order (activeEdits is ORDER BY seq), so the last entry per deviceId is the
+// current one; this collapses to that, tagging how many earlier notes for the same device it replaced.
+// Journal history itself is untouched — this only shapes what dataFreshness returns.
+function latestBaselineNotes(notes: { note: string; deviceId: string | null; at: number }[]) {
+  const byDevice = new Map<string | null, { note: string; deviceId: string | null; at: number; supersededCount: number }>();
+  for (const n of notes) {
+    const supersededCount = (byDevice.get(n.deviceId)?.supersededCount ?? -1) + 1;
+    byDevice.set(n.deviceId, { note: n.note, deviceId: n.deviceId, at: n.at, supersededCount });
+  }
+  return [...byDevice.values()].map(({ supersededCount, ...rest }) => (supersededCount > 0 ? { ...rest, supersededCount } : rest));
+}
+
 export function dataFreshness(cfg: Config) {
   if (!fs.existsSync(cfg.mirrorPath)) {
-    const baselineNotes = computeOverlay(cfg).baselineNotes;
+    const baselineNotes = latestBaselineNotes(computeOverlay(cfg).baselineNotes);
     const j = journalSince(cfg, 0);
     const journalSeq = j.length ? j[j.length - 1].seq : 0;
     return { mirrorAgeSeconds: null, lastIngestAt: null, latestDataDay: null, sources: [], dailyMetricColumns: [], metricSeriesKeys: [], pendingEdits: listPending(cfg).length, journalSeq, baselineNotes, notIngested: true };
@@ -18,7 +33,7 @@ export function dataFreshness(cfg: Config) {
   try {
     const li = latestIngest(cfg);
     const now = Math.floor(Date.now() / 1000);
-    const baselineNotes = computeOverlay(cfg).baselineNotes;
+    const baselineNotes = latestBaselineNotes(computeOverlay(cfg).baselineNotes);
     const j = journalSince(cfg, 0);
     const journalSeq = j.length ? j[j.length - 1].seq : 0;
     return {
