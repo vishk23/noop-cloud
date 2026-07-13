@@ -179,6 +179,15 @@ export function motionSeries(cfg: Config, args: { from: string; to: string; devi
   if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
   if (toT - fromTs > MAX_SPAN_S) return { error: "span_too_wide", maxDays: 7 };
   const b = Math.min(3600, Math.max(60, args.bucketSeconds ?? 300));
+  // appleStepHour rows are hour-granular (ts = hour-start, one pre-aggregated steps total per hour) —
+  // a caller explicitly filtered to apple-health with a sub-hour bucket can't get a meaningful answer
+  // (every bucket would just echo one hour's total, or be empty), so this rejects rather than silently
+  // returning a misleading result. An unfiltered caller with a sub-hour bucket instead falls through
+  // and omits apple rows (see appleOmitted below) since strap data at that bucket size is still valid.
+  if (args.deviceId === "apple-health" && b < 3600) {
+    return { error: "apple_hourly_min_bucket", hint: "appleStepHour data is hourly; use bucketSeconds >= 3600" };
+  }
+  const wantsApple = args.deviceId === "apple-health" || args.deviceId === undefined;
   const m = new Mirror(cfg.mirrorPath);
   try {
     const stepsRaw = m.stepSamplesRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: SERIES_CAP });
@@ -209,17 +218,44 @@ export function motionSeries(cfg: Config, args: { from: string; to: string; devi
     for (const g of gravity) { const c = cellFor(g.deviceId, g.ts); c.gx.push(g.x); c.gy.push(g.y); c.gz.push(g.z); c.n += 1; }
     const avg = (xs: number[]) => round3(xs.reduce((a, x) => a + x, 0) / xs.length);
     const spread = (xs: number[]) => (xs.length ? Math.max(...xs) - Math.min(...xs) : 0);
-    const buckets = [...byBucket.values()]
-      .sort((a, c) => a.ts - c.ts || a.deviceId.localeCompare(c.deviceId))
+    const strapBuckets = [...byBucket.values()]
       .map((x) => ({
         ts: x.ts, deviceId: x.deviceId, family: sourceFamily(x.deviceId), steps: x.steps,
         walkTicks: x.walkTicks, runTicks: x.runTicks, stillTicks: x.stillTicks, unclassifiedTicks: x.unclassifiedTicks,
         ...(x.gx.length ? { postureX: avg(x.gx), postureY: avg(x.gy), postureZ: avg(x.gz), postureVar: round3((spread(x.gx) + spread(x.gy) + spread(x.gz)) / 3) } : {}),
         n: x.n,
       }));
+    // iPhone hourly steps overlay (appleStepHour, NOOP commit d47525ea): only meaningful at
+    // bucketSeconds >= 3600 (see the apple_hourly_min_bucket early-return above for the
+    // apple-health-filtered case). An unfiltered caller with a finer bucket still gets full strap
+    // data — apple rows are just left out, flagged via appleOmitted so the caller knows why iPhone
+    // data isn't there rather than assuming the phone recorded nothing. Built as separate bucket
+    // objects (not through cellFor/Cell) rather than zero-filled tick/posture fields, since apple rows
+    // carry neither activity-class nor gravity evidence.
+    let appleOmitted = false;
+    const appleBucketsByTs = new Map<number, { steps: number; n: number; deviceId: string }>();
+    if (wantsApple) {
+      if (b >= 3600) {
+        for (const row of m.appleStepHours(fromTs, toT)) {
+          const bucketTs = Math.floor(row.ts / b) * b;
+          const cur = appleBucketsByTs.get(bucketTs) ?? { steps: 0, n: 0, deviceId: row.deviceId };
+          cur.steps += row.steps; cur.n += 1;
+          appleBucketsByTs.set(bucketTs, cur);
+        }
+      } else {
+        appleOmitted = true;
+      }
+    }
+    const appleBuckets = [...appleBucketsByTs.entries()]
+      .map(([ts, v]) => ({ ts, deviceId: v.deviceId, family: sourceFamily(v.deviceId), steps: v.steps, n: v.n }));
+    const buckets = [...strapBuckets, ...appleBuckets].sort((a, c) => a.ts - c.ts || a.deviceId.localeCompare(c.deviceId));
     // Either source read landing exactly on SERIES_CAP means it was clipped — a wide window with dense
     // motion (see SERIES_CAP above) — so later buckets in the range may be missing entirely.
-    return { buckets, ...(stepsRaw.length === SERIES_CAP || gravity.length === SERIES_CAP ? { truncated: true, hint: "narrow the from/to window or increase bucketSeconds" } : {}) };
+    return {
+      buckets,
+      ...(stepsRaw.length === SERIES_CAP || gravity.length === SERIES_CAP ? { truncated: true, hint: "narrow the from/to window or increase bucketSeconds" } : {}),
+      ...(appleOmitted ? { appleOmitted: true } : {}),
+    };
   } finally { m.close(); }
 }
 
@@ -240,7 +276,7 @@ export function registerGranularTools(server: McpServer, cfg: Config): void {
 
   server.registerTool("motion_series", {
     title: "Motion series",
-    description: "Movement evidence for a time range: step counts (+ walk/run/still/unclassified tick breakdown) + wrist posture (gravity) per bucket. Use with hr_series to distinguish 'awake in bed' (no steps, unchanged posture) from 'up and about' (steps, posture change). truncated:true means a wide window with dense motion hit the read cap — narrow the range or widen bucketSeconds.",
+    description: "Movement evidence for a time range: step counts (+ walk/run/still/unclassified tick breakdown) + wrist posture (gravity) per bucket. Includes iPhone hourly steps (apple-health) when bucketSeconds >= 3600 — overlay against strap ticks to see when the phone was/wasn't recording. Use with hr_series to distinguish 'awake in bed' (no steps, unchanged posture) from 'up and about' (steps, posture change). truncated:true means a wide window with dense motion hit the read cap — narrow the range or widen bucketSeconds.",
     inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(motionSeries(cfg, a)));

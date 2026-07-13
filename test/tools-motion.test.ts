@@ -110,6 +110,52 @@ describe("motion_series", () => {
   });
 });
 
+describe("motion_series apple-health hourly overlay (appleStepHour)", () => {
+  it("includes apple-health hourly buckets alongside strap buckets when unfiltered at hourly granularity", () => {
+    const r = motionSeries(cfg, { from: "2026-06-13T03:00:00Z", to: "2026-06-13T10:00:00Z", bucketSeconds: 3600 }) as any;
+    const appleBuckets = r.buckets.filter((b: any) => b.deviceId === "apple-health");
+    expect(appleBuckets.length).toBe(8); // 03:00Z..10:00Z inclusive, one appleStepHour row per hour
+    expect(appleBuckets.every((b: any) => b.family === "apple")).toBe(true);
+    expect(appleBuckets.map((b: any) => b.steps)).toEqual([0, 0, 0, 0, 120, 900, 1500, 400]);
+    // apple rows carry neither posture (gravity) nor activity-class evidence.
+    expect(appleBuckets.every((b: any) => b.postureX === undefined)).toBe(true);
+    expect(appleBuckets.every((b: any) => b.walkTicks === undefined)).toBe(true);
+    // strap (my-whoop) gravity buckets from the same night are still present, untouched by the overlay.
+    const strapBuckets = r.buckets.filter((b: any) => b.deviceId === "my-whoop");
+    expect(strapBuckets.length).toBeGreaterThan(0);
+    expect(r.appleOmitted).toBeUndefined();
+  });
+
+  it("rejects a sub-hour bucket when explicitly filtered to apple-health", () => {
+    const r = motionSeries(cfg, { from: "2026-06-13T03:00:00Z", to: "2026-06-13T10:00:00Z", deviceId: "apple-health", bucketSeconds: 120 }) as any;
+    expect(r.error).toBe("apple_hourly_min_bucket");
+    expect(r.hint).toBe("appleStepHour data is hourly; use bucketSeconds >= 3600");
+    expect(r.buckets).toBeUndefined();
+  });
+
+  it("omits apple rows and flags appleOmitted when unfiltered with a sub-hour bucket (strap stays fine-grained)", () => {
+    const r = motionSeries(cfg, { from: "2026-06-13T03:00:00Z", to: "2026-06-13T10:00:00Z", bucketSeconds: 120 }) as any;
+    expect(r.appleOmitted).toBe(true);
+    expect(r.error).toBeUndefined();
+    expect(r.buckets.some((b: any) => b.deviceId === "apple-health")).toBe(false);
+  });
+
+  it("tolerates a mirror missing appleStepHour (pre-feature mirror) at hourly granularity — no throw, no apple rows", () => {
+    const oldDir = path.join(process.cwd(), "test/.tmp/motion-old-apple");
+    fs.rmSync(oldDir, { recursive: true, force: true }); fs.mkdirSync(oldDir, { recursive: true });
+    const cfgOld = { dataDir: oldDir, mirrorPath: path.join(oldDir, "mirror.sqlite"), serverDbPath: path.join(oldDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
+    const z = path.join(oldDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfgOld);
+    const raw = new Database(cfgOld.mirrorPath);
+    raw.exec("DROP TABLE appleStepHour;");
+    raw.close();
+
+    expect(() => motionSeries(cfgOld, { from: "2026-06-13T03:00:00Z", to: "2026-06-13T10:00:00Z", bucketSeconds: 3600 })).not.toThrow();
+    const r = motionSeries(cfgOld, { from: "2026-06-13T03:00:00Z", to: "2026-06-13T10:00:00Z", bucketSeconds: 3600 }) as any;
+    expect(r.buckets.some((b: any) => b.deviceId === "apple-health")).toBe(false);
+    expect(r.appleOmitted).toBeUndefined(); // table absence isn't the same as the bucket-size omission signal
+  });
+});
+
 describe("sleep_detail motion evidence", () => {
   it("reports 0 in-session steps (the walk lands after the recorded wake) and >=1 posture change", () => {
     const r = sleepDetail(cfg, { deviceId: "my-whoop", startTs: NIGHT }) as any;

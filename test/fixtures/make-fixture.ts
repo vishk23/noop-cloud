@@ -25,6 +25,7 @@ export function buildMirrorSqlite(target: string): void {
     CREATE TABLE pairedDevice (id TEXT PRIMARY KEY, brand TEXT, model TEXT, sourceKind TEXT);
     CREATE TABLE stepSample (deviceId TEXT, ts INTEGER, counter INTEGER, activityClass INTEGER, PRIMARY KEY(deviceId, ts));
     CREATE TABLE gravitySample (deviceId TEXT, ts INTEGER, x DOUBLE, y DOUBLE, z DOUBLE, synced INTEGER DEFAULT 0, PRIMARY KEY(deviceId, ts));
+    CREATE TABLE appleStepHour (deviceId TEXT, ts INTEGER, steps INTEGER, PRIMARY KEY(deviceId, ts));
   `);
   db.prepare("INSERT INTO grdb_migrations VALUES (?)").run("v25-oura-raw");
   const pd = db.prepare("INSERT INTO pairedDevice VALUES (?,?,?,?)");
@@ -116,6 +117,15 @@ export function buildMirrorSqlite(target: string): void {
   step.run("my-whoop", wake + 300, 1020, 1);    // 10:05Z, delta 20 (activityClass 1 = walk)
   step.run("my-whoop", wake + 360, 1050, 1);    // 10:06Z, delta 30
   step.run("my-whoop", wake + 420, 1075, 1);    // 10:07Z, delta 25
+
+  // iPhone hourly steps overlay (appleStepHour, NOOP commit d47525ea): idle overnight then a walk
+  // starting 07:00Z, same 2026-06-13 night as the WHOOP motion fixture above — lets motion_series
+  // tests overlay phone-vs-strap recording windows on one night. New table, absent from any mirror
+  // ingested before this feature shipped (same hasTable tolerance as stepSample/gravitySample). No
+  // existing pin counts these rows.
+  const appleHour = db.prepare("INSERT INTO appleStepHour VALUES (?,?,?)");
+  const APPLE_HOURLY_STEPS = [0, 0, 0, 0, 120, 900, 1500, 400]; // 03:00Z..10:00Z, walk starts 07:00Z
+  APPLE_HOURLY_STEPS.forEach((steps, i) => appleHour.run("apple-health", night + i * 3600, steps));
 
   // Isolated wrap/gap fixture for stepDeltas() (2026-06-10 noon — clear of every other motion-tool
   // test window): a real u16 wrap (65530 -> 10, delta 16), a >=512 "gap" jump that MUST be dropped

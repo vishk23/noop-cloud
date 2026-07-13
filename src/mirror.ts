@@ -95,4 +95,15 @@ export class Mirror {
     args.push(opts.limit);
     return this.db.prepare(`SELECT deviceId, ts, x, y, z FROM gravitySample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
   }
+
+  // appleStepHour is populated by the iPhone-side hourly step import (NOOP commit d47525ea), written
+  // under deviceId "apple-health" — absent from any mirror uploaded before that phone build shipped,
+  // so this shares the hasTable tolerance pattern above rather than assuming the table exists. Rows
+  // are already pre-aggregated per hour (ts = hour-start, one steps total per hour), unlike
+  // stepSample's raw wrap-aware counter stream, so no delta math and no limit/deviceId filter: a
+  // 7-day (MAX_SPAN_S) window is at most 168 rows.
+  appleStepHours(fromTs: number, toTs: number): { deviceId: string; ts: number; steps: number }[] {
+    if (!this.hasTable("appleStepHour")) return [];
+    return this.db.prepare("SELECT deviceId, ts, steps FROM appleStepHour WHERE ts >= ? AND ts <= ? ORDER BY ts").all(fromTs, toTs) as any[];
+  }
 }
