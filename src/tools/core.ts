@@ -25,7 +25,7 @@ export function dataFreshness(cfg: Config) {
       mirrorAgeSeconds: li ? now - li.receivedAt : null,
       lastIngestAt: li ? new Date(li.receivedAt * 1000).toISOString() : null,
       latestDataDay: m.latestDataDay(),
-      sources: m.sources().map((s) => ({ deviceId: s.deviceId, family: s.family, latestDay: s.latestDay })),
+      sources: m.sources().map((s) => ({ deviceId: s.deviceId, family: s.family, latestDay: s.latestDay, tables: s.tables })),
       // Discoverability (post-hoc audit: a whole agent-run was wasted failing to find
       // skinTempDevC because nothing listed valid names). Introspected/aggregated fresh on every
       // call rather than hardcoded, so a phone-side schema change surfaces automatically.
@@ -82,7 +82,7 @@ const asTool = (obj: unknown) => ({ content: [{ type: "text" as const, text: JSO
 export function registerCoreTools(server: McpServer, cfg: Config): void {
   server.registerTool("data_freshness", {
     title: "Data freshness",
-    description: "How stale the mirror is and which sources it holds, plus discoverable `dailyMetricColumns` and `metricSeriesKeys` (per-family counts) for building compare_sources/metric_series calls. Call this first.",
+    description: "How stale the mirror is and which sources it holds (deviceIds that only ever write raw samples, e.g. hrSample-only straps, are included via `tables`), plus discoverable `dailyMetricColumns` and `metricSeriesKeys` (per-family counts) for building compare_sources/metric_series calls. Call this first.",
     inputSchema: {},
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async () => asTool(dataFreshness(cfg)));

@@ -29,12 +29,29 @@ export class Mirror {
   constructor(path: string) { this.db = new Database(path, { readonly: true, fileMustExist: true }); }
   close(): void { this.db.close(); }
 
+  // Union deviceIds across dailyMetric, sleepSession, and hrSample: a device that only ever
+  // writes raw samples (e.g. a strap deviceId, whose scored daily rollups land under a separate
+  // derived "-noop" deviceId) previously had no dailyMetric row and was invisible here even
+  // though it holds real data. One cheap GROUP BY per table (each aggregated off that table's own
+  // deviceId-prefixed primary key), unioned in JS; `tables` records which of the three a source
+  // actually appears in.
   sources() {
-    const rows = this.db.prepare(`
-      SELECT d.deviceId, MAX(d.day) AS latestDay, p.brand AS brand
-      FROM dailyMetric d LEFT JOIN pairedDevice p ON p.id = d.deviceId
-      GROUP BY d.deviceId ORDER BY d.deviceId`).all() as any[];
-    return rows.map((r) => ({ deviceId: r.deviceId, family: sourceFamily(r.deviceId), brand: r.brand ?? null, latestDay: r.latestDay ?? null }));
+    const dm = this.db.prepare(`SELECT deviceId, MAX(day) AS maxDay FROM dailyMetric GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[];
+    const ss = this.db.prepare(`SELECT deviceId, MAX(date(startTs, 'unixepoch')) AS maxDay FROM sleepSession GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[];
+    const hr = this.db.prepare(`SELECT deviceId, MAX(date(ts, 'unixepoch')) AS maxDay FROM hrSample GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[];
+    const byDevice = new Map<string, { tables: Set<string>; latestDay: string | null }>();
+    const merge = (rows: { deviceId: string; maxDay: string | null }[], table: string) => {
+      for (const r of rows) {
+        const e = byDevice.get(r.deviceId) ?? { tables: new Set<string>(), latestDay: null };
+        e.tables.add(table);
+        if (r.maxDay && (!e.latestDay || r.maxDay > e.latestDay)) e.latestDay = r.maxDay;
+        byDevice.set(r.deviceId, e);
+      }
+    };
+    merge(dm, "dailyMetric"); merge(ss, "sleepSession"); merge(hr, "hrSample");
+    const brandById = new Map((this.db.prepare("SELECT id, brand FROM pairedDevice").all() as { id: string; brand: string | null }[]).map((b) => [b.id, b.brand]));
+    return [...byDevice.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([deviceId, e]) => ({ deviceId, family: sourceFamily(deviceId), brand: brandById.get(deviceId) ?? null, latestDay: e.latestDay, tables: [...e.tables].sort() }));
   }
   // PRAGMA-introspected dailyMetric columns minus the two identity columns — lets callers (and
   // data_freshness, see tools/core.ts) discover real column names instead of guessing (post-hoc
