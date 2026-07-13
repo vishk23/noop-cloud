@@ -32,8 +32,30 @@ Then ask: "call data_freshness, then health_snapshot for the last 7 days."
 ## Tools
 
 `data_freshness`, `health_snapshot`, `metric_series`, `sleep_summary`, `workout_summary`,
-`compare_sources`, plus ChatGPT Deep Research `search`/`fetch`. Prompts: `morning_report`,
-`corroborate_sources`, `find_messy_data`. All read-only in this phase.
+`compare_sources`, `request_sync`, plus ChatGPT Deep Research `search`/`fetch`. Prompts:
+`morning_report`, `corroborate_sources`, `find_messy_data`. All read-only in this phase.
+
+## Push-triggered on-demand sync
+
+`request_sync` asks the phone to sync right now via a silent APNs push instead of waiting for its
+normal schedule — call it, then poll `data_freshness` until `mirrorAgeSeconds` resets. It's
+throttled to one push per 120s server-wide and never throws: with no push credentials configured
+it returns `{configured: false}`, and with credentials but no registered phone it returns
+`{devices: 0}`.
+
+Requires an Apple Developer APNs Auth Key (.p8) and four Fly secrets:
+
+```bash
+fly secrets set \
+  APNS_KEY_P8="$(cat AuthKey_XXXXXXXXXX.p8)" \
+  APNS_KEY_ID=XXXXXXXXXX \
+  APPLE_TEAM_ID=YOUR_TEAM_ID \
+  APNS_TOPIC=com.yourorg.NOOP
+```
+
+The phone side isn't wired up yet — once it registers for silent push, it should call
+`POST /register-device` (read-write credential) with `{token, platform: "ios"}`, ideally on every
+app open so a reinstalled/restored phone re-registers automatically.
 
 ## Morning report
 
