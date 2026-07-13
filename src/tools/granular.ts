@@ -10,13 +10,12 @@ const toTs = (s: string, endOfDay = false) => /^\d{4}-\d{2}-\d{2}$/.test(s)
   ? Math.floor(new Date(`${s}T${endOfDay ? "23:59:59" : "00:00:00"}Z`).getTime() / 1000)
   : Math.floor(new Date(s).getTime() / 1000);
 const MAX_SPAN_S = 7 * 86_400, RAW_CAP = 5000;
-// sleepDetail's step/gravity reads only (NOT hr_series' RAW_CAP above, and NOT sleepDetail's own HR
-// read, which stays RAW_CAP): a sleep session is time-bounded (~14h max in practice) unlike hr_series'
-// open-ended window, and real motion cadence runs ~2 rows/sec — 14h * 3600 * 2 ≈ 100k rows, so 500k
-// gives ~5x headroom. Raised from RAW_CAP(5000) after a live mirror proved 5000 silently undercounts
-// steps/postureChanges 3-4x on a real ~22k-row night (post-hoc review Critical, 2026-07-12): the read
-// was truncated with no signal, so sleep_detail reported 17 steps / 5 postureChanges against a true
-// 70 / 15.
+// sleepDetail's step/gravity reads only (NOT hr_series' RAW_CAP above): a sleep session is
+// time-bounded (~14h max in practice) unlike hr_series' open-ended window, and real motion cadence
+// runs ~2 rows/sec — 14h * 3600 * 2 ≈ 100k rows, so 500k gives ~5x headroom. Raised from RAW_CAP(5000)
+// after a live mirror proved 5000 silently undercounts steps/postureChanges 3-4x on a real ~22k-row
+// night (post-hoc review Critical, 2026-07-12): the read was truncated with no signal, so sleep_detail
+// reported 17 steps / 5 postureChanges against a true 70 / 15.
 const MOTION_RAW_CAP = 500_000;
 // motion_series spans up to 7 days (MAX_SPAN_S) with no per-session bound, so unlike sleepDetail this
 // can still truncate on a wide window with dense motion (e.g. >1.5 days of continuous ~2 rows/sec
@@ -24,11 +23,32 @@ const MOTION_RAW_CAP = 500_000;
 // instead, since a caller who hits this should narrow the window or bucket more coarsely, not silently
 // pull an unbounded read.
 const SERIES_CAP = 200_000;
+// sleepDetail's own HR read (hrDuringSleep): same time-bound reasoning as MOTION_RAW_CAP above (a
+// session is ~14h max in practice), sized for HR's cadence (up to ~1Hz in practice, so ~14h*3600 ≈
+// 50k rows; 250k gives ~5x headroom). This is the FETCH cap used to learn the true in-window sample
+// count for decimateEvenly() below — the cap on what's actually returned stays RAW_CAP(5000).
+// Audit-exposed (2026-07-13): a 6.4h/~23k-sample night at 1Hz used to hit RAW_CAP(5000) via a raw SQL
+// `ORDER BY ts LIMIT`, silently returning only the first ~83 minutes with no signal the tail was
+// missing — this misled a live investigation.
+const HR_DETAIL_RAW_CAP = 250_000;
 const round3 = (x: number) => Math.round(x * 1000) / 1000;
 
 function dropDeleted(samples: { deviceId: string; ts: number; bpm: number }[], ranges: { deviceId: string; fromTs: number; toTs: number }[]) {
   if (!ranges.length) return samples;
   return samples.filter((s) => !ranges.some((r) => r.deviceId === s.deviceId && s.ts >= r.fromTs && s.ts <= r.toTs));
+}
+
+// Evenly decimate `rows` (already ORDER BY ts) down to at most `cap` entries by taking every
+// `stride`-th row (stride = ceil(n/cap)) instead of a head-truncation that silently drops everything
+// past the first `cap` rows — see sleepDetail's HR read below and HR_DETAIL_RAW_CAP above. Below the
+// cap, this is a no-op (same rows, same order).
+function decimateEvenly<T>(rows: T[], cap: number): { rows: T[]; decimated: boolean; stride: number; total: number } {
+  const total = rows.length;
+  if (total <= cap) return { rows, decimated: false, stride: 1, total };
+  const stride = Math.ceil(total / cap);
+  const out: T[] = [];
+  for (let i = 0; i < total; i += stride) out.push(rows[i]);
+  return { rows: out, decimated: true, stride, total };
 }
 
 // Average gravity per fixed-size bucket, sorted — shared by motionSeries (variable bucket) and
@@ -141,8 +161,9 @@ export function sleepDetail(cfg: Config, args: { deviceId: string; startTs: numb
     const startTs = adj?.newStartTs ?? row.startTs, endTs = adj?.newEndTs ?? row.endTs;
     const stageEdit = overlay.stageEdits.get(sleepKeyOf(args.deviceId, args.startTs));
     const stages = stageEdit ? stageEdit.stages : (row.stagesJSON ? JSON.parse(row.stagesJSON) : null);
-    const hr = dropDeleted(m.hrSamplesRange({ fromTs: startTs, toTs: endTs, deviceId: args.deviceId, limit: RAW_CAP }), overlay.deletedHrRanges);
-    const hrAny = hr.length ? hr : dropDeleted(m.hrSamplesRange({ fromTs: startTs, toTs: endTs, limit: RAW_CAP }), overlay.deletedHrRanges);
+    const hr = dropDeleted(m.hrSamplesRange({ fromTs: startTs, toTs: endTs, deviceId: args.deviceId, limit: HR_DETAIL_RAW_CAP }), overlay.deletedHrRanges);
+    const hrAny = hr.length ? hr : dropDeleted(m.hrSamplesRange({ fromTs: startTs, toTs: endTs, limit: HR_DETAIL_RAW_CAP }), overlay.deletedHrRanges);
+    const hrDec = decimateEvenly(hrAny, RAW_CAP);
     // stepSample/gravitySample are absent from any mirror ingested before this feature shipped —
     // motion stays null rather than a misleading all-zero reading in that case.
     const hasMotion = m.hasTable("stepSample") || m.hasTable("gravitySample");
@@ -167,7 +188,8 @@ export function sleepDetail(cfg: Config, args: { deviceId: string; startTs: numb
     return {
       session: { deviceId: row.deviceId, family: sourceFamily(row.deviceId), startTs, endTs, durationMin: Math.round((endTs - startTs) / 60), efficiency: row.efficiency, restingHr: row.restingHr, avgHrv: row.avgHrv, ...(adj ? { edited: true, editId: adj.editId } : {}) },
       stages, ...(stageEdit ? { stagesEdited: true, editId: stageEdit.editId } : {}),
-      hrDuringSleep: hrAny.map((s) => ({ ts: s.ts, bpm: s.bpm, deviceId: s.deviceId })),
+      hrDuringSleep: hrDec.rows.map((s) => ({ ts: s.ts, bpm: s.bpm, deviceId: s.deviceId })),
+      ...(hrDec.decimated ? { hrDecimated: true, hrStride: hrDec.stride, hrTotalSamples: hrDec.total } : {}),
       motion,
     };
   } finally { m.close(); }
@@ -269,7 +291,7 @@ export function registerGranularTools(server: McpServer, cfg: Config): void {
 
   server.registerTool("sleep_detail", {
     title: "Sleep night detail",
-    description: "One night's full evidence: bounds, stage-by-stage hypnogram, in-sleep heart-rate, and motion (step count + walk/run/still/unclassified tick breakdown + wrist-posture changes) during the session. Reflects confirmed stage edits, bound adjustments, and HR deletions. motion.truncated:true means the raw step/gravity read hit its cap and the count may be incomplete.",
+    description: "One night's full evidence: bounds, stage-by-stage hypnogram, in-sleep heart-rate, and motion (step count + walk/run/still/unclassified tick breakdown + wrist-posture changes) during the session. Reflects confirmed stage edits, bound adjustments, and HR deletions. hrDuringSleep beyond 5000 in-window samples is evenly decimated across the full night rather than truncated to its start (hrDecimated:true plus hrStride/hrTotalSamples record the thinning) — call hr_series directly for a full-resolution window. motion.truncated:true means the raw step/gravity read hit its cap and the count may be incomplete.",
     inputSchema: { deviceId: z.string(), startTs: z.number().int() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(sleepDetail(cfg, a)));
