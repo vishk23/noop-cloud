@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { buildNoopbak } from "./fixtures/make-fixture.js";
 import { ingestNoopbak } from "../src/ingest.js";
+import { appendJournal } from "../src/staging.js";
 import { compareSources } from "../src/tools/compare.js";
 
 const dataDir = path.join(process.cwd(), "test/.tmp/tools-compare");
@@ -66,5 +67,29 @@ describe("compare_sources guard: empty mirror", () => {
     const r = compareSources(emptyCfg, { from: "2026-06-13", to: "2026-06-13" });
     expect(r.days).toEqual([]);
     expect(r.notIngested).toBe(true);
+  });
+});
+
+describe("compare_sources overlay: fallback respects delete_metric_point", () => {
+  const overlayDataDir = path.join(process.cwd(), "test/.tmp/tools-compare-overlay");
+  const overlayCfg = { dataDir: overlayDataDir, mirrorPath: path.join(overlayDataDir, "mirror.sqlite"), serverDbPath: path.join(overlayDataDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
+  beforeAll(() => {
+    fs.rmSync(overlayDataDir, { recursive: true, force: true });
+    fs.mkdirSync(overlayDataDir, { recursive: true });
+    const z = path.join(overlayDataDir, "b.noopbak");
+    buildNoopbak(z);
+    ingestNoopbak(fs.readFileSync(z), overlayCfg);
+    // Delete the apple-health vo2max for 2026-06-13 — a pure-fallback metric
+    appendJournal(overlayCfg, { editId: "e_vo2_del", kind: "delete_metric_point", payloadJSON: JSON.stringify({ deviceId: "apple-health", day: "2026-06-13", key: "vo2max" }), beforeJSON: null, rationale: null });
+  });
+
+  it("filters fallback metricSeries rows through deletion overlay, excluding deleted points", () => {
+    const r = compareSources(overlayCfg, { from: "2026-06-13", to: "2026-06-13", metrics: ["vo2max"] });
+    const vo2max = r.days[0].metrics.vo2max;
+    // apple-health deleted, only my-whoop (45) remains
+    expect(vo2max.apple).toBeUndefined();
+    expect(vo2max.whoop).toBe(45);
+    // spreadPct computed with only one value should be 0
+    expect(vo2max.spreadPct).toBe(0);
   });
 });

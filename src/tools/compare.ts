@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "../config.js";
 import { Mirror, DailyMetricRow } from "../mirror.js";
+import { computeOverlay, pointKeyOf } from "../edits/overlay.js";
 
 const DAY = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "YYYY-MM-DD");
 const DEFAULT_METRICS = ["restingHr", "avgHrv", "totalSleepMin"] as const;
@@ -15,6 +16,7 @@ export function compareSources(cfg: Config, args: { from: string; to: string; me
   }
 
   const metrics = (args.metrics && args.metrics.length ? args.metrics : [...DEFAULT_METRICS]);
+  const overlay = computeOverlay(cfg);
   const m = new Mirror(cfg.mirrorPath);
   try {
     const rows = m.dailyMetrics({ from: args.from, to: args.to });
@@ -49,6 +51,7 @@ export function compareSources(cfg: Config, args: { from: string; to: string; me
         const dailyFamilies = new Set(byFamily.keys());
         for (const r of seriesByDayKey.get(`${day}|${metric}`) ?? []) {
           if (dailyFamilies.has(r.family)) continue;
+          if (overlay.deletedMetricPoints.has(pointKeyOf(r.deviceId, r.day, r.key))) continue;
           const arr = byFamily.get(r.family) ?? [];
           arr.push(r.value);
           byFamily.set(r.family, arr);
