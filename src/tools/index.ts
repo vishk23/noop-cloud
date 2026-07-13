@@ -6,6 +6,7 @@ import { registerCompareSources } from "./compare.js";
 import { registerSearchFetch } from "./search-fetch.js";
 import { registerWriteTools } from "./writes.js";
 import { registerGranularTools } from "./granular.js";
+import { registerPushTools } from "./push.js";
 
 export function registerTools(server: McpServer, cfg: Config, scope: "ro" | "rw"): void {
   registerCoreTools(server, cfg); // health_snapshot + data_freshness (Task 7)
@@ -14,4 +15,5 @@ export function registerTools(server: McpServer, cfg: Config, scope: "ro" | "rw"
   registerSearchFetch(server, cfg); // search + fetch (Task 10)
   registerWriteTools(server, cfg, scope); // propose_edit/list_pending/edit_journal (+ rw-only resolution tools) (Task 4/5)
   registerGranularTools(server, cfg); // hr_series + sleep_detail (Phase 2b Task 1)
+  registerPushTools(server, cfg); // request_sync — ro-allowed, mutates no user data (push-triggered sync)
 }
