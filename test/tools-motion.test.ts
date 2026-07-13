@@ -154,6 +154,22 @@ describe("motion_series apple-health hourly overlay (appleStepHour)", () => {
     expect(r.buckets.some((b: any) => b.deviceId === "apple-health")).toBe(false);
     expect(r.appleOmitted).toBeUndefined(); // table absence isn't the same as the bucket-size omission signal
   });
+
+  it("preserves fractional-offset local-hour-anchored ts (e.g. IST 00:30Z) without re-flooring to UTC grid", () => {
+    // Fractional-offset timezones (IST UTC+5:30, Nepal UTC+5:45, etc.) encode local hour boundaries
+    // at non-UTC-hour-aligned timestamps. The bucket ts should preserve the original row.ts exactly,
+    // not recompute it via Math.floor(row.ts / b) * b, which would shift it to the nearest UTC hour.
+    const base = Math.floor(new Date("2026-06-12T00:00:00Z").getTime() / 1000);
+    const r = motionSeries(cfg, { from: "2026-06-12T00:00:00Z", to: "2026-06-12T03:00:00Z", bucketSeconds: 3600 }) as any;
+    const fracBuckets = r.buckets.filter((b: any) => b.deviceId === "apple-health" && b.ts >= base + 1800);
+    expect(fracBuckets.length).toBe(3); // 00:30:00Z, 01:30:00Z, 02:30:00Z
+    // Each bucket ts should match the original appleStepHour row.ts exactly, not floored to UTC hour boundary.
+    expect(fracBuckets[0].ts).toBe(base + 1800);   // 00:30:00Z, not 00:00:00Z
+    expect(fracBuckets[1].ts).toBe(base + 5400);   // 01:30:00Z, not 01:00:00Z
+    expect(fracBuckets[2].ts).toBe(base + 9000);   // 02:30:00Z, not 02:00:00Z
+    // Values are correct regardless (only the label drifted).
+    expect(fracBuckets.map((b: any) => b.steps)).toEqual([50, 75, 100]);
+  });
 });
 
 describe("sleep_detail motion evidence", () => {

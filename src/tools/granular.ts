@@ -237,7 +237,7 @@ export function motionSeries(cfg: Config, args: { from: string; to: string; devi
     if (wantsApple) {
       if (b >= 3600) {
         for (const row of m.appleStepHours(fromTs, toT)) {
-          const bucketTs = Math.floor(row.ts / b) * b;
+          const bucketTs = row.ts;
           const cur = appleBucketsByTs.get(bucketTs) ?? { steps: 0, n: 0, deviceId: row.deviceId };
           cur.steps += row.steps; cur.n += 1;
           appleBucketsByTs.set(bucketTs, cur);

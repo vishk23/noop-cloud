@@ -127,6 +127,14 @@ export function buildMirrorSqlite(target: string): void {
   const APPLE_HOURLY_STEPS = [0, 0, 0, 0, 120, 900, 1500, 400]; // 03:00Z..10:00Z, walk starts 07:00Z
   APPLE_HOURLY_STEPS.forEach((steps, i) => appleHour.run("apple-health", night + i * 3600, steps));
 
+  // Fractional-offset timezone test: rows at HH:30:00Z (simulating local-hour-anchored times in
+  // timezones like IST/UTC+5:30). The bucket ts should preserve the original row.ts exactly,
+  // not floor it to the nearest UTC hour boundary.
+  const fracDay = tsOf("2026-06-12", 0); // 2026-06-12 00:00:00Z
+  appleHour.run("apple-health", fracDay + 1800, 50);   // 00:30:00Z (local hour boundary in UTC+5:30)
+  appleHour.run("apple-health", fracDay + 5400, 75);   // 01:30:00Z
+  appleHour.run("apple-health", fracDay + 9000, 100);  // 02:30:00Z
+
   // Isolated wrap/gap fixture for stepDeltas() (2026-06-10 noon — clear of every other motion-tool
   // test window): a real u16 wrap (65530 -> 10, delta 16), a >=512 "gap" jump that MUST be dropped
   // (10 -> 20000, delta 19990 — a sync-session boundary/reboot, not real motion), then a real delta
