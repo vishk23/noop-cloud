@@ -3,7 +3,13 @@ import http2 from "node:http2";
 import type { Config } from "../config.js";
 import { listDeviceTokens, deleteDeviceToken } from "./registry.js";
 
-const APNS_HOST = "https://api.push.apple.com";
+// Sandbox by default: the personal-fork iOS build is dev-signed (`aps-environment: development`),
+// so its tokens live in APNs sandbox — pushing them at the production host returns BadDeviceToken
+// (and this sender PRUNES on BadDeviceToken, which would silently unregister the phone forever).
+// Set APNS_ENV=production only when the app ships with a production push entitlement.
+const APNS_HOST = process.env.APNS_ENV === "production"
+  ? "https://api.push.apple.com"
+  : "https://api.sandbox.push.apple.com";
 const JWT_TTL_S = 45 * 60; // Apple allows provider JWTs up to ~60min old; refresh at 45 to stay well inside.
 
 type ApnsConfig = Pick<Config, "apnsKeyP8" | "apnsKeyId" | "appleTeamId" | "apnsTopic">;
