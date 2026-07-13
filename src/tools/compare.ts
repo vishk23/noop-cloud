@@ -28,7 +28,14 @@ export function compareSources(cfg: Config, args: { from: string; to: string; me
     const seriesRows = m.metricSeriesForKeys({ keys: metrics, from: args.from, to: args.to });
     const seriesByDayKey = new Map<string, typeof seriesRows>();
     for (const r of seriesRows) { const k = `${r.day}|${r.key}`; const a = seriesByDayKey.get(k) ?? []; a.push(r); seriesByDayKey.set(k, a); }
-    const days = [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([day, drows]) => {
+    // Day universe = union of dailyMetric days and metricSeries fallback days. Deriving `days`
+    // from byDay alone silently dropped a day whose only evidence was a metricSeries fallback row
+    // (e.g. Apple steps on a day no wearable wrote a dailyMetric row at all) — see
+    // tools-compare.test.ts's "day universe" tests for the regression this fixes.
+    const allDays = new Set<string>(byDay.keys());
+    for (const r of seriesRows) allDays.add(r.day);
+    const days = [...allDays].sort((a, b) => a.localeCompare(b)).map((day) => {
+      const drows = byDay.get(day) ?? [];
       const metricsOut: Record<string, any> = {};
       for (const metric of metrics) {
         // A family can have multiple same-family deviceIds (e.g. WHOOP strap + derived

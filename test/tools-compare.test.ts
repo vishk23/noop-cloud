@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { buildNoopbak } from "./fixtures/make-fixture.js";
+import Database from "better-sqlite3";
+import { buildNoopbak, buildMirrorSqlite, buildNoopbakFrom } from "./fixtures/make-fixture.js";
 import { ingestNoopbak } from "../src/ingest.js";
 import { appendJournal } from "../src/staging.js";
 import { compareSources } from "../src/tools/compare.js";
@@ -91,5 +92,37 @@ describe("compare_sources overlay: fallback respects delete_metric_point", () =>
     expect(vo2max.whoop).toBe(45);
     // spreadPct computed with only one value should be 0
     expect(vo2max.spreadPct).toBe(0);
+  });
+});
+
+describe("compare_sources day universe: metricSeries-only day (post-hoc audit fix)", () => {
+  // Isolated mirror copy (own dataDir), same pattern as tools-motion-dense.test.ts: this needs a
+  // day with NO dailyMetric row at all for any device, which the shared fixture doesn't have — so
+  // this seeds it directly rather than perturbing the shared fixture's pinned row counts.
+  const fbDataDir = path.join(process.cwd(), "test/.tmp/tools-compare-fallback-day");
+  const fbCfg = { dataDir: fbDataDir, mirrorPath: path.join(fbDataDir, "mirror.sqlite"), serverDbPath: path.join(fbDataDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
+  const NEW_DAY = "2026-06-20"; // clear of every DAYS entry in the shared fixture
+
+  beforeAll(() => {
+    fs.rmSync(fbDataDir, { recursive: true, force: true });
+    fs.mkdirSync(fbDataDir, { recursive: true });
+    const srcSqlite = path.join(fbDataDir, "src.sqlite");
+    buildMirrorSqlite(srcSqlite);
+    const raw = new Database(srcSqlite);
+    // NEW_DAY has NO dailyMetric row for ANY device — its only evidence is this metricSeries
+    // fallback row, reproducing the real "Apple steps with no wearable dailyMetric that day"
+    // scenario the audit found silently dropped from compare_sources' day universe.
+    raw.prepare("INSERT INTO metricSeries VALUES (?,?,?,?)").run("apple-health", NEW_DAY, "steps", 4321);
+    raw.close();
+    const zip = path.join(fbDataDir, "b.noopbak");
+    buildNoopbakFrom(srcSqlite, zip);
+    ingestNoopbak(fs.readFileSync(zip), fbCfg);
+  });
+
+  it("surfaces a day whose only data is a metricSeries fallback row", () => {
+    const r = compareSources(fbCfg, { from: NEW_DAY, to: NEW_DAY, metrics: ["steps"] });
+    const day = r.days.find((d) => d.day === NEW_DAY);
+    expect(day).toBeDefined();
+    expect(day!.metrics.steps.apple).toBe(4321);
   });
 });
