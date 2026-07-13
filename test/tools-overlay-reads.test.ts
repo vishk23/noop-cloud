@@ -44,6 +44,7 @@ describe("overlay-aware reads", () => {
     const f = dataFreshness(cfg) as any;
     expect(f.journalSeq).toBeGreaterThanOrEqual(5);
     expect(f.baselineNotes[0].note).toContain("RHR");
+    expect(f.baselineNotes[0].supersededCount).toBeUndefined(); // only note for this device so far
   });
   it("workout_summary keeps the stored durationS for an un-edited workout (stored ≠ wall-time span)", () => {
     const w = workoutSummary(cfg, { from: "2026-06-11", to: "2026-06-11" }).workouts.find((x: any) => x.sport === "walking") as any;
@@ -59,5 +60,15 @@ describe("overlay-aware reads", () => {
     expect(w.endTs).toBe(WALK_TS + 4800);
     expect(w.durationS).toBe(4800);
     expect(w.durationMin).toBe(80);
+  });
+  it("data_freshness surfaces only the LATEST baseline note per device, with supersededCount (audit-exposed)", () => {
+    // A second oura-api note lands on top of e_note ("oura RHR reads ~2bpm high") from beforeAll.
+    // Journal history stays append-only, but the surfaced list must show the replacement, not both.
+    appendJournal(cfg, { editId: "e_note2", kind: "set_baseline_note", payloadJSON: JSON.stringify({ note: "oura RHR sensor recalibrated — offset no longer applies", deviceId: "oura-api" }), beforeJSON: null, rationale: null });
+    const f = dataFreshness(cfg) as any;
+    const ouraNotes = f.baselineNotes.filter((n: any) => n.deviceId === "oura-api");
+    expect(ouraNotes.length).toBe(1); // the stale note is collapsed away, not shown alongside its replacement
+    expect(ouraNotes[0].note).toBe("oura RHR sensor recalibrated — offset no longer applies");
+    expect(ouraNotes[0].supersededCount).toBe(1);
   });
 });
