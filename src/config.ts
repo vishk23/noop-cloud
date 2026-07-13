@@ -8,6 +8,12 @@ export interface Config {
   roToken: string;
   rwToken: string;
   maxIngestBytes: number;
+  // Push-triggered on-demand sync (request_sync MCP tool + POST /register-device). All four
+  // optional together: unset means the tool responds {configured:false} instead of failing.
+  apnsKeyP8?: string;
+  apnsKeyId?: string;
+  appleTeamId?: string;
+  apnsTopic?: string;
 }
 
 function required(name: string): string {
@@ -26,5 +32,9 @@ export function loadConfig(): Config {
     roToken: required("RO_TOKEN"),
     rwToken: required("RW_TOKEN"),
     maxIngestBytes: Number(process.env.MAX_INGEST_BYTES ?? 262_144_000),
+    apnsKeyP8: process.env.APNS_KEY_P8,
+    apnsKeyId: process.env.APNS_KEY_ID,
+    appleTeamId: process.env.APPLE_TEAM_ID,
+    apnsTopic: process.env.APNS_TOPIC,
   };
 }
