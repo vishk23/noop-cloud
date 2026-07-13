@@ -16,6 +16,9 @@ export function openServerDb(cfg: Pick<Config, "serverDbPath">): Database.Databa
       seq INTEGER PRIMARY KEY AUTOINCREMENT, editId TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
       payloadJSON TEXT NOT NULL, beforeJSON TEXT, rationale TEXT,
       appliedAt INTEGER NOT NULL, undoneBySeq INTEGER, ackedAt INTEGER);
+    CREATE TABLE IF NOT EXISTS deviceToken (
+      token TEXT PRIMARY KEY, platform TEXT NOT NULL, updatedAt INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS pushState (id INTEGER PRIMARY KEY CHECK (id = 1), lastPushAt INTEGER);
   `);
   const cols = db.prepare("PRAGMA table_info(editJournal)").all() as any[];
   if (!cols.some((c) => c.name === "ackedAt")) db.exec("ALTER TABLE editJournal ADD COLUMN ackedAt INTEGER");

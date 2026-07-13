@@ -7,6 +7,9 @@ import { requireScope, tokenScope } from "./auth.js";
 import { ingestNoopbak, IngestError } from "./ingest.js";
 import { buildMcpServer } from "./mcp.js";
 import { journalSince, ackEdits } from "./staging.js";
+import { upsertDeviceToken } from "./push/registry.js";
+
+const DEVICE_TOKEN_RE = /^[0-9a-fA-F]{32,100}$/;
 
 export function createApp(cfg: Config): express.Express {
   fs.mkdirSync(cfg.dataDir, { recursive: true });
@@ -25,6 +28,15 @@ export function createApp(cfg: Config): express.Express {
         res.status(500).json({ error: "ingest_failed" });
       }
     });
+
+  app.post("/register-device", requireScope(cfg, "rw"), express.json({ limit: "16kb" }), (req, res) => {
+    const token = (req.body as any)?.token;
+    const platform = (req.body as any)?.platform;
+    if (typeof token !== "string" || !DEVICE_TOKEN_RE.test(token)) return res.status(400).json({ error: "bad_token" });
+    if (platform !== "ios") return res.status(400).json({ error: "bad_platform" });
+    const count = upsertDeviceToken(cfg, token, platform);
+    res.json({ registered: true, count });
+  });
 
   app.post("/mcp", requireScope(cfg, "ro"), express.json({ limit: "4mb" }), async (req, res) => {
     const scope = tokenScope(cfg, req.header("authorization")) ?? "ro"; // requireScope already vetted it
