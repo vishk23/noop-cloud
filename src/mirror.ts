@@ -36,6 +36,34 @@ export class Mirror {
       GROUP BY d.deviceId ORDER BY d.deviceId`).all() as any[];
     return rows.map((r) => ({ deviceId: r.deviceId, family: sourceFamily(r.deviceId), brand: r.brand ?? null, latestDay: r.latestDay ?? null }));
   }
+  // PRAGMA-introspected dailyMetric columns minus the two identity columns — lets callers (and
+  // data_freshness, see tools/core.ts) discover real column names instead of guessing (post-hoc
+  // audit: a whole agent-run was wasted failing to find skinTempDevC because nothing listed the
+  // valid names).
+  dailyMetricColumns(): string[] {
+    const cols = this.db.prepare("PRAGMA table_info(dailyMetric)").all() as { name: string }[];
+    return cols.map((c) => c.name).filter((n) => n !== "deviceId" && n !== "day");
+  }
+  // DISTINCT metricSeries keys with a per-family row count, capped at `limit` keys (default 100).
+  // Two-step (DISTINCT keys first, then aggregate only those) rather than one GROUP BY over the
+  // whole table, so a mirror with many distinct keys doesn't force a full-table aggregate just to
+  // return a capped list.
+  metricSeriesKeyCounts(limit = 100): { key: string; counts: Partial<Record<Family, number>> }[] {
+    const keys = (this.db.prepare("SELECT DISTINCT key FROM metricSeries ORDER BY key LIMIT ?").all(limit) as { key: string }[]).map((r) => r.key);
+    if (!keys.length) return [];
+    const placeholders = keys.map(() => "?").join(",");
+    const rows = this.db.prepare(
+      `SELECT key, deviceId, COUNT(*) AS n FROM metricSeries WHERE key IN (${placeholders}) GROUP BY key, deviceId`
+    ).all(...keys) as { key: string; deviceId: string; n: number }[];
+    const byKey = new Map<string, Partial<Record<Family, number>>>();
+    for (const key of keys) byKey.set(key, {});
+    for (const r of rows) {
+      const counts = byKey.get(r.key)!;
+      const fam = sourceFamily(r.deviceId);
+      counts[fam] = (counts[fam] ?? 0) + r.n;
+    }
+    return keys.map((key) => ({ key, counts: byKey.get(key)! }));
+  }
   dailyMetrics(opts: { deviceId?: string; from: string; to: string }): DailyMetricRow[] {
     const where = ["day >= ? AND day <= ?"]; const args: any[] = [opts.from, opts.to];
     if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
