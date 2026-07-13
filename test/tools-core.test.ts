@@ -31,6 +31,12 @@ describe("core tools", () => {
     expect(byKey.vo2max.apple).toBeGreaterThan(0);
     expect(byKey.vo2max.whoop).toBeGreaterThan(0);
   });
+  it("data_freshness sources report which tables each device appears in", () => {
+    const r = dataFreshness(cfg) as any;
+    const oura = r.sources.find((s: any) => s.deviceId === "oura-api");
+    expect(oura.tables).toContain("dailyMetric");
+    expect(oura.tables).toContain("hrSample");
+  });
   it("health_snapshot rolls up recent days by family", () => {
     const r = healthSnapshot(cfg, { days: 2 });
     expect(r.days.length).toBe(2);

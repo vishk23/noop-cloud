@@ -1,10 +1,25 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import fs from "node:fs"; import path from "node:path";
+import Database from "better-sqlite3";
 import { buildMirrorSqlite } from "./fixtures/make-fixture.js";
 import { Mirror, sourceFamily } from "../src/mirror.js";
 
 const p = path.join(process.cwd(), "test/.tmp/mirror-read.sqlite");
-beforeAll(() => { fs.mkdirSync(path.dirname(p), { recursive: true }); buildMirrorSqlite(p); });
+const HR_ONLY_DEVICE = "strap-raw-only";
+const HR_ONLY_DAY = "2026-06-25"; // clear of every DAYS entry in the fixture
+const HR_ONLY_TS = Math.floor(new Date(`${HR_ONLY_DAY}T04:00:00Z`).getTime() / 1000);
+
+beforeAll(() => {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  buildMirrorSqlite(p);
+  // A device that only ever writes raw hrSample rows (no dailyMetric, no sleepSession) — the
+  // real-world shape of a strap deviceId whose scored daily rollups land under a separate derived
+  // "-noop" deviceId (post-hoc audit fix: sources() used to be dailyMetric-only, so this device
+  // was invisible even though it held real data).
+  const raw = new Database(p);
+  raw.prepare("INSERT INTO hrSample VALUES (?,?,?)").run(HR_ONLY_DEVICE, HR_ONLY_TS, 58);
+  raw.close();
+});
 
 describe("Mirror", () => {
   it("classifies source families", () => {
@@ -16,6 +31,19 @@ describe("Mirror", () => {
     const m = new Mirror(p);
     const s = m.sources();
     expect(s.find((x) => x.deviceId === "oura-api")?.latestDay).toBe("2026-06-13");
+    m.close();
+  });
+  it("sources() surfaces a device that only ever writes hrSample rows (post-hoc audit fix)", () => {
+    const m = new Mirror(p);
+    const s = m.sources();
+    const hrOnly = s.find((x) => x.deviceId === HR_ONLY_DEVICE);
+    expect(hrOnly).toBeDefined();
+    expect(hrOnly!.tables).toEqual(["hrSample"]);
+    expect(hrOnly!.latestDay).toBe(HR_ONLY_DAY);
+    // A dailyMetric-only device (like oura-api) still reports its table membership too.
+    const oura = s.find((x) => x.deviceId === "oura-api");
+    expect(oura!.tables).toContain("dailyMetric");
+    expect(oura!.tables).toContain("hrSample");
     m.close();
   });
   it("filters dailyMetrics by source and range", () => {
