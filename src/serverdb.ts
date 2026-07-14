@@ -22,5 +22,10 @@ export function openServerDb(cfg: Pick<Config, "serverDbPath">): Database.Databa
   `);
   const cols = db.prepare("PRAGMA table_info(editJournal)").all() as any[];
   if (!cols.some((c) => c.name === "ackedAt")) db.exec("ALTER TABLE editJournal ADD COLUMN ackedAt INTEGER");
+  // The phone's IANA timezone (X-Phone-Timezone header on /ingest), NULL when absent or malformed.
+  // Every timestamp in an upload is epoch-UTC, so this is the only record of which zone the phone was
+  // in as of a given upload. Guarded ADD COLUMN (same idiom as ackedAt) so existing DBs migrate in place.
+  const ingestCols = db.prepare("PRAGMA table_info(ingestLog)").all() as any[];
+  if (!ingestCols.some((c) => c.name === "phoneTz")) db.exec("ALTER TABLE ingestLog ADD COLUMN phoneTz TEXT");
   return db;
 }

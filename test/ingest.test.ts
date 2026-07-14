@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import fs from "node:fs"; import path from "node:path"; import Database from "better-sqlite3"; import AdmZip from "adm-zip";
 import { buildNoopbak } from "./fixtures/make-fixture.js";
-import { ingestNoopbak, latestIngest, IngestError } from "../src/ingest.js";
+import { ingestNoopbak, latestIngest, IngestError, normalizePhoneTz } from "../src/ingest.js";
 
 const dataDir = path.join(process.cwd(), "test/.tmp/ingest");
 const cfg = () => ({ dataDir, mirrorPath: path.join(dataDir, "mirror.sqlite"), serverDbPath: path.join(dataDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any);
@@ -37,6 +37,26 @@ describe("ingest", () => {
     const db = new Database(cfg().mirrorPath, { readonly: true });
     expect((db.prepare("SELECT COUNT(*) c FROM dailyMetric").get() as any).c).toBeGreaterThan(0); db.close();
   });
+  it("stores a valid phone timezone on the ingestLog row", () => {
+    const zip = path.join(dataDir, "tz.noopbak"); buildNoopbak(zip);
+    ingestNoopbak(fs.readFileSync(zip), cfg(), "America/Los_Angeles");
+    expect(latestIngest(cfg())?.phoneTz).toBe("America/Los_Angeles");
+  });
+  it("stores NULL phoneTz when none is supplied (default)", () => {
+    const zip = path.join(dataDir, "notz.noopbak"); buildNoopbak(zip);
+    ingestNoopbak(fs.readFileSync(zip), cfg());
+    expect(latestIngest(cfg())?.phoneTz ?? null).toBeNull();
+  });
+  it("normalizePhoneTz accepts IANA ids and UTC, rejects everything else", () => {
+    expect(normalizePhoneTz("America/Los_Angeles")).toBe("America/Los_Angeles");
+    expect(normalizePhoneTz("America/Argentina/Buenos_Aires")).toBe("America/Argentina/Buenos_Aires");
+    expect(normalizePhoneTz("UTC")).toBe("UTC");
+    expect(normalizePhoneTz("")).toBeNull();
+    expect(normalizePhoneTz("-07:00")).toBeNull();
+    expect(normalizePhoneTz("'; DROP TABLE ingestLog;--")).toBeNull();
+    expect(normalizePhoneTz(undefined)).toBeNull();
+    expect(normalizePhoneTz(42)).toBeNull();
+  });
   it("does not corrupt an existing mirror when a later upload fails AFTER staging (foreign db)", () => {
     const zip = path.join(dataDir, "ok2.noopbak"); buildNoopbak(zip); ingestNoopbak(fs.readFileSync(zip), cfg());
     const foreign = path.join(dataDir, "f2.sqlite"); const fdb = new Database(foreign); fdb.exec("CREATE TABLE x(a)"); fdb.close();
@@ -59,6 +79,27 @@ it("POST /ingest requires rw and swaps the mirror", async () => {
     r.end(body);
   });
   server.close(); expect(status).toBe(200);
+});
+
+it("POST /ingest stores a valid X-Phone-Timezone header and NULLs a malformed one", async () => {
+  process.env.RO_TOKEN = "ro".padEnd(40, "x"); process.env.RW_TOKEN = "rw".padEnd(40, "y");
+  const c = cfg(); c.roToken = process.env.RO_TOKEN; c.rwToken = process.env.RW_TOKEN; c.port = 0;
+  const zip = path.join(dataDir, "tzhdr.noopbak"); buildNoopbak(zip); const body = fs.readFileSync(zip);
+  const app = createApp(c); const server = app.listen(0); const port = (server.address() as any).port;
+  const post = (tz: string | undefined) => new Promise<number>((resolve) => {
+    const headers: any = { authorization: `Bearer ${c.rwToken}`, "content-type": "application/octet-stream" };
+    if (tz !== undefined) headers["x-phone-timezone"] = tz;
+    const r = http.request({ port, path: "/ingest", method: "POST", headers }, (res) => { res.resume(); res.on("end", () => resolve(res.statusCode!)); });
+    r.end(body);
+  });
+
+  expect(await post("America/New_York")).toBe(200);
+  expect(latestIngest(c)?.phoneTz).toBe("America/New_York");
+
+  // A malformed header must be stored as NULL, never persisted verbatim.
+  expect(await post("Pacific Time (bogus)")).toBe(200);
+  expect(latestIngest(c)?.phoneTz ?? null).toBeNull();
+  server.close();
 });
 
 it("POST /ingest with an oversized body returns 413 JSON, not an HTML error page", async () => {

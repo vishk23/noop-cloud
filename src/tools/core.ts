@@ -39,6 +39,10 @@ export function dataFreshness(cfg: Config) {
     return {
       mirrorAgeSeconds: li ? now - li.receivedAt : null,
       lastIngestAt: li ? new Date(li.receivedAt * 1000).toISOString() : null,
+      // The phone's IANA timezone as of the most recent upload (X-Phone-Timezone header). null when the
+      // uploading build predates the header or sent a malformed value. Every timestamp in the mirror is
+      // epoch-UTC, so this is the anchor for any wall-clock reading of the latest data.
+      phoneTz: li?.phoneTz ?? null,
       latestDataDay: m.latestDataDay(),
       sources: m.sources().map((s) => ({ deviceId: s.deviceId, family: s.family, latestDay: s.latestDay, tables: s.tables })),
       // Discoverability (post-hoc audit: a whole agent-run was wasted failing to find

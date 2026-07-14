@@ -144,6 +144,14 @@ export class Mirror {
   hasTable(name: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
   }
+  // The phone's per-local-day IANA timezone (WhoopStore v28 `phoneTimezone` table). Mirrors ingested
+  // before that migration shipped lack the table entirely — return an empty map rather than throw, so
+  // sleep_summary degrades to "no tzId" instead of crashing on an older upload.
+  phoneTimezones(): Map<string, string> {
+    if (!this.hasTable("phoneTimezone")) return new Map();
+    const rows = this.db.prepare("SELECT day, tzId FROM phoneTimezone").all() as { day: string; tzId: string }[];
+    return new Map(rows.map((r) => [r.day, r.tzId]));
+  }
   stepSamplesRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }): StepSampleRow[] {
     if (!this.hasTable("stepSample")) return [];
     const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];

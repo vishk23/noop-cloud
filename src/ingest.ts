@@ -9,12 +9,21 @@ const SQLITE_MAGIC = Buffer.from("SQLite format 3\0", "binary");
 
 export function latestIngest(cfg: Pick<Config, "serverDbPath">) {
   const db = openServerDb(cfg);
-  const r = db.prepare("SELECT receivedAt, bytes, latestDay FROM ingestLog ORDER BY id DESC LIMIT 1").get() as any;
+  const r = db.prepare("SELECT receivedAt, bytes, latestDay, phoneTz FROM ingestLog ORDER BY id DESC LIMIT 1").get() as any;
   db.close();
   return r ?? null;
 }
 
-export function ingestNoopbak(buf: Buffer, cfg: Pick<Config, "dataDir" | "mirrorPath" | "serverDbPath" | "maxIngestBytes">): { ok: true; bytes: number; latestDay: string | null } {
+// IANA timezone identifier: "Area/Location" (e.g. America/Los_Angeles, America/Argentina/Buenos_Aires),
+// or the bare "UTC". Anything else (empty, injection, a raw offset) is rejected and stored as NULL.
+const IANA_TZ_RE = /^[A-Za-z_]+\/[A-Za-z0-9_+\-/]+$|^UTC$/;
+
+/** Returns the identifier if it looks like a valid IANA tz id, else null. */
+export function normalizePhoneTz(raw: unknown): string | null {
+  return typeof raw === "string" && IANA_TZ_RE.test(raw) ? raw : null;
+}
+
+export function ingestNoopbak(buf: Buffer, cfg: Pick<Config, "dataDir" | "mirrorPath" | "serverDbPath" | "maxIngestBytes">, phoneTz: string | null = null): { ok: true; bytes: number; latestDay: string | null } {
   if (buf.length > cfg.maxIngestBytes) throw new IngestError("too_large", `body ${buf.length} > ${cfg.maxIngestBytes}`);
   let zip: AdmZip;
   try { zip = new AdmZip(buf); } catch { throw new IngestError("bad_zip"); }
@@ -51,7 +60,7 @@ export function ingestNoopbak(buf: Buffer, cfg: Pick<Config, "dataDir" | "mirror
     throw e;
   }
   const db = openServerDb(cfg);
-  db.prepare("INSERT INTO ingestLog (receivedAt, bytes, latestDay) VALUES (?,?,?)").run(Math.floor(Date.now() / 1000), buf.length, latestDay);
+  db.prepare("INSERT INTO ingestLog (receivedAt, bytes, latestDay, phoneTz) VALUES (?,?,?,?)").run(Math.floor(Date.now() / 1000), buf.length, latestDay, phoneTz);
   db.close();
   return { ok: true, bytes: buf.length, latestDay };
 }
