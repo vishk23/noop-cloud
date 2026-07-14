@@ -97,6 +97,10 @@ counts + wrist posture/gravity) adds movement evidence — combined with `hr_ser
 "awake in bed" (no steps, unchanged posture) from "up and about" (steps, posture change);
 `sleep_detail` folds the same evidence into `motion: { steps, postureChanges }` for a session.
 Motion tools return empty/`null` (never throw) against a mirror uploaded before this feature shipped.
+`hrv_series` (bucketed RMSSD + mean HR from raw beat-to-beat R-R intervals, ≤7 days) surfaces daytime
+HRV without pulling the phone. R-R data is WHOOP-era only — `rrAvailable:false` for oura-api or any
+pre-WHOOP range, since the Oura API never exposes beat-to-beat timing — and a bucket with too few
+clean intervals reports `rmssd:null` rather than a fabricated number.
 Then `edit_sleep_stages` rewrites the night's stage timeline and `delete_hr_range` throws out
 artifact heart-rate stretches — through the same propose → confirm → journal → undo rail as every
 other edit.

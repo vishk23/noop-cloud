@@ -21,6 +21,7 @@ export interface MetricPointRow { deviceId: string; family: Family; day: string;
 // activityClass is a nullable INTEGER enum (0=still, 1=walk, 2=run), added in a later migration.
 export interface StepSampleRow { deviceId: string; ts: number; counter: number; activityClass: number | null; }
 export interface GravitySampleRow { deviceId: string; ts: number; x: number; y: number; z: number; }
+export interface RRIntervalRow { deviceId: string; ts: number; rrMs: number; }
 
 const withFamily = <T extends { deviceId: string }>(r: T) => ({ ...r, family: sourceFamily(r.deviceId) });
 
@@ -29,16 +30,18 @@ export class Mirror {
   constructor(path: string) { this.db = new Database(path, { readonly: true, fileMustExist: true }); }
   close(): void { this.db.close(); }
 
-  // Union deviceIds across dailyMetric, sleepSession, and hrSample: a device that only ever
-  // writes raw samples (e.g. a strap deviceId, whose scored daily rollups land under a separate
+  // Union deviceIds across dailyMetric, sleepSession, hrSample, and rrInterval: a device that only
+  // ever writes raw samples (e.g. a strap deviceId, whose scored daily rollups land under a separate
   // derived "-noop" deviceId) previously had no dailyMetric row and was invisible here even
   // though it holds real data. One cheap GROUP BY per table (each aggregated off that table's own
-  // deviceId-prefixed primary key), unioned in JS; `tables` records which of the three a source
-  // actually appears in.
+  // deviceId-prefixed primary key), unioned in JS; `tables` records which of the four a source
+  // actually appears in — rrInterval's presence there is how a caller learns which deviceIds carry
+  // beat-to-beat R-R data (WHOOP-only; see hrv_series in src/tools/granular.ts).
   sources() {
     const dm = this.db.prepare(`SELECT deviceId, MAX(day) AS maxDay FROM dailyMetric GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[];
     const ss = this.db.prepare(`SELECT deviceId, MAX(date(startTs, 'unixepoch')) AS maxDay FROM sleepSession GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[];
     const hr = this.db.prepare(`SELECT deviceId, MAX(date(ts, 'unixepoch')) AS maxDay FROM hrSample GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[];
+    const rr = this.db.prepare(`SELECT deviceId, MAX(date(ts, 'unixepoch')) AS maxDay FROM rrInterval GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[];
     const byDevice = new Map<string, { tables: Set<string>; latestDay: string | null }>();
     const merge = (rows: { deviceId: string; maxDay: string | null }[], table: string) => {
       for (const r of rows) {
@@ -48,7 +51,7 @@ export class Mirror {
         byDevice.set(r.deviceId, e);
       }
     };
-    merge(dm, "dailyMetric"); merge(ss, "sleepSession"); merge(hr, "hrSample");
+    merge(dm, "dailyMetric"); merge(ss, "sleepSession"); merge(hr, "hrSample"); merge(rr, "rrInterval");
     const brandById = new Map((this.db.prepare("SELECT id, brand FROM pairedDevice").all() as { id: string; brand: string | null }[]).map((b) => [b.id, b.brand]));
     return [...byDevice.entries()].sort((a, b) => a[0].localeCompare(b[0]))
       .map(([deviceId, e]) => ({ deviceId, family: sourceFamily(deviceId), brand: brandById.get(deviceId) ?? null, latestDay: e.latestDay, tables: [...e.tables].sort() }));
@@ -116,6 +119,21 @@ export class Mirror {
     if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
     args.push(opts.limit);
     return this.db.prepare(`SELECT deviceId, ts, bpm FROM hrSample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+  // RR granularity is sub-second but ts is not, so two+ real beats routinely share one integer-second
+  // ts (common at resting HR: ~800ms RR means roughly every other beat lands in a new second). The
+  // app's own rrIntervals read (Packages/WhoopStore/Sources/WhoopStore/Reads.swift) tiebreaks same-ts
+  // rows with `ORDER BY ts, rrMs, seq` — fine for a plain listing, but WRONG for hrv_series: sorting
+  // same-ts beats by VALUE can swap two genuinely-successive beats whenever the earlier one has the
+  // larger rrMs (proven by a failing test: an 800/850ms-alternating series lost its constant ±50ms
+  // successive diff exactly at a same-second pair, pulling RMSSD from 50ms to 46ms). `rowid` reflects
+  // real insertion/arrival order and isn't a value, so it can't invert two beats' true sequence —
+  // ordering by it instead is a deliberate deviation from the app's own query, not an oversight.
+  rrIntervalsRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }): RRIntervalRow[] {
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, rrMs FROM rrInterval WHERE ${where.join(" AND ")} ORDER BY ts, rowid LIMIT ?`).all(...args) as any[];
   }
   sleepSessionAt(deviceId: string, startTs: number) {
     return (this.db.prepare("SELECT deviceId, startTs, endTs, efficiency, restingHr, avgHrv, userEdited, stagesJSON FROM sleepSession WHERE deviceId = ? AND startTs = ?").get(deviceId, startTs) as any) ?? null;

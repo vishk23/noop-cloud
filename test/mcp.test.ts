@@ -37,5 +37,6 @@ describe("/mcp", () => {
     const names = (json.result?.tools ?? []).map((t: any) => t.name);
     expect(names).toContain("data_freshness");
     expect(names).toContain("health_snapshot");
+    expect(names).toContain("hrv_series");
   });
 });

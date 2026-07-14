@@ -31,7 +31,14 @@ const SERIES_CAP = 200_000;
 // `ORDER BY ts LIMIT`, silently returning only the first ~83 minutes with no signal the tail was
 // missing — this misled a live investigation.
 const HR_DETAIL_RAW_CAP = 250_000;
+// hrvSeries' raw rrInterval read: rows land roughly one per heartbeat, denser than hrSample's
+// multi-second cadence, so a 7-day (MAX_SPAN_S) window can hold far more rows than hr_series' 200k
+// bucketed-read limit. Sized like MOTION_RAW_CAP's ~5x-headroom reasoning above rather than reused,
+// since RR and HR sample density differ; a hit is surfaced via truncated/hint (see hrvSeries below),
+// never silently dropped.
+const RR_RAW_CAP = 500_000;
 const round3 = (x: number) => Math.round(x * 1000) / 1000;
+const round1 = (x: number) => Math.round(x * 10) / 10;
 
 function dropDeleted(samples: { deviceId: string; ts: number; bpm: number }[], ranges: { deviceId: string; fromTs: number; toTs: number }[]) {
   if (!ranges.length) return samples;
@@ -147,6 +154,76 @@ export function hrSeries(cfg: Config, args: { from: string; to: string; deviceId
     }
     const capped = raw.slice(0, RAW_CAP);
     return { samples: capped.map((s) => ({ ...s, family: sourceFamily(s.deviceId) })), ...(raw.length > RAW_CAP ? { truncated: true, hint: "pass bucketSeconds to aggregate" } : {}) };
+  } finally { m.close(); }
+}
+
+// hrvSeries' RR cleaning — a LIGHT approximation of the app's HRVAnalyzer cleaning intent
+// (Packages/StrandAnalytics/Sources/StrandAnalytics/HRVAnalyzer.swift in the NOOP app repo: a
+// [300,2000]ms range filter + Malik-style centered-5-beat-window ectopic rejection, then a
+// minBeats(20) gate before trusting RMSSD). This cloud tool is not the on-device scoring engine and
+// isn't bound by the app's Swift/Kotlin byte-parity contract, so it trades precision for a single
+// linear pass: a wider [250,3000]ms range gate, and a both-neighbors successive-diff spike check
+// instead of a centered local-median window. minBeats(20) is reused as-is since it's the app's own
+// "trustworthy result" threshold.
+const RR_MIN_MS = 250, RR_MAX_MS = 3000;
+const RR_ECTOPIC_THRESHOLD = 0.20;
+const RR_MIN_BEATS = 20;
+
+// Range filter, then a both-neighbors successive-diff spike check: an interior beat is dropped only
+// when it deviates from BOTH its previous and next range-surviving beat by more than
+// RR_ECTOPIC_THRESHOLD — an isolated bad beat between two normal ones, not a real change in rhythm.
+// Boundary beats (no previous or no next survivor) are always kept: light filtering defers to
+// inclusion rather than risking a false rejection with only one neighbor to judge against.
+// Order-preserving; input must already be ts-sorted (rrIntervalsRange guarantees this).
+function cleanRR(rows: { ts: number; rrMs: number }[]): { ts: number; rrMs: number }[] {
+  const ranged = rows.filter((r) => r.rrMs >= RR_MIN_MS && r.rrMs <= RR_MAX_MS);
+  const keep = new Array(ranged.length).fill(true);
+  for (let i = 1; i < ranged.length - 1; i++) {
+    const prev = ranged[i - 1].rrMs, cur = ranged[i].rrMs, next = ranged[i + 1].rrMs;
+    const devPrev = Math.abs(cur - prev) / prev, devNext = Math.abs(cur - next) / next;
+    if (devPrev > RR_ECTOPIC_THRESHOLD && devNext > RR_ECTOPIC_THRESHOLD) keep[i] = false;
+  }
+  return ranged.filter((_, i) => keep[i]);
+}
+
+export function hrvSeries(cfg: Config, args: { from: string; to: string; deviceId?: string; bucketSeconds?: number }) {
+  if (!fs.existsSync(cfg.mirrorPath)) return { buckets: [], notIngested: true };
+  const fromTs = toTs(args.from), toT = toTs(args.to, true);
+  if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
+  if (toT - fromTs > MAX_SPAN_S) return { error: "span_too_wide", maxDays: 7 };
+  const b = Math.min(3600, Math.max(60, args.bucketSeconds ?? 300));
+  const m = new Mirror(cfg.mirrorPath);
+  try {
+    const raw = m.rrIntervalsRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: RR_RAW_CAP });
+    // rrInterval is WHOOP-era only — the Oura API never exposed beat-to-beat timing, so a range that's
+    // pure oura-api (or predates any WHOOP pairing) legitimately has zero rows, not a bug. Distinguish
+    // that from "no data in this bucket" (which still returns a bucket, just with rmssd:null below).
+    if (raw.length === 0) {
+      return { buckets: [], rrAvailable: false, hint: "rrInterval is WHOOP-era only — empty for oura-api and any pre-WHOOP range (the Oura API never provides beat-to-beat R-R data)." };
+    }
+    const byBucket = new Map<string, { ts: number; deviceId: string; rows: { ts: number; rrMs: number }[] }>();
+    for (const r of raw) {
+      const bucketTs = Math.floor(r.ts / b) * b;
+      const key = `${r.deviceId}|${bucketTs}`;
+      let c = byBucket.get(key);
+      if (!c) { c = { ts: bucketTs, deviceId: r.deviceId, rows: [] }; byBucket.set(key, c); }
+      c.rows.push({ ts: r.ts, rrMs: r.rrMs });
+    }
+    const buckets = [...byBucket.values()].sort((x, y) => x.ts - y.ts || x.deviceId.localeCompare(y.deviceId))
+      .map((c) => {
+        const clean = cleanRR(c.rows);
+        const n = clean.length;
+        // Too few clean beats to trust RMSSD/meanHr (same minBeats floor as the app's HRVAnalyzer) —
+        // null, not a fabricated number, while still reporting n so a caller can see how close it was.
+        if (n < RR_MIN_BEATS) return { ts: c.ts, deviceId: c.deviceId, family: sourceFamily(c.deviceId), rmssd: null, meanHr: null, n };
+        let sumSq = 0;
+        for (let i = 1; i < n; i++) { const d = clean[i].rrMs - clean[i - 1].rrMs; sumSq += d * d; }
+        const rmssd = round1(Math.sqrt(sumSq / (n - 1))); // Task Force (1996) RMSSD — matches HRVAnalyzer.rmssdRaw
+        const meanRR = clean.reduce((s, r) => s + r.rrMs, 0) / n;
+        const meanHr = round1(60_000 / meanRR); // 60,000ms/min ÷ mean RR(ms) = beats/min
+        return { ts: c.ts, deviceId: c.deviceId, family: sourceFamily(c.deviceId), rmssd, meanHr, n };
+      });
+    return { buckets, ...(raw.length === RR_RAW_CAP ? { truncated: true, hint: "narrow the from/to window or increase bucketSeconds" } : {}) };
   } finally { m.close(); }
 }
 
@@ -288,6 +365,13 @@ export function registerGranularTools(server: McpServer, cfg: Config): void {
     inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(hrSeries(cfg, a)));
+
+  server.registerTool("hrv_series", {
+    title: "HRV (RMSSD) series from R-R intervals",
+    description: "Bucketed heart-rate-variability (RMSSD, ms) computed from raw beat-to-beat R-R intervals for a time range (max 7 days) — the beat-level timing hr_series' averaged BPM can't see, e.g. for daytime HRV or a stress read. R-R data is WHOOP-era only: a range with none returns rrAvailable:false, meaning oura-api or a pre-WHOOP date (the Oura API never exposes beat-to-beat timing). Applies light range (250-3000ms) + successive-diff artifact filtering — a simplified approximation of the app's HRVAnalyzer cleaning, not byte-identical — before computing RMSSD and mean HR (60000/meanRR) per bucket; a bucket with fewer than 20 clean intervals returns rmssd:null and meanHr:null (not fabricated) while still reporting n.",
+    inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async (a) => asTool(hrvSeries(cfg, a)));
 
   server.registerTool("sleep_detail", {
     title: "Sleep night detail",
