@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Config, loadConfig } from "./config.js";
 import { requireScope, tokenScope } from "./auth.js";
-import { ingestNoopbak, IngestError } from "./ingest.js";
+import { ingestNoopbak, IngestError, normalizePhoneTz } from "./ingest.js";
 import { buildMcpServer } from "./mcp.js";
 import { journalSince, ackEdits } from "./staging.js";
 import { upsertDeviceToken } from "./push/registry.js";
@@ -20,7 +20,8 @@ export function createApp(cfg: Config): express.Express {
     express.raw({ type: "*/*", limit: cfg.maxIngestBytes }),
     (req, res) => {
       try {
-        const out = ingestNoopbak(req.body as Buffer, cfg);
+        const phoneTz = normalizePhoneTz(req.header("x-phone-timezone"));
+        const out = ingestNoopbak(req.body as Buffer, cfg, phoneTz);
         res.json(out);
       } catch (e) {
         if (e instanceof IngestError) return res.status(400).json({ error: e.code });

@@ -62,6 +62,18 @@ describe("core tools", () => {
     expect(last.whoop.recovery).toBe(66);
     expect(last.whoop.sources).toEqual(["my-whoop", "my-whoop-noop"]);
   });
+  it("data_freshness surfaces phoneTz from the latest ingest (null when none was sent)", () => {
+    const r = dataFreshness(cfg) as any;
+    // The shared fixture ingest sent no header → null.
+    expect(r.phoneTz).toBeNull();
+
+    // A fresh ingest carrying a timezone surfaces it.
+    const tzDir = path.join(process.cwd(), "test/.tmp/tools-core-tz");
+    fs.rmSync(tzDir, { recursive: true, force: true }); fs.mkdirSync(tzDir, { recursive: true });
+    const tzCfg = { dataDir: tzDir, mirrorPath: path.join(tzDir, "mirror.sqlite"), serverDbPath: path.join(tzDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
+    const z = path.join(tzDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), tzCfg, "America/New_York");
+    expect((dataFreshness(tzCfg) as any).phoneTz).toBe("America/New_York");
+  });
   it("tools return structured not-ingested response before first ingest", () => {
     const emptyDir = path.join(process.cwd(), "test/.tmp/tools-empty");
     fs.rmSync(emptyDir, { recursive: true, force: true });
