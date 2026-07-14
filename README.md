@@ -14,6 +14,30 @@ fly deploy
 
 Save the two tokens. `RW_TOKEN` uploads data; `RO_TOKEN` is for read clients (Claude Code, cron).
 
+## Run with plain Docker (any host)
+
+Nothing here is Fly-specific: the runtime is a Node 20 + Express + SQLite server that reads
+its whole config from env vars, and storage is a SQLite file in `DATA_DIR` — just a mounted
+directory. `fly.toml` is the only Fly artifact and is ignored off-Fly. So it runs anywhere
+Docker does (Compose, Kubernetes, a bare VM):
+
+```bash
+docker build -t noop-cloud .
+docker run -p 8080:8080 \
+  -e RO_TOKEN=$(openssl rand -hex 32) \
+  -e RW_TOKEN=$(openssl rand -hex 32) \
+  -v "$PWD/data:/data" \
+  noop-cloud
+```
+
+The server listens on `:8080`; `GET /healthz` is the health check. Then `POST /ingest` a
+`.noopbak` with `Authorization: Bearer <RW_TOKEN>` and point any MCP client at `http://<host>:8080/mcp`
+with the `RO_TOKEN`. Env vars: `DATA_DIR` (default `/data` in the image), `PORT` (8080),
+`RO_TOKEN`, `RW_TOKEN`, `MAX_INGEST_BYTES`, plus the optional `APNS_*` push credentials below —
+pass them with `-e` or an `--env-file` instead of `fly secrets`. `better-sqlite3` is a native
+module, so build the image on (or for) your target CPU architecture — the Dockerfile compiles it
+during the build.
+
 ## Upload data (iOS Shortcut, no app changes)
 
 In NOOP: **Settings → Backup & Sync → Back up now** to write a `.noopbak`. Then an iOS Shortcut:
