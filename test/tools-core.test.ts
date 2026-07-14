@@ -37,6 +37,13 @@ describe("core tools", () => {
     expect(oura.tables).toContain("dailyMetric");
     expect(oura.tables).toContain("hrSample");
   });
+  it("data_freshness sources surface rrInterval only for devices that actually carry R-R data (WHOOP-only)", () => {
+    const r = dataFreshness(cfg) as any;
+    const whoop = r.sources.find((s: any) => s.deviceId === "my-whoop");
+    expect(whoop.tables).toContain("rrInterval");
+    const oura = r.sources.find((s: any) => s.deviceId === "oura-api");
+    expect(oura.tables).not.toContain("rrInterval"); // Oura's API never exposes beat-to-beat R-R data
+  });
   it("health_snapshot rolls up recent days by family", () => {
     const r = healthSnapshot(cfg, { days: 2 });
     expect(r.days.length).toBe(2);

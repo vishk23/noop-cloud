@@ -12,6 +12,8 @@ export function buildMirrorSqlite(target: string): void {
   db.exec(`
     CREATE TABLE grdb_migrations (identifier TEXT PRIMARY KEY);
     CREATE TABLE hrSample (deviceId TEXT, ts INTEGER, bpm INTEGER, PRIMARY KEY(deviceId, ts));
+    CREATE TABLE rrInterval (deviceId TEXT, ts INTEGER, rrMs INTEGER, seq INTEGER DEFAULT 0,
+      synced INTEGER DEFAULT 0, PRIMARY KEY(deviceId, ts, rrMs, seq));
     CREATE TABLE dailyMetric (deviceId TEXT, day TEXT, totalSleepMin INTEGER, efficiency REAL,
       restingHr REAL, avgHrv REAL, recovery REAL, strain REAL, spo2Pct REAL, skinTempDevC REAL,
       respRateBpm REAL, steps INTEGER, activeKcalEst REAL, PRIMARY KEY(deviceId, day));
@@ -96,6 +98,16 @@ export function buildMirrorSqlite(target: string): void {
   ]);
   db.prepare("UPDATE sleepSession SET stagesJSON = ? WHERE deviceId = 'my-whoop' AND startTs = ?").run(stages, night);
   for (let t = night; t <= night + 25200; t += 300) hr.run("my-whoop", t, 46 + Math.round(8 * Math.abs(Math.sin(t / 3000))));
+
+  // R-R intervals for the same night (my-whoop only — Oura's API never exposes beat-to-beat data, so
+  // rrInterval stays empty for oura-api/apple-health across this whole fixture; see hrv_series in
+  // src/tools/granular.ts and the data_freshness `tables` union in src/mirror.ts's sources()). A short
+  // alternating 800/850ms burst, one row per second so the composite PK can't collide — just enough
+  // presence for data_freshness/sources() to see "rrInterval" under my-whoop's tables. Precise
+  // RMSSD-math/bucketing/sparse-bucket/artifact-filter fixtures live in their own dedicated mirror
+  // (test/tools-hrv.test.ts), same pattern as tools-hr-dense.test.ts/tools-motion-dense.test.ts.
+  const rr = db.prepare("INSERT INTO rrInterval (deviceId,ts,rrMs,seq,synced) VALUES (?,?,?,?,?)");
+  for (let i = 0; i < 24; i++) rr.run("my-whoop", night + i, i % 2 === 0 ? 800 : 850, 0, 0);
 
   // Motion evidence for the same night (my-whoop), CoreMotion/WHOOP-shaped: wrist posture (gravity)
   // is stable 03:00-05:00Z aside from a 03:30-03:40Z posture-change blip (a "stayed in bed" night).
