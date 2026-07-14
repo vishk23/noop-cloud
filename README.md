@@ -24,6 +24,24 @@ corrections to mis-scored data, with every edit confirmed by you and reversible.
   plus SQLite. Upload via an iOS Shortcut of NOOP's existing `.noopbak` backup: zero app
   changes. Works with Claude Code, claude.ai, ChatGPT Deep Research, and any MCP client.
 
+## How your data gets in — two paths
+
+**Path A — backup upload (included here, no app changes).** An iOS Shortcut POSTs NOOP's
+`.noopbak` to `/ingest`. That's it: every read tool and all the MCP-side editing below work
+against that snapshot. This is the recommended way to start and it's fully self-contained in
+this repo.
+
+**Path B — live two-way sync (needs app-side integration, *not* in this repo).** The server
+also speaks the endpoints for a much richer flow: background upload, push-to-sync
+(`request_sync` → APNs → the phone uploads within ~a minute), and applying the AI's *confirmed*
+edits back onto the device — so a correction you approve in Claude flows to your phone and
+sticks. The server half lives here (`/register-device`, `/edits`, `/edits/ack`, `request_sync`);
+the **client half — the CloudSync code inside the NOOP app that registers for push, handles it,
+pulls the edit journal, applies it, and does pull-first / skip-unchanged uploads — is a separate
+integration in the app and is not part of this repo.** Sections tagged **_(needs Path B)_** below
+assume it. Want Path B for your own NOOP build? Open an issue or reach out — happy to share how
+the client side works.
+
 ## Deploy (Fly.io)
 
 ```bash
@@ -105,6 +123,11 @@ artifact HR ranges, and blanking bogus metric points. See [Editing your data](#e
 
 ## Push-triggered on-demand sync
 
+> **Needs Path B (app integration).** This describes the live-sync flow. The server endpoints are
+> here, but the phone must run the NOOP-app CloudSync integration (registration + push handling)
+> for it to do anything — see [How your data gets in](#how-your-data-gets-in--two-paths). On a bare
+> backup-upload deployment `request_sync` simply returns `{devices: 0}`.
+
 `request_sync` asks the phone to sync right now via a visible APNs alert push (priority 10, with
 `content-available` so it also wakes the app in the background to upload) instead of waiting for its
 normal schedule — call it, then poll `data_freshness` until `mirrorAgeSeconds` resets. A silent
@@ -168,7 +191,9 @@ by appending, so the audit trail is complete forever.
   the phone can't do, and server reads already resolve those undos via the immutable mirror
   (`src/edits/compensation.ts`).
 - Honesty note: `health_snapshot` / `compare_sources` aggregate the phone's own daily rollups; those
-  numbers update after the phone applies your edits (Phase 3) and re-uploads.
+  numbers update after the phone applies your edits and re-uploads — which is the **_(needs Path B)_**
+  apply-back leg. With backup-upload only (Path A), confirmed edits are reflected in the server's
+  read tools via the overlay, but the phone's own rollups won't change until you edit on-device.
 
 ### Granular evidence & edits
 
