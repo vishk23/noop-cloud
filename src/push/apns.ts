@@ -81,24 +81,37 @@ function http2Send(deviceToken: string, headers: Record<string, string>, payload
 
 export interface SendResult { pushed: number; pruned: number; }
 
+// The visible banner every request_sync push carries. A silent (content-available-only) background
+// push CANNOT be delivered reliably — iOS budget-throttles apns-priority:5 background pushes and drops
+// them entirely under Low Power Mode or with Background App Refresh off, so a second request_sync
+// minutes after a first routinely never woke the app at all. An `alert` push at apns-priority:10 is
+// delivered promptly and reliably, AND (because content-available:1 rides along) still wakes the app
+// in the background to run its upload — so "visible" and "reliable" are the same single change here.
+const PUSH_ALERT = { title: "NOOP", body: "Syncing your latest data…" };
+
 /**
- * Send a silent (content-available) push to every registered device token. `send` is an
+ * Send a VISIBLE (alert + content-available) push to every registered device token. `send` is an
  * injectable seam (defaults to the real HTTP/2 transport) so tests never touch real APNs.
  * Tokens Apple reports as dead (410, or 400 with reason "BadDeviceToken") are pruned from the
  * registry so future pushes stop targeting them.
  */
-export async function sendSilentPush(cfg: ApnsConfig & Pick<Config, "serverDbPath">, send: SendFn = http2Send): Promise<SendResult> {
+export async function sendSyncPush(cfg: ApnsConfig & Pick<Config, "serverDbPath">, send: SendFn = http2Send): Promise<SendResult> {
   const tokens = listDeviceTokens(cfg);
   if (tokens.length === 0) return { pushed: 0, pruned: 0 };
   const jwt = buildProviderJWT(cfg);
   const headers = {
     authorization: `bearer ${jwt}`,
-    "apns-push-type": "background",
-    "apns-priority": "5",
+    // alert (not background) + priority 10: the ONLY combination iOS delivers promptly and reliably.
+    // content-available rides along so a backgrounded app still wakes to upload without a user tap.
+    "apns-push-type": "alert",
+    "apns-priority": "10",
     "apns-topic": cfg.apnsTopic!,
     "content-type": "application/json",
   };
-  const payload = JSON.stringify({ aps: { "content-available": 1 } });
+  // `purpose` is a custom top-level key (outside `aps`, per APNs) the app reads from userInfo to tell
+  // a TAPPED cloud-sync alert apart from its own local notifications (battery/illness/smart-alarm), so
+  // only a tap on THIS push kicks an upload.
+  const payload = JSON.stringify({ aps: { alert: PUSH_ALERT, "content-available": 1 }, purpose: "cloudsync" });
   let pushed = 0;
   let pruned = 0;
   for (const t of tokens) {

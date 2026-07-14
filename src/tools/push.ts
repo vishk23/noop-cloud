@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "../config.js";
 import { countDeviceTokens, getLastPushAt, setLastPushAt } from "../push/registry.js";
-import { isApnsConfigured, sendSilentPush, type SendFn } from "../push/apns.js";
+import { isApnsConfigured, sendSyncPush, type SendFn } from "../push/apns.js";
 import { dataFreshness } from "./core.js";
 
 const THROTTLE_S = 120;
@@ -25,7 +25,7 @@ export async function requestSync(cfg: Config, send?: SendFn) {
     return { throttled: true, retryInSec: THROTTLE_S - (now - last) };
   }
   setLastPushAt(cfg, now);
-  const { pushed } = await sendSilentPush(cfg, send);
+  const { pushed } = await sendSyncPush(cfg, send);
   return {
     pushed,
     mirrorAgeSeconds: dataFreshness(cfg).mirrorAgeSeconds,

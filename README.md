@@ -37,8 +37,11 @@ Then ask: "call data_freshness, then health_snapshot for the last 7 days."
 
 ## Push-triggered on-demand sync
 
-`request_sync` asks the phone to sync right now via a silent APNs push instead of waiting for its
-normal schedule — call it, then poll `data_freshness` until `mirrorAgeSeconds` resets. It's
+`request_sync` asks the phone to sync right now via a visible APNs alert push (priority 10, with
+`content-available` so it also wakes the app in the background to upload) instead of waiting for its
+normal schedule — call it, then poll `data_freshness` until `mirrorAgeSeconds` resets. A silent
+(content-available-only) background push was tried first but iOS budget-throttles those and drops
+them under Low Power Mode / Background App Refresh off, so repeat calls never woke the phone. It's
 throttled to one push per 120s server-wide and never throws: with no push credentials configured
 it returns `{configured: false}`, and with credentials but no registered phone it returns
 `{devices: 0}`.
@@ -53,9 +56,10 @@ fly secrets set \
   APNS_TOPIC=com.yourorg.NOOP
 ```
 
-The phone side isn't wired up yet — once it registers for silent push, it should call
-`POST /register-device` (read-write credential) with `{token, platform: "ios"}`, ideally on every
-app open so a reinstalled/restored phone re-registers automatically.
+The phone registers for remote notifications and calls `POST /register-device` (read-write
+credential) with `{token, platform: "ios"}` on every app open, so a reinstalled/restored phone
+re-registers automatically. It must also hold User Notification authorization for the alert banner
+to display (the app requests it on the Cloud Sync path).
 
 ## Morning report
 
