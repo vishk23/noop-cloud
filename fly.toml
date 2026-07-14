@@ -1,4 +1,5 @@
-app = "vk-noop-cloud"
+# Rename to your own app before deploying: `fly deploy -a <your-app>` or edit this line.
+app = "noop-cloud"
 primary_region = "iad"
 
 [build]
