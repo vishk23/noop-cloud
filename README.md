@@ -20,6 +20,15 @@ In NOOP: **Settings → Backup & Sync → Back up now** to write a `.noopbak`. T
 "Get File → Get Contents of URL": `POST https://<app>.fly.dev/ingest`, header
 `Authorization: Bearer <RW_TOKEN>`, request body = the file.
 
+Every timestamp in an upload is epoch-UTC, so `POST /ingest` also accepts an optional
+`X-Phone-Timezone` header carrying the phone's current IANA identifier (the app's in-app Cloud Sync
+path sets it; the Shortcut can add it as a static header). It is validated against an IANA-id shape
+(`Area/Location` or bare `UTC`) — anything else is stored as `NULL` — and recorded on the ingest
+log row, so the server knows which zone the phone was in as of that upload. `data_freshness` returns
+it as `phoneTz`, and `sleep_summary` attaches a per-night `tzId` by resolving each session's local
+day (across the UTC-day boundary) against the phone's per-day `phoneTimezone` table when present.
+Mirrors uploaded before that table shipped simply omit the field.
+
 ## Connect Claude Code
 
 ```bash
@@ -89,6 +98,16 @@ by appending, so the audit trail is complete forever.
 - Read-only callers (routines, cron, shared agents) can `propose_edit`, `list_pending`, `edit_journal`.
 - `confirm_edit` / `reject_edit` / `undo_edit` exist **only** for read-write callers — invisible otherwise.
 - `GET /edits?since=<seq>` (read token) streams the journal for downstream sync.
+- **Cross-batch undo converges the phone.** When `undo_edit` reverses a sleep-bounds or sleep-stage
+  edit, it also appends a forward **compensating** edit re-asserting the target's net post-undo state
+  (computed from the overlay *after* the undo, so a still-active stacked edit on the same night wins
+  over the mirror baseline). Without it, a phone that applied the original edit in an *earlier* pull
+  batch would never see the undo (the applier skips undo markers and never re-pulls the undone row),
+  leaving the change stuck on-device; the compensating row is an ordinary edit, so a device syncing
+  from any cursor reverts. It is server-side only (heals every app version, zero phone change).
+  `delete_*` / `add_*` / note kinds get no compensation — deletes would need on-device resurrection
+  the phone can't do, and server reads already resolve those undos via the immutable mirror
+  (`src/edits/compensation.ts`).
 - Honesty note: `health_snapshot` / `compare_sources` aggregate the phone's own daily rollups; those
   numbers update after the phone applies your edits (Phase 3) and re-uploads.
 
