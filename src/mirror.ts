@@ -139,6 +139,18 @@ export class Mirror {
     return (this.db.prepare("SELECT deviceId, startTs, endTs, efficiency, restingHr, avgHrv, userEdited, stagesJSON FROM sleepSession WHERE deviceId = ? AND startTs = ?").get(deviceId, startTs) as any) ?? null;
   }
 
+  // v28-imu-activity: per-second IMU activity features derived from the WHOOP 5/MG raw 6-axis offload
+  // buffer (WhoopStore `imuActivity` table). WHOOP 5/MG-only, and only present once that migration
+  // shipped AND a deep-buffer capture ran — imu_series guards with hasTable("imuActivity") before
+  // calling this, which assumes the table exists. cadenceHz is nullable (a still/bursty wrist).
+  imuActivityRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }):
+    { deviceId: string; ts: number; accelEnergyG: number; gyroEnergyDps: number; jerkRms: number; cadenceHz: number | null; cadenceStrength: number; sampleCount: number }[] {
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, accelEnergyG, gyroEnergyDps, jerkRms, cadenceHz, cadenceStrength, sampleCount FROM imuActivity WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+
   // Real phone schema carries stepSample/gravitySample from CoreMotion, but any mirror ingested
   // before this feature shipped won't have them — check sqlite_master rather than assume present.
   hasTable(name: string): boolean {

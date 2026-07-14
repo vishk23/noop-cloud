@@ -358,6 +358,53 @@ export function motionSeries(cfg: Config, args: { from: string; to: string; devi
   } finally { m.close(); }
 }
 
+// imu_series: bucket the per-second WHOOP 5/MG IMU activity features (WhoopStore v28 imuActivity table)
+// over a range. Structurally like motionSeries but reads one derived-feature table (not step+gravity),
+// and — since IMU capture is 5/MG-only + opt-in — degrades to notCaptured on a mirror lacking the table.
+// Cadence is aggregated as a STRENGTH-WEIGHTED mean over the rhythmic seconds (nulls ignored), so a
+// bucket with only a few clean gait seconds isn't dragged to a fabricated rate by the still ones; per
+// the derived-signal rule cadence is a reported feature, never a gate.
+export function imuSeries(cfg: Config, args: { from: string; to: string; deviceId?: string; bucketSeconds?: number }) {
+  if (!fs.existsSync(cfg.mirrorPath)) return { buckets: [], notIngested: true };
+  const fromTs = toTs(args.from), toT = toTs(args.to, true);
+  if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
+  if (toT - fromTs > MAX_SPAN_S) return { error: "span_too_wide", maxDays: 7 };
+  const b = Math.min(3600, Math.max(60, args.bucketSeconds ?? 300));
+  const r3 = (x: number) => Math.round(x * 1000) / 1000;
+  const m = new Mirror(cfg.mirrorPath);
+  try {
+    if (!m.hasTable("imuActivity")) {
+      return { buckets: [], notCaptured: true, hint: "no IMU activity — needs a WHOOP 5/MG with the deep-buffer capture toggle on" };
+    }
+    const rows = m.imuActivityRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: SERIES_CAP });
+    type Cell = { ts: number; deviceId: string; accelSum: number; accelPeak: number; gyroSum: number; jerkSum: number; cadWeightSum: number; cadValSum: number; rhythmic: number; n: number };
+    const byBucket = new Map<string, Cell>();
+    for (const row of rows) {
+      const bucketTs = Math.floor(row.ts / b) * b;
+      const key = `${row.deviceId}|${bucketTs}`;
+      let c = byBucket.get(key);
+      if (!c) { c = { ts: bucketTs, deviceId: row.deviceId, accelSum: 0, accelPeak: 0, gyroSum: 0, jerkSum: 0, cadWeightSum: 0, cadValSum: 0, rhythmic: 0, n: 0 }; byBucket.set(key, c); }
+      c.accelSum += row.accelEnergyG; c.accelPeak = Math.max(c.accelPeak, row.accelEnergyG);
+      c.gyroSum += row.gyroEnergyDps; c.jerkSum += row.jerkRms; c.n += 1;
+      if (row.cadenceHz != null) { c.rhythmic += 1; c.cadWeightSum += row.cadenceStrength; c.cadValSum += row.cadenceHz * row.cadenceStrength; }
+    }
+    const buckets = [...byBucket.values()]
+      .sort((a, c) => a.ts - c.ts || a.deviceId.localeCompare(c.deviceId))
+      .map((c) => {
+        const cadenceHz = c.cadWeightSum > 0 ? c.cadValSum / c.cadWeightSum : null;
+        return {
+          ts: c.ts, deviceId: c.deviceId, family: sourceFamily(c.deviceId), seconds: c.n,
+          accelEnergyG: r3(c.accelSum / c.n), accelEnergyPeakG: r3(c.accelPeak),
+          gyroEnergyDps: r3(c.gyroSum / c.n), jerkRms: r3(c.jerkSum / c.n),
+          cadenceHz: cadenceHz == null ? null : r3(cadenceHz),
+          cadenceStepsPerMin: cadenceHz == null ? null : Math.round(cadenceHz * 60),
+          rhythmicFraction: r3(c.rhythmic / c.n),
+        };
+      });
+    return { buckets, ...(rows.length === SERIES_CAP ? { truncated: true, hint: "narrow the from/to window or increase bucketSeconds" } : {}) };
+  } finally { m.close(); }
+}
+
 export function registerGranularTools(server: McpServer, cfg: Config): void {
   server.registerTool("hr_series", {
     title: "Heart-rate series",
@@ -386,4 +433,11 @@ export function registerGranularTools(server: McpServer, cfg: Config): void {
     inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(motionSeries(cfg, a)));
+
+  server.registerTool("imu_series", {
+    title: "IMU activity series (WHOOP 5/MG high-rate motion)",
+    description: "High-rate motion for a time range (max 7 days), bucketed: per bucket the mean + peak accelerometer energy (g), gyro energy (°/s), jerk, and gait cadence (Hz + steps/min, strength-weighted over the rhythmic seconds) plus the rhythmic fraction. Derived from the WHOOP 5/MG raw 6-axis IMU offload buffer at 100 Hz — it resolves walking/running cadence, impact and rotational energy that the 1 Hz gravity-only motion_series physically cannot, and is the granular input for sport/activity detection. WHOOP 5/MG only and needs the deep-buffer capture toggle: notCaptured:true means no IMU activity is in range (wrong strap, capture off, or nothing offloaded yet). truncated:true means the read hit its cap — narrow the window or widen bucketSeconds. Pair with hr_series to tell a hard effort (high cadence + high HR) from fidgeting.",
+    inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async (a) => asTool(imuSeries(cfg, a)));
 }
