@@ -41,8 +41,14 @@ describe("granular edit full loop over MCP", () => {
     expect(d1.stages.length).toBe(2);
     const u = await mcp(port, cfg().rwToken, 4, "undo_edit", { seq: c.seq });
     expect(u.undoneSeq).toBe(c.seq);
+    // Cross-batch heal: undo now ALSO appends a forward compensating edit_sleep_stages re-asserting
+    // the pre-edit (mirror) hypnogram, so a phone that applied the original in an earlier batch reverts
+    // it. The stage VALUES revert to the fixture's original 4-segment hypnogram; the night reads as
+    // edited because that compensation is itself an (authoritative) cloud edit.
+    expect(u.compensationSeq).toBeGreaterThan(u.bySeq);
     const d2 = await mcp(port, cfg().roToken, 5, "sleep_detail", { deviceId: "my-whoop", startTs: NIGHT });
-    expect(d2.stagesEdited).toBeUndefined();
-    expect(d2.stages.length).toBe(4); // fixture's original hypnogram
+    expect(d2.stagesEdited).toBe(true); // annotated with the compensation edit
+    expect(d2.stages.length).toBe(4); // reverted to the fixture's original hypnogram
+    expect(d2.stages.map((s: any) => s.stage)).toEqual(["light", "deep", "rem", "light"]);
   });
 });

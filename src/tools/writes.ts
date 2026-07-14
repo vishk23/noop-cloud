@@ -5,6 +5,7 @@ import type { Config } from "../config.js";
 import { EDIT_KINDS, EditKind, payloadSchema, DAILY_METRIC_EDITABLE_COLUMNS } from "../edits/kinds.js";
 import { captureBefore, renderDiff, EditTargetError } from "../edits/diff.js";
 import { createProposal, listPending, journalSince, getProposal, resolveProposal, appendJournal, markUndone, journalEntryFor } from "../staging.js";
+import { compensationFor } from "../edits/compensation.js";
 
 const asTool = (obj: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }], structuredContent: obj as Record<string, unknown> });
 
@@ -101,10 +102,12 @@ export function registerResolutionTools(server: McpServer, cfg: Config): void {
 
   // Phase-3 replay must treat undo rows as idempotent: a crash between appendJournal(undo) and
   // markUndone below can leave a duplicate undo row targeting the same seq on retry — markUndone's
-  // `undoneBySeq IS NULL` guard makes the second markUndone a no-op, and this is harmless.
+  // `undoneBySeq IS NULL` guard makes the second markUndone a no-op, and this is harmless. A retry of
+  // the whole call is also safe: the `undoneBySeq !== null` guard below short-circuits it to
+  // not_undoable, so the compensation row is never appended twice for one undo.
   server.registerTool("undo_edit", {
     title: "Undo a confirmed edit",
-    description: "Reverse a journal entry by appending an undo record (history is never deleted).",
+    description: "Reverse a journal entry by appending an undo record (history is never deleted). For sleep-bounds/stage edits also appends a forward compensating edit re-asserting the pre-undo state, so a phone that applied the original in an earlier pull batch reverts it too.",
     inputSchema: { seq: z.number().int().min(1) },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
   }, async (a) => {
@@ -112,6 +115,15 @@ export function registerResolutionTools(server: McpServer, cfg: Config): void {
     if (!target || target.kind === "undo" || target.undoneBySeq !== null) return asTool({ error: "not_undoable" });
     const bySeq = appendJournal(cfg, { editId: "undo_" + crypto.randomBytes(5).toString("hex"), kind: "undo", payloadJSON: JSON.stringify({ targetSeq: a.seq }), beforeJSON: null, rationale: null });
     markUndone(cfg, a.seq, bySeq);
-    return asTool({ undoneSeq: a.seq, bySeq });
+    // Cross-batch heal: skipping the undo marker alone only reverts a phone that pulled the original
+    // edit in the SAME batch (where CloudEditApplier never applied it). A phone that applied + acked
+    // the original in an earlier batch never re-pulls it, so the undo marker is a no-op there — the
+    // change is stuck. A forward compensating edit (built from the NET post-undo overlay, hence after
+    // markUndone) re-asserts the correct value as a normal edit every app version already applies.
+    const comp = compensationFor(cfg, target);
+    const compensationSeq = comp
+      ? appendJournal(cfg, { editId: "comp_" + crypto.randomBytes(5).toString("hex"), kind: comp.kind, payloadJSON: comp.payloadJSON, beforeJSON: null, rationale: comp.rationale })
+      : undefined;
+    return asTool({ undoneSeq: a.seq, bySeq, ...(compensationSeq !== undefined ? { compensationSeq } : {}) });
   });
 }
