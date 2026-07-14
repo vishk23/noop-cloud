@@ -1,7 +1,28 @@
 # noop-cloud
 
-A self-hostable remote MCP server that mirrors a NOOP health database and exposes
-read-only biometrics tools to Claude, ChatGPT, and agents over Streamable HTTP.
+A self-hostable remote **MCP server for your NOOP health data.** It mirrors your NOOP
+database and puts your WHOOP, Oura, and Apple Health biometrics behind Claude, ChatGPT, or
+any agent over Streamable HTTP — so you can query them in natural language, cross-check one
+wearable against another, drill into the raw sensor trace, and let the AI *propose*
+corrections to mis-scored data, with every edit confirmed by you and reversible.
+
+## What you can do
+
+- **Talk to your biometrics.** Ask "how did I sleep this week?" or "show my resting-HR trend"
+  and Claude/ChatGPT answers from your own data — no dashboard, no CSV wrangling.
+- **Cross-check your sources.** `compare_sources` puts WHOOP, Oura, and Apple side by side for
+  the same day, so you (and the AI) can catch which device is wrong when they disagree.
+- **See the raw evidence, not just daily rollups.** Pull beat-to-beat heart rate, the full
+  sleep hypnogram, R-R-interval HRV, and motion/IMU — enough for the AI to judge whether a
+  flagged "wake" was real or just movement.
+- **Let the AI fix your data — safely.** It can *propose* corrections (re-score a bad night,
+  delete a bogus HR spike, re-stage a hypnogram). Nothing changes until you confirm with the
+  write token; every edit is an append-only journal with a before-snapshot and one-command
+  undo, and your uploaded data is never mutated. Read-only callers (cron, shared agents) can
+  propose but never confirm.
+- **Self-host in minutes, a couple dollars a month.** One small Fly machine — or plain Docker —
+  plus SQLite. Upload via an iOS Shortcut of NOOP's existing `.noopbak` backup: zero app
+  changes. Works with Claude Code, claude.ai, ChatGPT Deep Research, and any MCP client.
 
 ## Deploy (Fly.io)
 
@@ -64,9 +85,23 @@ Then ask: "call data_freshness, then health_snapshot for the last 7 days."
 
 ## Tools
 
-`data_freshness`, `health_snapshot`, `metric_series`, `sleep_summary`, `workout_summary`,
-`compare_sources`, `request_sync`, plus ChatGPT Deep Research `search`/`fetch`. Prompts:
-`morning_report`, `corroborate_sources`, `find_messy_data`. All read-only in this phase.
+**Summaries & trends (read):** `data_freshness`, `health_snapshot`, `metric_series`,
+`sleep_summary`, `workout_summary`, `compare_sources` (WHOOP vs Oura vs Apple corroboration).
+
+**Raw sensor evidence (read):** `hr_series` (beat-level heart rate), `sleep_detail` (full
+hypnogram + in-sleep HR), `hrv_series` (RMSSD from R-R intervals), `motion_series` (steps +
+wrist posture), `imu_series` (WHOOP 5/MG activity).
+
+**Edits — propose → confirm → journal → undo:** `propose_edit`, `list_pending`, `edit_journal`
+(read token) and `confirm_edit`, `reject_edit`, `undo_edit` (**write token only**). Edit kinds
+cover fixing/adding/deleting workouts, adjusting sleep bounds, re-staging hypnograms, deleting
+artifact HR ranges, and blanking bogus metric points. See [Editing your data](#editing-your-data).
+
+**On-demand sync:** `request_sync` pushes your phone to upload fresh data now (see
+[Push-triggered on-demand sync](#push-triggered-on-demand-sync)).
+
+**ChatGPT Deep Research:** `search` / `fetch`.  **Prompts:** `morning_report`,
+`corroborate_sources`, `find_messy_data`.
 
 ## Push-triggered on-demand sync
 
@@ -111,7 +146,7 @@ Local dry-run (prints, no push):
 ANTHROPIC_API_KEY=… NOOP_CLOUD_URL=https://<app>.fly.dev NOOP_RO_TOKEN=… node scripts/report.mjs --dry-run
 ```
 
-## Editing your data (Phase 2)
+## Editing your data
 
 The AI can *propose* corrections; nothing changes until you confirm with the read-write credential.
 The mirror (your uploaded data) is never modified — confirmed edits live in an append-only journal
