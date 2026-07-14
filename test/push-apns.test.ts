@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, vi } from "vitest";
 import fs from "node:fs"; import path from "node:path"; import crypto from "node:crypto";
-import { isApnsConfigured, sendSilentPush } from "../src/push/apns.js";
+import { isApnsConfigured, sendSyncPush } from "../src/push/apns.js";
 import type { SendFn } from "../src/push/apns.js";
 import { upsertDeviceToken, listDeviceTokens } from "../src/push/registry.js";
 
@@ -50,12 +50,12 @@ describe("isApnsConfigured", () => {
   });
 });
 
-describe("sendSilentPush", () => {
+describe("sendSyncPush", () => {
   it("short-circuits with no transport calls when there are no registered tokens", async () => {
     const cfg = baseCfg();
     let calls = 0;
     const send: SendFn = async () => { calls++; return { status: 200, body: "" }; };
-    expect(await sendSilentPush(cfg, send)).toEqual({ pushed: 0, pruned: 0 });
+    expect(await sendSyncPush(cfg, send)).toEqual({ pushed: 0, pruned: 0 });
     expect(calls).toBe(0);
   });
 
@@ -70,18 +70,24 @@ describe("sendSilentPush", () => {
       calls.push({ deviceToken, headers, payload });
       return { status: 200, body: "" };
     };
-    const result = await sendSilentPush(cfg, send);
+    const result = await sendSyncPush(cfg, send);
     expect(result).toEqual({ pushed: 2, pruned: 0 });
     expect(calls.map((c) => c.deviceToken).sort()).toEqual([tokenA, tokenB].sort());
 
     for (const c of calls) {
-      expect(c.payload).toBe(JSON.stringify({ aps: { "content-available": 1 } }));
-      expect(c.headers["apns-push-type"]).toBe("background");
-      expect(c.headers["apns-priority"]).toBe("5");
+      // Visible + wake: an alert dict (so iOS displays a banner) AND content-available:1 (so a
+      // backgrounded app still wakes to upload without a user tap), sent as an alert push at
+      // priority 10 — the only combination iOS delivers promptly and reliably.
+      const body = JSON.parse(c.payload);
+      expect(body.aps.alert).toEqual({ title: "NOOP", body: "Syncing your latest data…" });
+      expect(body.aps["content-available"]).toBe(1);
+      expect(body.purpose).toBe("cloudsync");
+      expect(c.headers["apns-push-type"]).toBe("alert");
+      expect(c.headers["apns-priority"]).toBe("10");
       expect(c.headers["apns-topic"]).toBe(cfg.apnsTopic);
       expect(c.headers.authorization).toMatch(/^bearer /);
     }
-    // Both recipients share one signing pass per sendSilentPush call.
+    // Both recipients share one signing pass per sendSyncPush call.
     expect(calls[1].headers.authorization).toBe(calls[0].headers.authorization);
 
     // JWT shape: header alg/kid, claims iss/iat.
@@ -105,14 +111,14 @@ describe("sendSilentPush", () => {
     const seen: string[] = [];
     const send: SendFn = async (_t, headers) => { seen.push(headers.authorization); return { status: 200, body: "" }; };
 
-    await sendSilentPush(cfg, send);
-    await sendSilentPush(cfg, send);
+    await sendSyncPush(cfg, send);
+    await sendSyncPush(cfg, send);
     expect(seen[1]).toBe(seen[0]); // reused, not re-signed
 
     vi.useFakeTimers();
     try {
       vi.setSystemTime(Date.now() + 46 * 60 * 1000);
-      await sendSilentPush(cfg, send);
+      await sendSyncPush(cfg, send);
     } finally {
       vi.useRealTimers();
     }
@@ -126,7 +132,7 @@ describe("sendSilentPush", () => {
     upsertDeviceToken(cfg, alive, "ios");
     const send: SendFn = async (deviceToken) =>
       deviceToken === dead ? { status: 410, body: JSON.stringify({ reason: "Unregistered", timestamp: 0 }) } : { status: 200, body: "" };
-    const result = await sendSilentPush(cfg, send);
+    const result = await sendSyncPush(cfg, send);
     expect(result).toEqual({ pushed: 1, pruned: 1 });
     expect(listDeviceTokens(cfg).map((t) => t.token)).toEqual([alive]);
   });
@@ -136,7 +142,7 @@ describe("sendSilentPush", () => {
     const dead = "e".repeat(64);
     upsertDeviceToken(cfg, dead, "ios");
     const send: SendFn = async () => ({ status: 400, body: JSON.stringify({ reason: "BadDeviceToken" }) });
-    const result = await sendSilentPush(cfg, send);
+    const result = await sendSyncPush(cfg, send);
     expect(result).toEqual({ pushed: 0, pruned: 1 });
     expect(listDeviceTokens(cfg).map((t) => t.token)).not.toContain(dead);
   });
@@ -146,7 +152,7 @@ describe("sendSilentPush", () => {
     const flaky = "f0".repeat(32);
     upsertDeviceToken(cfg, flaky, "ios");
     const send: SendFn = async () => ({ status: 500, body: JSON.stringify({ reason: "InternalServerError" }) });
-    const result = await sendSilentPush(cfg, send);
+    const result = await sendSyncPush(cfg, send);
     expect(result).toEqual({ pushed: 0, pruned: 0 });
     expect(listDeviceTokens(cfg).map((t) => t.token)).toContain(flaky);
   });
@@ -160,6 +166,6 @@ describe("sendSilentPush", () => {
       if (deviceToken === bad) throw new Error("network blip");
       return { status: 200, body: "" };
     };
-    expect(await sendSilentPush(cfg, send)).toEqual({ pushed: 1, pruned: 0 });
+    expect(await sendSyncPush(cfg, send)).toEqual({ pushed: 1, pruned: 0 });
   });
 });
