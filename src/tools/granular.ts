@@ -586,7 +586,7 @@ export function imuCoverage(cfg: Config, args: { from?: string; to?: string; dev
     const fromTs = args.from ? toTs(args.from) : extent.firstTs;
     const toT = args.to ? toTs(args.to, true) : extent.lastTs;
     if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
-    // A far wider cap than the 7-day series tools: this reads five narrow columns and returns one row
+    // A far wider cap than the 7-day series tools: this reads four narrow columns and returns one row
     // per capture RUN, so "have I ever captured anything?" over a year is a fair question here in a way
     // it isn't for hr_series. Still bounded — an unbounded window is a mistake, not a feature.
     if (toT - fromTs > IMU_COVERAGE_MAX_SPAN_S) return { error: "span_too_wide", maxDays: 366 };
@@ -598,13 +598,13 @@ export function imuCoverage(cfg: Config, args: { from?: string; to?: string; dev
     if (rows.length === 0) {
       return { sessions: [], notCaptured: true, window: { fromTs, toTs: toT }, dataExtent: { firstTs: extent.firstTs, lastTs: extent.lastTs, seconds: extent.n }, hint: "no IMU buffers in THIS range, though the mirror holds some elsewhere — see dataExtent for where they actually are, or call with no from/to to see every capture run." };
     }
-    type S = { deviceId: string; startTs: number; endTs: number; seconds: number; samples: number; rhythmic: number; accelPeak: number; gaps: number; largestGap: number };
+    type S = { deviceId: string; startTs: number; endTs: number; seconds: number; rhythmic: number; accelPeak: number; gaps: number; largestGap: number };
     const sessions: S[] = [];
     let cur: S | null = null;
     // rows are ORDER BY deviceId, ts — so a device change starts a new session as surely as a time gap.
     for (const r of rows) {
       if (!cur || cur.deviceId !== r.deviceId || r.ts - cur.endTs > gap) {
-        cur = { deviceId: r.deviceId, startTs: r.ts, endTs: r.ts, seconds: 0, samples: 0, rhythmic: 0, accelPeak: 0, gaps: 0, largestGap: 0 };
+        cur = { deviceId: r.deviceId, startTs: r.ts, endTs: r.ts, seconds: 0, rhythmic: 0, accelPeak: 0, gaps: 0, largestGap: 0 };
         sessions.push(cur);
       } else {
         // An internal hole: adjacent rows should be 1 s apart, so anything more is missing seconds
@@ -612,7 +612,7 @@ export function imuCoverage(cfg: Config, args: { from?: string; to?: string; dev
         const missing = r.ts - cur.endTs - 1;
         if (missing > 0) { cur.gaps += 1; cur.largestGap = Math.max(cur.largestGap, missing); }
       }
-      cur.endTs = r.ts; cur.seconds += 1; cur.samples += r.sampleCount;
+      cur.endTs = r.ts; cur.seconds += 1;
       if (r.cadenceHz != null) cur.rhythmic += 1;
       cur.accelPeak = Math.max(cur.accelPeak, r.accelEnergyG);
     }
@@ -634,8 +634,14 @@ export function imuCoverage(cfg: Config, args: { from?: string; to?: string; dev
         missingSeconds: spanSeconds - s.seconds,
         gaps: s.gaps, largestGapSeconds: s.largestGap,
         rhythmicSeconds: s.rhythmic,
-        // SUM of the per-second sampleCount: how many raw IMU samples the run actually banked.
-        samples: s.samples,
+        // NO sample count here, deliberately — and imuCoverageRange doesn't even read the column. The
+        // producer computes each row's features over a TRAILING window of up to 6 contiguous 1-second
+        // buffers and stores THAT WINDOW's total in sampleCount, so adjacent rows re-count the same raw
+        // samples: a steady 100 Hz run reads 100,200,300,400,500,600,600,… and resets to 100 after any
+        // hole. Summing it inflates ~6x — a 100-second run banks 10 000 samples but sums to 58 500.
+        // seconds*sampleRateHz can't stand in either: the mirror never stores the rate, so that number
+        // would be invented rather than measured — the same sin as the rounded-up coverage above.
+        // `seconds` IS the honest volume answer; imu_series reads the buffers themselves.
         accelEnergyPeakG: round3(s.accelPeak),
       };
     });
@@ -644,7 +650,6 @@ export function imuCoverage(cfg: Config, args: { from?: string; to?: string; dev
       sessions: out,
       totals: {
         sessions: out.length, seconds: totalSeconds,
-        samples: out.reduce((a, s) => a + s.samples, 0),
         firstTs: out[0].startTs, lastTs: out[out.length - 1].endTs,
         days: new Set(rows.map((r) => new Date(r.ts * 1000).toISOString().slice(0, 10))).size,
       },
@@ -711,7 +716,7 @@ export function registerGranularTools(server: McpServer, cfg: Config): void {
 
   server.registerTool("imu_coverage", {
     title: "Deep IMU capture coverage",
-    description: "WHERE the WHOOP 5/MG deep IMU buffers exist — the availability question imu_series cannot answer without blind-scanning ranges. Answers 'did my overnight capture actually work?' and, with from/to OMITTED (the default, which anchors on the table's own extent), 'do I have ANY deep buffers, ever?'. Returns contiguous capture SESSIONS rather than per-day buckets: a run is the natural unit of 'did it work', and sessions are timezone-independent, so an overnight is never split at a meaningless UTC boundary. Rows in imuActivity are ONE PER SECOND (confirmed against the producer and the live mirror), which is what makes `seconds` a row count and `coverage` a real ratio. Per session: startTs/endTs plus ISO start/end (UTC), `seconds` (seconds actually banked), `spanSeconds` (wall-clock length of the run), `coverage` = seconds/spanSeconds — COVERAGE < 1 IS THE FAILURE SIGNAL, meaning the capture dropped rows mid-run — `missingSeconds`, `gaps` and `largestGapSeconds` (internal holes shorter than gapSeconds), `rhythmicSeconds` (seconds with a cadence lock), `samples` (total raw IMU samples banked), and accelEnergyPeakG. A gap longer than `gapSeconds` (default 60) ENDS a session rather than being bridged, so a dropout shows up as two honest runs, not one run with an invented hole. Span limit is a generous 366 days, unlike the 7-day series tools, because this reads narrow columns and returns one row per run. THREE DISTINCT EMPTY ANSWERS, worth telling apart: notCaptured with a 'predates the migration' hint means the uploading phone build could not capture IMU at all; notCaptured on an EMPTY table means the build supports it but nothing was ever banked (capture toggle off, or a WHOOP 4.0 — this is 5/MG-only); and notCaptured WITH a `dataExtent` means nothing in your range but buffers do exist elsewhere — read dataExtent and retry, or drop from/to. Use imu_series for what the buffers actually say.",
+    description: "WHERE the WHOOP 5/MG deep IMU buffers exist — the availability question imu_series cannot answer without blind-scanning ranges. Answers 'did my overnight capture actually work?' and, with from/to OMITTED (the default, which anchors on the table's own extent), 'do I have ANY deep buffers, ever?'. Returns contiguous capture SESSIONS rather than per-day buckets: a run is the natural unit of 'did it work', and sessions are timezone-independent, so an overnight is never split at a meaningless UTC boundary. Rows in imuActivity are ONE PER SECOND (confirmed against the producer and the live mirror), which is what makes `seconds` a row count and `coverage` a real ratio. Per session: startTs/endTs plus ISO start/end (UTC), `seconds` (seconds actually banked), `spanSeconds` (wall-clock length of the run), `coverage` = seconds/spanSeconds — COVERAGE < 1 IS THE FAILURE SIGNAL, meaning the capture dropped rows mid-run — `missingSeconds`, `gaps` and `largestGapSeconds` (internal holes shorter than gapSeconds), `rhythmicSeconds` (seconds with a cadence lock), and accelEnergyPeakG. There is deliberately NO raw-sample count: the producer's per-row sampleCount is the size of an OVERLAPPING trailing 6-second feature window, so no honest per-run sample total can be derived from it — report `seconds` (which IS a true count, one row per second) and don't invent one from a sample rate the mirror doesn't store. A gap longer than `gapSeconds` (default 60) ENDS a session rather than being bridged, so a dropout shows up as two honest runs, not one run with an invented hole. Span limit is a generous 366 days, unlike the 7-day series tools, because this reads narrow columns and returns one row per run. THREE DISTINCT EMPTY ANSWERS, worth telling apart: notCaptured with a 'predates the migration' hint means the uploading phone build could not capture IMU at all; notCaptured on an EMPTY table means the build supports it but nothing was ever banked (capture toggle off, or a WHOOP 4.0 — this is 5/MG-only); and notCaptured WITH a `dataExtent` means nothing in your range but buffers do exist elsewhere — read dataExtent and retry, or drop from/to. Use imu_series for what the buffers actually say.",
     inputSchema: {
       from: z.string().optional().describe("Omit both from and to to cover every capture run in the mirror."),
       to: z.string().optional(), deviceId: z.string().optional(),

@@ -21,6 +21,16 @@ const cfg = mk(dataDir), emptyCfg = mk(emptyDir), bareCfg = mk(bareDir);
 const T0 = Math.floor(new Date("2026-06-13T12:00:00Z").getTime() / 1000);
 const DDL = `CREATE TABLE IF NOT EXISTS imuActivity (deviceId TEXT NOT NULL, ts INTEGER NOT NULL, accelEnergyG DOUBLE NOT NULL, gyroEnergyDps DOUBLE NOT NULL, jerkRms DOUBLE NOT NULL, cadenceHz DOUBLE, cadenceStrength DOUBLE NOT NULL, sampleCount INTEGER NOT NULL, PRIMARY KEY(deviceId, ts));`;
 
+// sampleCount is an OVERLAPPING WINDOW size, not this second's own samples. The producer
+// (StrandAnalytics.ImuActivityIngest) computes each row's features over a TRAILING window of up to
+// windowSeconds=6 CONTIGUOUS 1 s buffers ending at that second, and stores that whole window's sample
+// total (ImuFeatureExtractor's `n`). So a steady 100 Hz run reads 100,200,300,400,500,600,600,… and
+// RESETS to 100 after any hole, because a ts discontinuity restarts the walk-back. Every fixture row
+// below is generated through this helper rather than a flat constant: a flat sampleCount would quietly
+// license summing the column, and summing overlapping windows counts each raw sample up to 6x.
+const WINDOW_S = 6, RATE_HZ = 100;
+const winSamples = (secondsSinceReset: number) => Math.min(secondsSinceReset + 1, WINDOW_S) * RATE_HZ;
+
 beforeAll(() => {
   for (const [d, c] of [[dataDir, cfg], [emptyDir, emptyCfg], [bareDir, bareCfg]] as const) {
     fs.rmSync(d, { recursive: true, force: true }); fs.mkdirSync(d, { recursive: true });
@@ -33,18 +43,20 @@ beforeAll(() => {
   db.exec(DDL);
   const ins = db.prepare("INSERT INTO imuActivity VALUES (?,?,?,?,?,?,?,?)");
   // Run A: 100 contiguous seconds, rhythmic throughout (a walk) — a clean, 100%-covered capture.
-  for (let i = 0; i < 100; i++) ins.run("my-whoop", T0 + i, 0.30, 40.0, 0.08, 1.8, 0.6, 600);
+  // sampleCount ramps 100→600 over the first 6 s and then holds: the real producer shape.
+  for (let i = 0; i < 100; i++) ins.run("my-whoop", T0 + i, 0.30, 40.0, 0.08, 1.8, 0.6, winSamples(i));
   // Run B: starts 600 s later (> the 60 s default gap, so it is a SEPARATE session). 50 seconds of
   // wall-clock span but only 47 rows (20 + 19 + 8): two internal holes, one of 1 s and one of 2 s.
-  // This is the coverage<1 case — a run that dropped rows mid-capture.
+  // This is the coverage<1 case — a run that dropped rows mid-capture. Each hole RESETS the producer's
+  // trailing window, so sampleCount ramps from 100 again after it rather than holding at 600.
   const B = T0 + 700;
-  for (let i = 0; i < 20; i++) ins.run("my-whoop", B + i, 0.01, 1.0, 0.005, null, 0.05, 100);   // still
-  // hole: B+20 missing (1 s)
-  for (let i = 21; i < 40; i++) ins.run("my-whoop", B + i, 0.05, 2.0, 0.006, null, 0.05, 100);
-  // hole: B+40, B+41 missing (2 s)
-  for (let i = 42; i < 50; i++) ins.run("my-whoop", B + i, 0.90, 3.0, 0.007, null, 0.05, 100);  // peak accel
+  for (let i = 0; i < 20; i++) ins.run("my-whoop", B + i, 0.01, 1.0, 0.005, null, 0.05, winSamples(i));   // still
+  // hole: B+20 missing (1 s) — window resets
+  for (let i = 21; i < 40; i++) ins.run("my-whoop", B + i, 0.05, 2.0, 0.006, null, 0.05, winSamples(i - 21));
+  // hole: B+40, B+41 missing (2 s) — window resets again
+  for (let i = 42; i < 50; i++) ins.run("my-whoop", B + i, 0.90, 3.0, 0.007, null, 0.05, winSamples(i - 42));  // peak accel
   // A different strap's run, overlapping run A in TIME — must never merge into it.
-  for (let i = 0; i < 10; i++) ins.run("other-strap", T0 + i, 0.02, 1.0, 0.005, null, 0.05, 200);
+  for (let i = 0; i < 10; i++) ins.run("other-strap", T0 + i, 0.02, 1.0, 0.005, null, 0.05, winSamples(i));
   db.close();
 });
 
@@ -93,7 +105,6 @@ describe("imu_coverage", () => {
     expect(a.missingSeconds).toBe(0);
     expect(a.gaps).toBe(0);
     expect(a.rhythmicSeconds).toBe(100);       // a walk: cadence locked every second
-    expect(a.samples).toBe(60_000);            // 100 s * 600 samples
     expect(a.start).toBe("2026-06-13T12:00:00.000Z");
   });
 
@@ -108,7 +119,20 @@ describe("imu_coverage", () => {
     expect(b.largestGapSeconds).toBe(2);       // the bigger one
     expect(b.rhythmicSeconds).toBe(0);         // still: no cadence lock all run
     expect(b.accelEnergyPeakG).toBe(0.9);
-    expect(b.samples).toBe(4700);              // 47 s * 100 samples
+  });
+
+  it("reports no sample COUNT at all — the producer's sampleCount is an overlapping window", () => {
+    // The regression this guards: sampleCount is the size of a TRAILING 6 s window, so consecutive rows
+    // re-count the same raw samples and summing the column inflates by ~6x. Run A is 100 s of 100 Hz
+    // capture — 10 000 raw samples actually banked — but its sampleCounts sum to 58 500. There is no
+    // honest sample total derivable here: the window size is not the second's own samples, and the
+    // mirror never stores the sample RATE, so seconds*rate would be an invented number rather than a
+    // measured one. So the tool reports none. `seconds` and `coverage` are the real answers, and
+    // anything that needs the buffers themselves belongs in imu_series.
+    const r = imuCoverage(cfg, {}) as any;
+    expect(r.sessions).toHaveLength(3);
+    for (const s of r.sessions) expect(s).not.toHaveProperty("samples");
+    expect(r.totals).not.toHaveProperty("samples");
   });
 
   it("never rounds coverage up to a perfect 1 while seconds are missing", () => {
@@ -122,8 +146,9 @@ describe("imu_coverage", () => {
     const z = path.join(long, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), c);
     const db = new Database(c.mirrorPath); db.exec(DDL);
     const ins = db.prepare("INSERT INTO imuActivity VALUES (?,?,?,?,?,?,?,?)");
-    // 2176-second span, one single second missing in the middle — 2175 rows banked.
-    for (let i = 0; i < 2176; i++) { if (i === 1000) continue; ins.run("my-whoop", T0 + i, 0.1, 1.0, 0.005, null, 0.05, 600); }
+    // 2176-second span, one single second missing in the middle — 2175 rows banked. The hole at i=1000
+    // resets the producer's trailing window, so the ramp restarts at i=1001.
+    for (let i = 0; i < 2176; i++) { if (i === 1000) continue; ins.run("my-whoop", T0 + i, 0.1, 1.0, 0.005, null, 0.05, winSamples(i < 1000 ? i : i - 1001)); }
     db.close();
     const r = imuCoverage(c, { deviceId: "my-whoop" }) as any;
     const s = r.sessions[0];
@@ -159,16 +184,13 @@ describe("imu_coverage", () => {
     const others = r.sessions.filter((s: any) => s.deviceId === "other-strap");
     expect(others).toHaveLength(1);
     expect(others[0].seconds).toBe(10);        // never merged into my-whoop's overlapping run A
-    expect(others[0].samples).toBe(2000);
   });
 
   it("totals cover every session and count distinct UTC days", () => {
     const r = imuCoverage(cfg, {}) as any;
     expect(r.totals.sessions).toBe(3);
-    expect(r.totals.seconds).toBe(157);        // my-whoop 147 + other-strap 10
-    // 60 000 (run A) + 4 700 (run B) + 2 000 (other-strap) — every run's raw samples, not just the
-    // filtered device's.
-    expect(r.totals.samples).toBe(66_700);
+    expect(r.totals.seconds).toBe(157);        // my-whoop 147 + other-strap 10 — every run, not just
+                                               // the filtered device's
     expect(r.totals.days).toBe(1);
   });
 
