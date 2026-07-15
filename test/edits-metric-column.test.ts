@@ -6,7 +6,7 @@ import { createApp } from "../src/server.js";
 
 // Full MCP loop for the post-hoc audit fix: delete_metric_point's key can now name a dailyMetric
 // COLUMN (not just a metricSeries key), so a single confirmed-bogus dailyMetric value (the
-// motivating real case: restingHr=90 for oura-api on 2025-05-29, neighbors 41/43/48) can finally
+// motivating real case: a restingHr outlier well above its neighboring days) can finally
 // be blanked. Mirrors tools-granular-e2e.test.ts's propose(ro) -> confirm(rw) -> read -> undo(rw)
 // -> reverts shape.
 const dataDir = path.join(process.cwd(), "test/.tmp/edits-metric-column");
@@ -35,7 +35,7 @@ beforeAll(() => {
 describe("delete_metric_point on a dailyMetric column, full MCP loop", () => {
   it("propose(ro) → confirm(rw) → hidden on compare_sources AND health_snapshot → undo(rw) → restored", async () => {
     // Fixture: oura-api restingHr on 2026-06-13 is 53 (make-fixture.ts).
-    const p = await mcp(port, cfg().roToken, 1, "propose_edit", { kind: "delete_metric_point", payload: { deviceId: "oura-api", day: "2026-06-13", key: "restingHr" }, rationale: "bogus spike, neighbors read 41/43/48" });
+    const p = await mcp(port, cfg().roToken, 1, "propose_edit", { kind: "delete_metric_point", payload: { deviceId: "oura-api", day: "2026-06-13", key: "restingHr" }, rationale: "bogus spike, neighbors much lower" });
     expect(p.status).toBe("pending");
     expect(p.diff).toContain("restingHr");
     expect(p.diff).toContain("53");

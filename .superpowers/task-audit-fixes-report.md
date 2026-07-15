@@ -27,8 +27,8 @@ dailyMetric value that day) is unchanged — only the set of days iterated chang
 ## Fix 2 — delete_metric_point cannot touch dailyMetric columns
 
 **Problem:** `delete_metric_point`'s overlay only ever filtered `metricSeries` rows, so the
-confirmed-bogus data point (dailyMetric `restingHr=90` for `oura-api` on `2025-05-29`, neighbors
-41/43/48) had no correction path — the kind couldn't target a dailyMetric column at all.
+confirmed-bogus data point (a dailyMetric `restingHr` outlier for `oura-api`, well above its
+neighboring days) had no correction path — the kind couldn't target a dailyMetric column at all.
 
 **Fix:** Extended the *existing* `delete_metric_point` kind (no new kind added, `EDIT_KINDS.length`
 stays 8):
