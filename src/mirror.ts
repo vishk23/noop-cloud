@@ -173,6 +173,32 @@ export class Mirror {
     return this.db.prepare(`SELECT deviceId, ts, accelEnergyG, gyroEnergyDps, jerkRms, cadenceHz, cadenceStrength, sampleCount FROM imuActivity WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
   }
 
+  // Per-second IMU rows reduced to a COVERAGE question ("do I have deep buffers at all, and when?")
+  // rather than the feature values imu_series buckets. Selects only what the session roll-up needs, so
+  // this stays cheap on a wide window: the whole point is that a caller can ask about months without
+  // pulling accel/gyro/jerk for every second. ORDER BY ts, deviceId — imuCoverage walks it in that
+  // order to cut sessions per device. Table-guarded like stepSamplesRange: opt-in 5/MG capture means
+  // plenty of real mirrors never carry it.
+  imuCoverageRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }):
+    { deviceId: string; ts: number; cadenceHz: number | null; accelEnergyG: number; sampleCount: number }[] {
+    if (!this.hasTable("imuActivity")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, cadenceHz, accelEnergyG, sampleCount FROM imuActivity WHERE ${where.join(" AND ")} ORDER BY deviceId, ts LIMIT ?`).all(...args) as any[];
+  }
+
+  // The full ts extent of imuActivity, ignoring any range — what a from/to-less imu_coverage call
+  // anchors on so "when do I have buffers at all?" needs no guessed window. Cheap: min/max over the
+  // (deviceId, ts) primary key.
+  imuActivityExtent(deviceId?: string): { firstTs: number; lastTs: number; n: number } | null {
+    if (!this.hasTable("imuActivity")) return null;
+    const where = deviceId ? "WHERE deviceId = ?" : "";
+    const args = deviceId ? [deviceId] : [];
+    const r = this.db.prepare(`SELECT MIN(ts) firstTs, MAX(ts) lastTs, COUNT(*) n FROM imuActivity ${where}`).get(...args) as any;
+    return r && r.n > 0 ? r : null;
+  }
+
   // The strap's firmware event log over a range (WhoopStore `event` table). The rows are whatever the
   // strap banked and the phone offloaded over BLE — WHOOP-only in practice: nothing on the cloud-import
   // path (oura-api) writes here, so an events question about an Oura source is always empty.
