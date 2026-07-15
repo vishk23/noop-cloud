@@ -165,12 +165,15 @@ export class Mirror {
   // buffer (WhoopStore `imuActivity` table). WHOOP 5/MG-only, and only present once that migration
   // shipped AND a deep-buffer capture ran — imu_series guards with hasTable("imuActivity") before
   // calling this, which assumes the table exists. cadenceHz is nullable (a still/bursty wrist).
+  // sampleCount is not selected: no caller reads it, and it holds the producer's OVERLAPPING
+  // trailing-window size rather than the second's own samples, so it is not a quantity to aggregate
+  // (see imuCoverageRange).
   imuActivityRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }):
-    { deviceId: string; ts: number; accelEnergyG: number; gyroEnergyDps: number; jerkRms: number; cadenceHz: number | null; cadenceStrength: number; sampleCount: number }[] {
+    { deviceId: string; ts: number; accelEnergyG: number; gyroEnergyDps: number; jerkRms: number; cadenceHz: number | null; cadenceStrength: number }[] {
     const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
     if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
     args.push(opts.limit);
-    return this.db.prepare(`SELECT deviceId, ts, accelEnergyG, gyroEnergyDps, jerkRms, cadenceHz, cadenceStrength, sampleCount FROM imuActivity WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+    return this.db.prepare(`SELECT deviceId, ts, accelEnergyG, gyroEnergyDps, jerkRms, cadenceHz, cadenceStrength FROM imuActivity WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
   }
 
   // Per-second IMU rows reduced to a COVERAGE question ("do I have deep buffers at all, and when?")
