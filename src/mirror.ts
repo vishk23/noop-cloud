@@ -22,6 +22,11 @@ export interface MetricPointRow { deviceId: string; family: Family; day: string;
 export interface StepSampleRow { deviceId: string; ts: number; counter: number; activityClass: number | null; }
 export interface GravitySampleRow { deviceId: string; ts: number; x: number; y: number; z: number; }
 export interface RRIntervalRow { deviceId: string; ts: number; rrMs: number; }
+// `soc` is PERCENT (0-100), not a 0-1 fraction — see batterySamplesRange below for the provenance.
+// All three value columns are nullable: the command-response battery path fills only what it read.
+// `charging` is SQLite BOOLEAN, i.e. an INTEGER 0/1 (or null) out of better-sqlite3 — battery_series
+// in tools/granular.ts is what normalizes it to a real boolean for callers.
+export interface BatterySampleRow { deviceId: string; ts: number; soc: number | null; mv: number | null; charging: number | null; }
 
 const withFamily = <T extends { deviceId: string }>(r: T) => ({ ...r, family: sourceFamily(r.deviceId) });
 
@@ -177,6 +182,27 @@ export class Mirror {
     if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
     args.push(opts.limit);
     return this.db.prepare(`SELECT deviceId, ts, x, y, z FROM gravitySample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+
+  // The paired wearable's own battery telemetry, banked over BLE (WhoopStore `battery` table). UNITS,
+  // confirmed against the producer rather than assumed: `soc` is PERCENT (0-100) as a REAL, NOT a 0-1
+  // fraction — the WHOOP BATTERY_LEVEL decoder emits it as the wire word / 10 tagged "%" (Interpreter
+  // .swift's `battery_pct` @21 and PostHooks.swift's "soc@17(/10) mv@21 charge@26" region note in the
+  // NOOP app repo), the Oura BLE mapping stores `Double(v.percent)` (OuraStreamMapping.swift), and
+  // StrandAnalytics' BatteryEstimator documents its anchor as "the latest SoC ... in percent" with
+  // percent-scale constants (nearFullPct 90, chargeStepPct 1). That /10 means real readings carry one
+  // decimal (e.g. 82.5), so callers must not round to an int. `mv` is raw cell millivolts.
+  //
+  // Columns are named explicitly rather than SELECT * because migration v5 added a `synced` upload flag
+  // the cloud never surfaces. `charging` came in v6 and is assumed present — the app is long past it and
+  // every other reader here likewise assumes its era's columns — while hasTable() guards the table
+  // itself for the same reason stepSamplesRange does: a fixture or foreign mirror may not carry it.
+  batterySamplesRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }): BatterySampleRow[] {
+    if (!this.hasTable("battery")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, soc, mv, charging FROM battery WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
   }
 
   // appleStepHour is populated by the iPhone-side hourly step import (NOOP commit d47525ea), written

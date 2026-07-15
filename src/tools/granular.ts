@@ -405,6 +405,93 @@ export function imuSeries(cfg: Config, args: { from: string; to: string; deviceI
   } finally { m.close(); }
 }
 
+// battery_series: the paired strap's own battery telemetry (WhoopStore `battery` table) over a range.
+// Shaped like hrSeries (raw by default, bucketed only when asked) rather than the always-bucketed
+// motion/imu/hrv tools on purpose: the question this exists to answer — "when did it die / start
+// charging?" — is about TRANSITIONS, and a bucket average blurs the exact edge the caller wants.
+//
+// soc is PERCENT (0-100) with one real decimal, mv is cell millivolts — see batterySamplesRange in
+// src/mirror.ts for the provenance of that (it is confirmed against the app-side producer, not assumed).
+//
+// soc, mv and charging are ALL nullable columns, so nulls pass through as null and are SKIPPED by the
+// bucket aggregates rather than coerced to 0 — a 0 here would read as "flat battery", which is exactly
+// the false alarm this tool exists to resolve. charging in particular is null on the whole
+// command-response path (only the dense BATTERY_LEVEL-event path reports it, WhoopStore migration v6),
+// so null means UNKNOWN, never "not charging".
+const asBool = (v: number | null | undefined) => (v == null ? null : !!v);
+
+export function batterySeries(cfg: Config, args: { from: string; to: string; deviceId?: string; bucketSeconds?: number }) {
+  // Mode-appropriate empty payload, so a bucketSeconds caller isn't handed a `samples` key (and vice
+  // versa) on the no-data paths below.
+  const empty = args.bucketSeconds ? { buckets: [] as unknown[] } : { samples: [] as unknown[] };
+  if (!fs.existsSync(cfg.mirrorPath)) return { ...empty, notIngested: true };
+  const fromTs = toTs(args.from), toT = toTs(args.to, true);
+  if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
+  if (toT - fromTs > MAX_SPAN_S) return { error: "span_too_wide", maxDays: 7 };
+  const m = new Mirror(cfg.mirrorPath);
+  try {
+    const raw = m.batterySamplesRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: SERIES_CAP });
+    // Zero readings is a RESULT, not an error, and it's the tool's most diagnostic answer — the strap
+    // reported nothing across the whole window. Say so instead of returning an empty series a caller
+    // could read as "battery fine". Covers both a mirror with no battery table at all (older/foreign
+    // upload — batterySamplesRange returns [] for that) and a real table with nothing in range.
+    if (raw.length === 0) {
+      return { ...empty, notCaptured: true, hint: "no battery readings in range — the strap reported none: dead, off wrist, unpaired, or out of BLE range for the whole window (or the phone never synced it). Absence is evidence, not an error: call data_freshness to tell 'strap was silent' from 'phone hasn't uploaded'." };
+    }
+    const last = raw[raw.length - 1];
+    // The most recent reading INSIDE [from,to] — deliberately not called "current": the mirror only
+    // holds what the phone last uploaded. Carries its own deviceId so it stays unambiguous on a
+    // multi-strap mirror.
+    const latest = { ts: last.ts, deviceId: last.deviceId, family: sourceFamily(last.deviceId), soc: last.soc, mv: last.mv, charging: asBool(last.charging) };
+    // Landing exactly on the cap means the read was clipped — later readings in the range may be gone.
+    const truncated = raw.length === SERIES_CAP ? { truncated: true, hint: "narrow the from/to window" } : {};
+    if (args.bucketSeconds) {
+      const b = Math.min(3600, Math.max(60, args.bucketSeconds));
+      type Cell = { ts: number; deviceId: string; socs: number[]; mvs: number[]; chargingTrue: number; chargingKnown: number; n: number };
+      const byBucket = new Map<string, Cell>();
+      for (const r of raw) {
+        const bucketTs = Math.floor(r.ts / b) * b;
+        const key = `${r.deviceId}|${bucketTs}`;
+        let c = byBucket.get(key);
+        if (!c) { c = { ts: bucketTs, deviceId: r.deviceId, socs: [], mvs: [], chargingTrue: 0, chargingKnown: 0, n: 0 }; byBucket.set(key, c); }
+        if (r.soc != null) c.socs.push(r.soc);
+        if (r.mv != null) c.mvs.push(r.mv);
+        if (r.charging != null) { c.chargingKnown += 1; if (r.charging) c.chargingTrue += 1; }
+        c.n += 1;
+      }
+      // raw is ORDER BY ts, so per-bucket push order is time order: [0] is first, at() is last.
+      const buckets = [...byBucket.values()]
+        .sort((a, c) => a.ts - c.ts || a.deviceId.localeCompare(c.deviceId))
+        .map((c) => ({
+          ts: c.ts, deviceId: c.deviceId, family: sourceFamily(c.deviceId),
+          // first/last carry the DIRECTION within the bucket (falling = discharge, rising = charge);
+          // null only when every reading in the bucket had a null soc.
+          socFirst: c.socs.length ? c.socs[0] : null,
+          socLast: c.socs.length ? c.socs[c.socs.length - 1] : null,
+          socMin: c.socs.length ? Math.min(...c.socs) : null,
+          socMax: c.socs.length ? Math.max(...c.socs) : null,
+          mvLast: c.mvs.length ? c.mvs[c.mvs.length - 1] : null,
+          // Three-state, honouring the nullability above: true if ANY reading in the bucket reported
+          // charging, false if every reporting reading said no, null if NONE reported (unknown).
+          charging: c.chargingKnown === 0 ? null : c.chargingTrue > 0,
+          n: c.n,
+        }));
+      return { buckets, latest, ...truncated };
+    }
+    // Even decimation, not a head slice: past the cap a head slice would return the START of the window
+    // and silently drop the tail — i.e. exactly the moment the battery died. Same correction (and the
+    // same helper) as sleepDetail's hrDuringSleep read; see HR_DETAIL_RAW_CAP above for the live
+    // investigation that one misled. In practice battery readings are far too sparse to reach this.
+    const dec = decimateEvenly(raw, RAW_CAP);
+    return {
+      samples: dec.rows.map((r) => ({ ts: r.ts, deviceId: r.deviceId, family: sourceFamily(r.deviceId), soc: r.soc, mv: r.mv, charging: asBool(r.charging) })),
+      latest,
+      ...(dec.decimated ? { decimated: true, stride: dec.stride, totalSamples: dec.total, hint: "evenly thinned across the window — exact transition timing may be lost; narrow the range for it" } : {}),
+      ...truncated,
+    };
+  } finally { m.close(); }
+}
+
 export function registerGranularTools(server: McpServer, cfg: Config): void {
   server.registerTool("hr_series", {
     title: "Heart-rate series",
@@ -440,4 +527,11 @@ export function registerGranularTools(server: McpServer, cfg: Config): void {
     inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(imuSeries(cfg, a)));
+
+  server.registerTool("battery_series", {
+    title: "Strap battery series (state-of-charge)",
+    description: "The STRAP's own battery for a time range (max 7 days) — raw readings, or per-bucket when bucketSeconds is passed. This is the paired wearable's battery reported over BLE (in practice the WHOOP strap), never the phone's; cloud-imported sources (oura-api) never carry it. soc is PERCENT 0-100 (a real with one decimal, e.g. 82.5 — the strap reports tenths), mv is raw cell millivolts. Answers 'how much battery is left' via `latest`, the most recent reading INSIDE the range — NOT necessarily now, since the mirror only holds what the phone last uploaded, so pair it with data_freshness — and 'when did it die / start charging' by scanning soc for the fall to ~0 or the rise. An ABSENT or FLAT series is the real diagnostic signal, not a bug: notCaptured:true means zero readings in range, i.e. the strap wasn't reporting at all (dead, off wrist, unpaired, or out of BLE range), and a series that simply stops mid-range dates the moment it went quiet. charging is NULLABLE and frequently null: only the dense BATTERY_LEVEL-event path reports it, while the command-response path leaves it null — so charging:null means UNKNOWN, never 'not charging'; infer a charge from rising soc instead. soc/mv are nullable too and pass through as null, never 0. Per bucket: socFirst/socLast (the direction within that bucket), socMin/socMax, mvLast, n, and charging as three-state (true if any reading in the bucket reported charging, false if every reporting reading said no, null if none reported). decimated:true means over 5000 raw readings were evenly thinned across the window, so exact transition timing may be lost — narrow the range to recover it.",
+    inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async (a) => asTool(batterySeries(cfg, a)));
 }
