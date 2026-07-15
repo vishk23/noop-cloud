@@ -1,64 +1,56 @@
 # noop-cloud
 
-A self-hostable remote **MCP server for your NOOP health data.** It mirrors your NOOP
-database and puts your WHOOP, Oura, and Apple Health biometrics behind Claude, ChatGPT, or
-any agent over Streamable HTTP — so you can query them in natural language, cross-check one
-wearable against another, drill into the raw sensor trace, and let the AI *propose*
-corrections to mis-scored data, with every edit confirmed by you and reversible.
+**A self-hostable MCP server that puts your NOOP health data behind Claude/ChatGPT — read your biometrics in natural language, and propose · confirm · undo corrections without ever mutating your uploaded data.**
 
-## What you can do
+It mirrors your NOOP database (WHOOP, Oura, and Apple Health) and exposes it to any MCP client over Streamable HTTP: Node 20 + Express + SQLite, deployable to a single small Fly machine or plain Docker for a couple dollars a month.
 
-- **Talk to your biometrics.** Ask "how did I sleep this week?" or "show my resting-HR trend"
-  and Claude/ChatGPT answers from your own data — no dashboard, no CSV wrangling.
-- **Cross-check your sources.** `compare_sources` puts WHOOP, Oura, and Apple side by side for
-  the same day, so you (and the AI) can catch which device is wrong when they disagree.
-- **See the raw evidence, not just daily rollups.** Pull beat-to-beat heart rate, the full
-  sleep hypnogram, R-R-interval HRV, and motion/IMU — enough for the AI to judge whether a
-  flagged "wake" was real or just movement.
-- **Let the AI fix your data — safely.** It can *propose* corrections (re-score a bad night,
-  delete a bogus HR spike, re-stage a hypnogram). Nothing changes until you confirm with the
-  write token; every edit is an append-only journal with a before-snapshot and one-command
-  undo, and your uploaded data is never mutated. Read-only callers (cron, shared agents) can
-  propose but never confirm.
-- **Self-host in minutes, a couple dollars a month.** One small Fly machine — or plain Docker —
-  plus SQLite. Upload via an iOS Shortcut of NOOP's existing `.noopbak` backup: zero app
-  changes. Works with Claude Code, claude.ai, ChatGPT Deep Research, and any MCP client.
+- **Ask questions of your own data.** "How did I sleep this week?" / "Show my resting-HR trend" — answered from your biometrics, no dashboard or CSV wrangling.
+- **Cross-check your wearables.** `compare_sources` puts WHOOP, Oura, and Apple side by side for the same day so you can catch which device is wrong when they disagree.
+- **Drill into the raw evidence.** Beat-to-beat heart rate, the full sleep hypnogram, R-R-interval HRV, and motion/IMU — not just daily rollups — so the AI can judge whether a flagged "wake" was real or just movement.
+- **Let the AI fix data — safely.** It can *propose* corrections; nothing changes until you confirm. Every edit is an append-only journal with a before-snapshot and one-command `undo_edit`, and your uploaded mirror is never mutated.
+- **Read/write split by token.** Read clients (cron, shared agents) use `RO_TOKEN` and can propose but never confirm; only the `RW_TOKEN` can upload data and confirm/reject/undo edits.
 
-## How your data gets in — two paths
+> **Scope — two data paths.**
+> **Path A — backup upload (fully in this repo).** An iOS Shortcut POSTs NOOP's existing `.noopbak` backup to `/ingest`; every read tool and all MCP-side editing work against that snapshot. Zero app changes — this is the recommended way to start.
+> **Path B — live two-way sync (server endpoints here; phone side NOT in this repo).** The server also speaks the endpoints for push-to-sync (`request_sync` → APNs → the phone uploads) and applying *confirmed* edits back onto the device (`/register-device`, `/edits`, `/edits/ack`, `request_sync`). The **client half — the CloudSync code inside the NOOP app — is a separate integration and is not part of this repo.** Sections tagged **_(needs Path B)_** below assume it.
 
-**Path A — backup upload (included here, no app changes).** An iOS Shortcut POSTs NOOP's
-`.noopbak` to `/ingest`. That's it: every read tool and all the MCP-side editing below work
-against that snapshot. This is the recommended way to start and it's fully self-contained in
-this repo.
+## Architecture
 
-**Path B — live two-way sync (needs app-side integration, *not* in this repo).** The server
-also speaks the endpoints for a much richer flow: background upload, push-to-sync
-(`request_sync` → APNs → the phone uploads within ~a minute), and applying the AI's *confirmed*
-edits back onto the device — so a correction you approve in Claude flows to your phone and
-sticks. The server half lives here (`/register-device`, `/edits`, `/edits/ack`, `request_sync`);
-the **client half — the CloudSync code inside the NOOP app that registers for push, handles it,
-pulls the edit journal, applies it, and does pull-first / skip-unchanged uploads — is a separate
-integration in the app and is not part of this repo.** Sections tagged **_(needs Path B)_** below
-assume it. Want Path B for your own NOOP build? Open an issue or reach out — happy to share how
-the client side works.
+```
+  iPhone (NOOP app)                          Fly.io machine  (or any Docker host)
+  ┌───────────────────┐   POST /ingest       ┌────────────────────────────────────┐
+  │ iOS Shortcut       │  Bearer RW_TOKEN     │  Node 20 + Express                  │
+  │  .noopbak backup  ─┼─────────────────────▶│   ├─ SQLite mirror.sqlite (DATA_DIR)│
+  └───────────────────┘                       │   └─ SQLite server.sqlite (edits)   │
+                                              │            │                        │
+   Claude / ChatGPT / any MCP client          │   MCP over Streamable HTTP          │
+   ┌───────────────────┐   POST /mcp          │   POST /mcp  (Bearer RO_TOKEN)      │
+   │  20 tools, 3      ◀┼──────────────────────┤   GET  /healthz → {ok:true}        │
+   │  prompts          │  Bearer RO_TOKEN     └────────────────────────────────────┘
+   └───────────────────┘
+```
 
-## Deploy (Fly.io)
+## Quick start (Fly.io)
 
 ```bash
-fly launch --no-deploy --name <your-app>       # edit fly.toml app name
+fly launch --no-deploy --name <your-app>          # edit fly.toml app name
 fly volumes create noop_data --size 1 --region iad
 fly secrets set RO_TOKEN=$(openssl rand -hex 32) RW_TOKEN=$(openssl rand -hex 32)
 fly deploy
 ```
 
-Save the two tokens. `RW_TOKEN` uploads data; `RO_TOKEN` is for read clients (Claude Code, cron).
+Save the two tokens: `RW_TOKEN` uploads data and confirms edits; `RO_TOKEN` is for read clients (Claude Code, cron). Then upload a `.noopbak` (see [Upload data](#upload-data-ios-shortcut-no-app-changes)) and connect a client:
 
-## Run with plain Docker (any host)
+```bash
+claude mcp add --transport http noop-cloud https://<app>.fly.dev/mcp \
+  --header "Authorization: Bearer <RO_TOKEN>"
+```
 
-Nothing here is Fly-specific: the runtime is a Node 20 + Express + SQLite server that reads
-its whole config from env vars, and storage is a SQLite file in `DATA_DIR` — just a mounted
-directory. `fly.toml` is the only Fly artifact and is ignored off-Fly. So it runs anywhere
-Docker does (Compose, Kubernetes, a bare VM):
+Then ask: "call data_freshness, then health_snapshot for the last 7 days."
+
+## Docker alternative (any host)
+
+Nothing here is Fly-specific: the runtime reads its whole config from env vars, and storage is a SQLite file in `DATA_DIR` — just a mounted directory. `fly.toml` is the only Fly artifact and is ignored off-Fly, so it runs anywhere Docker does (Compose, Kubernetes, a bare VM):
 
 ```bash
 docker build -t noop-cloud .
@@ -69,13 +61,23 @@ docker run -p 8080:8080 \
   noop-cloud
 ```
 
-The server listens on `:8080`; `GET /healthz` is the health check. Then `POST /ingest` a
-`.noopbak` with `Authorization: Bearer <RW_TOKEN>` and point any MCP client at `http://<host>:8080/mcp`
-with the `RO_TOKEN`. Env vars: `DATA_DIR` (default `/data` in the image), `PORT` (8080),
-`RO_TOKEN`, `RW_TOKEN`, `MAX_INGEST_BYTES`, plus the optional `APNS_*` push credentials below —
-pass them with `-e` or an `--env-file` instead of `fly secrets`. `better-sqlite3` is a native
-module, so build the image on (or for) your target CPU architecture — the Dockerfile compiles it
-during the build.
+The server listens on `:8080`; `GET /healthz` is the health check. Then `POST /ingest` a `.noopbak` with `Authorization: Bearer <RW_TOKEN>` and point any MCP client at `http://<host>:8080/mcp` with the `RO_TOKEN`.
+
+**Environment variables:** `RO_TOKEN` and `RW_TOKEN` are required (each ≥32 chars). `DATA_DIR` (default `/data` in the image, `./data` otherwise), `PORT` (default `8080`), `MAX_INGEST_BYTES` (default `262144000` = 250 MiB), plus the optional `APNS_KEY_P8` / `APNS_KEY_ID` / `APPLE_TEAM_ID` / `APNS_TOPIC` push credentials (see [Push-triggered on-demand sync](#push-triggered-on-demand-sync)). Pass them with `-e` or an `--env-file` instead of `fly secrets`. `better-sqlite3` is a native module, so build the image on (or for) your target CPU architecture — the Dockerfile compiles it during the build.
+
+## Tools & prompts
+
+20 MCP tools and 3 prompts, grouped by function (read-token tools are visible to every caller; write-token tools appear only for `RW_TOKEN` clients):
+
+- **Summaries & trends (read, 6):** `data_freshness`, `health_snapshot`, `metric_series`, `sleep_summary`, `workout_summary`, `compare_sources` (WHOOP vs Oura vs Apple corroboration).
+- **Raw sensor evidence (read, 5):** `hr_series` (beat-level heart rate), `sleep_detail` (full hypnogram + in-sleep HR), `hrv_series` (RMSSD from R-R intervals), `motion_series` (steps + wrist posture), `imu_series` (WHOOP 5/MG activity).
+- **Edits — propose (read token, 3):** `propose_edit`, `list_pending`, `edit_journal`.
+- **Edits — resolve (write token only, 3):** `confirm_edit`, `reject_edit`, `undo_edit`.
+- **ChatGPT Deep Research (2):** `search`, `fetch`.
+- **On-demand sync (1):** `request_sync` (pushes your phone to upload fresh data now — **_needs Path B_**).
+- **Prompts (3):** `morning_report`, `corroborate_sources`, `find_messy_data`.
+
+See [Editing your data](#editing-your-data) for the propose → confirm → journal → undo rail.
 
 ## Upload data (iOS Shortcut, no app changes)
 
@@ -92,40 +94,11 @@ it as `phoneTz`, and `sleep_summary` attaches a per-night `tzId` by resolving ea
 day (across the UTC-day boundary) against the phone's per-day `phoneTimezone` table when present.
 Mirrors uploaded before that table shipped simply omit the field.
 
-## Connect Claude Code
-
-```bash
-claude mcp add --transport http noop-cloud https://<app>.fly.dev/mcp \
-  --header "Authorization: Bearer <RO_TOKEN>"
-```
-
-Then ask: "call data_freshness, then health_snapshot for the last 7 days."
-
-## Tools
-
-**Summaries & trends (read):** `data_freshness`, `health_snapshot`, `metric_series`,
-`sleep_summary`, `workout_summary`, `compare_sources` (WHOOP vs Oura vs Apple corroboration).
-
-**Raw sensor evidence (read):** `hr_series` (beat-level heart rate), `sleep_detail` (full
-hypnogram + in-sleep HR), `hrv_series` (RMSSD from R-R intervals), `motion_series` (steps +
-wrist posture), `imu_series` (WHOOP 5/MG activity).
-
-**Edits — propose → confirm → journal → undo:** `propose_edit`, `list_pending`, `edit_journal`
-(read token) and `confirm_edit`, `reject_edit`, `undo_edit` (**write token only**). Edit kinds
-cover fixing/adding/deleting workouts, adjusting sleep bounds, re-staging hypnograms, deleting
-artifact HR ranges, and blanking bogus metric points. See [Editing your data](#editing-your-data).
-
-**On-demand sync:** `request_sync` pushes your phone to upload fresh data now (see
-[Push-triggered on-demand sync](#push-triggered-on-demand-sync)).
-
-**ChatGPT Deep Research:** `search` / `fetch`.  **Prompts:** `morning_report`,
-`corroborate_sources`, `find_messy_data`.
-
 ## Push-triggered on-demand sync
 
 > **Needs Path B (app integration).** This describes the live-sync flow. The server endpoints are
 > here, but the phone must run the NOOP-app CloudSync integration (registration + push handling)
-> for it to do anything — see [How your data gets in](#how-your-data-gets-in--two-paths). On a bare
+> for it to do anything — see the **Scope** note near the top. On a bare
 > backup-upload deployment `request_sync` simply returns `{devices: 0}`.
 
 `request_sync` asks the phone to sync right now via a visible APNs alert push (priority 10, with
@@ -211,3 +184,7 @@ clean intervals reports `rmssd:null` rather than a fabricated number.
 Then `edit_sleep_stages` rewrites the night's stage timeline and `delete_hr_range` throws out
 artifact heart-rate stretches — through the same propose → confirm → journal → undo rail as every
 other edit.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Vishnu Kchittibhooma.
