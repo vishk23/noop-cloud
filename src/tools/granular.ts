@@ -492,6 +492,68 @@ export function batterySeries(cfg: Config, args: { from: string; to: string; dev
   } finally { m.close(); }
 }
 
+// device_events: the STRAP's own firmware event log (WhoopStore `event` table) over a range — the
+// wear/charge/boot/connection transitions the strap itself reported, as opposed to anything the phone
+// or the analytics inferred. This is the DB-backed half of "is my strap healthy and capturing?".
+//
+// `kind` is always "LABEL(opcode)" or "0xNN(opcode)" — never a bare label; see eventsRange in
+// src/mirror.ts for the provenance (WhoopProtocol Schema.enumName builds it). Rather than make callers
+// carry that quirk, each event is returned with `kind` verbatim PLUS a parsed `label` and `opcode`, and
+// the `kinds` filter accepts either spelling.
+const KIND_RE = /^(.*)\((\d+)\)$/;
+function splitKind(kind: string): { label: string; opcode: number | null } {
+  // Greedy (.*) so the split is on the LAST "(", which is the opcode group Schema.enumName appends.
+  const m = KIND_RE.exec(kind);
+  return m ? { label: m[1], opcode: Number(m[2]) } : { label: kind, opcode: null };
+}
+// payloadJSON is TEXT NOT NULL and is "{}" for all but one kind on a real mirror (of VK's 11 457 live
+// rows only BATTERY_LEVEL(3) carries fields), so an always-present `payload: {}` would be pure noise on
+// thousands of rows. Omit it when empty; keep it verbatim when it isn't. A payload that won't parse is
+// surfaced as payloadRaw rather than dropped or guessed at.
+function parsePayload(json: string): { payload?: unknown; payloadRaw?: string } {
+  if (!json || json === "{}") return {};
+  try {
+    const p = JSON.parse(json);
+    if (p && typeof p === "object" && !Array.isArray(p) && Object.keys(p).length === 0) return {};
+    return { payload: p };
+  } catch { return { payloadRaw: json }; }
+}
+
+export function deviceEvents(cfg: Config, args: { from: string; to: string; deviceId?: string; kinds?: string[]; countsOnly?: boolean }) {
+  const empty = { counts: [] as unknown[], ...(args.countsOnly ? {} : { events: [] as unknown[] }) };
+  if (!fs.existsSync(cfg.mirrorPath)) return { ...empty, notIngested: true };
+  const fromTs = toTs(args.from), toT = toTs(args.to, true);
+  if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
+  if (toT - fromTs > MAX_SPAN_S) return { error: "span_too_wide", maxDays: 7 };
+  const m = new Mirror(cfg.mirrorPath);
+  try {
+    // Counts first and from their own SQL aggregate: they stay TRUE even when the event read below is
+    // capped (see eventKindCounts in src/mirror.ts).
+    const counts = m.eventKindCounts({ fromTs, toTs: toT, deviceId: args.deviceId, kinds: args.kinds })
+      .map((c) => ({ kind: c.kind, ...splitKind(c.kind), n: c.n, firstTs: c.firstTs, lastTs: c.lastTs }));
+    if (counts.length === 0) {
+      // Zero events is a RESULT and a diagnostic one: the strap reported nothing across the window.
+      // Covers a mirror with no `event` table (older/foreign upload), a real table with nothing in
+      // range, and a `kinds` filter that matched nothing — the hint names all three so a caller can
+      // tell "strap was silent" from "I filtered myself to nothing".
+      return { ...empty, notCaptured: true, hint: "no strap events in range — either the strap reported none (unpaired, dead, off wrist, or out of BLE range for the whole window, or the phone never synced), or `kinds` filtered everything out. Cloud-imported sources (oura-api) NEVER write events, so an events question about one is always empty. Call data_freshness to tell 'strap was silent' from 'phone hasn't uploaded'." };
+    }
+    if (args.countsOnly) return { counts };
+    const rows = m.eventsRange({ fromTs, toTs: toT, deviceId: args.deviceId, kinds: args.kinds, limit: RAW_CAP });
+    const events = rows.map((r) => ({ ts: r.ts, deviceId: r.deviceId, family: sourceFamily(r.deviceId), kind: r.kind, ...splitKind(r.kind), ...parsePayload(r.payloadJSON) }));
+    const last = rows[rows.length - 1];
+    const latest = { ts: last.ts, deviceId: last.deviceId, family: sourceFamily(last.deviceId), kind: last.kind, ...splitKind(last.kind) };
+    // Head-slice + a loud flag, NOT battery_series' even decimation: an event log is discrete, and
+    // thinning it would drop whole one-off kinds — the BOOT or RTC_LOST a caller is hunting is exactly
+    // the row a stride would skip. `counts` above already tells the truth about the whole range, so the
+    // honest shape is a contiguous prefix plus "there are more".
+    const truncated = rows.length === RAW_CAP
+      ? { truncated: true, hint: "only the first 5000 events in range are listed — `counts` is still complete for the whole window; narrow from/to or pass `kinds` to see the rest" }
+      : {};
+    return { counts, events, latest, ...truncated };
+  } finally { m.close(); }
+}
+
 export function registerGranularTools(server: McpServer, cfg: Config): void {
   server.registerTool("hr_series", {
     title: "Heart-rate series",
@@ -534,4 +596,15 @@ export function registerGranularTools(server: McpServer, cfg: Config): void {
     inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(batterySeries(cfg, a)));
+
+  server.registerTool("device_events", {
+    title: "Strap firmware event log",
+    description: "What the STRAP itself reported for a time range (max 7 days) — the wear/charge/boot/connection log, not anything the phone or the analytics inferred. This is the strap-health tool: WRIST_ON/WRIST_OFF (was it actually worn), CHARGING_ON/CHARGING_OFF and BATTERY_PACK_CONNECTED/REMOVED (on the charger), BLE_CONNECTION_UP/DOWN (was the phone in range to collect), BOOT / BLE_SYSTEM_RESET / RTC_LOST / FLASH_INIT_COMPLETE (the strap rebooted or lost its clock — a prime suspect for missing or mis-timed data), STRAP_CONDITION_REPORT, DOUBLE_TAP, HAPTICS_FIRED. WHOOP-ONLY: cloud-imported sources (oura-api) never write events, so asking about one always returns notCaptured. `kind` is always 'LABEL(opcode)' (e.g. 'WRIST_ON(9)') for events the protocol schema names and '0xNN(opcode)' (e.g. '0x6E(110)') for ones it doesn't — an 0xNN kind is a REAL event whose meaning is simply undecoded, not corruption, and on a live WHOOP 5 these are among the most common. Each event carries `kind` verbatim plus parsed `label` and `opcode`, and the `kinds` filter accepts EITHER spelling ('WRIST_ON' or 'WRIST_ON(9)'). `counts` (per kind, with firstTs/lastTs) is aggregated in SQL over the WHOLE range and is always complete even when the event list is capped — call with countsOnly:true for a cheap 'what happened' glance. PAYLOADS ARE ALMOST ALWAYS EMPTY: payloadJSON is '{}' for every kind except BATTERY_LEVEL(3) (which carries battery_pct/battery_mV/battery_charging), so the `payload` key is OMITTED rather than returned as {} — an event here is usually a bare timestamped fact, and its `kind` is the whole message. Use battery_series for state-of-charge over time; this is for transitions and faults. notCaptured:true means zero events in range — the strap was silent (unpaired, dead, off wrist, out of BLE range) or `kinds` filtered everything out; pair with data_freshness to tell that from 'the phone never uploaded'. truncated:true means over 5000 events matched and only the first 5000 are listed (they are NOT thinned — a stride would drop the one-off BOOT you are hunting); `counts` still covers the full window.",
+    inputSchema: {
+      from: z.string(), to: z.string(), deviceId: z.string().optional(),
+      kinds: z.array(z.string()).optional().describe("Filter to these kinds; accepts a bare label ('WRIST_ON') or the full kind ('WRIST_ON(9)')."),
+      countsOnly: z.boolean().optional().describe("Return only the per-kind `counts` summary, not the event list."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async (a) => asTool(deviceEvents(cfg, a)));
 }

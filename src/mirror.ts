@@ -27,8 +27,25 @@ export interface RRIntervalRow { deviceId: string; ts: number; rrMs: number; }
 // `charging` is SQLite BOOLEAN, i.e. an INTEGER 0/1 (or null) out of better-sqlite3 — battery_series
 // in tools/granular.ts is what normalizes it to a real boolean for callers.
 export interface BatterySampleRow { deviceId: string; ts: number; soc: number | null; mv: number | null; charging: number | null; }
+// The strap's own firmware event log (WhoopStore `event` table, migration v1). `kind` is NOT a bare
+// label — it is always "LABEL(opcode)" (e.g. "WRIST_ON(9)") for an event the protocol schema names, and
+// "0xNN(opcode)" (e.g. "0x6E(110)") for one it doesn't; see eventsRange below for the provenance.
+// `payloadJSON` is TEXT NOT NULL and is "{}" for almost every kind — device_events in tools/granular.ts
+// is what parses it and splits `kind` into label/opcode.
+export interface EventRow { deviceId: string; ts: number; kind: string; payloadJSON: string; }
+export interface EventKindCount { kind: string; n: number; firstTs: number; lastTs: number; }
 
 const withFamily = <T extends { deviceId: string }>(r: T) => ({ ...r, family: sourceFamily(r.deviceId) });
+
+// Match a caller-supplied kind either EXACTLY ("WRIST_ON(9)") or by its bare LABEL ("WRIST_ON"), so an
+// agent that never saw the "(opcode)" suffix can still filter. Deliberately substr/instr rather than
+// `kind LIKE ? || '('`: event labels are full of underscores (WRIST_ON, BLE_CONNECTION_UP) and `_` is a
+// LIKE single-char wildcard, so the LIKE form would quietly match neighbouring labels. Labels never
+// contain "(" (Schema.enumName builds them as name + "(" + v + ")"), so the first "(" is the split.
+function kindFilterSql(kinds: string[]): { sql: string; args: string[] } {
+  const clause = "(kind = ? OR (instr(kind, '(') > 0 AND substr(kind, 1, instr(kind, '(') - 1) = ?))";
+  return { sql: `(${kinds.map(() => clause).join(" OR ")})`, args: kinds.flatMap((k) => [k, k]) };
+}
 
 export class Mirror {
   private db: Database.Database;
@@ -154,6 +171,40 @@ export class Mirror {
     if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
     args.push(opts.limit);
     return this.db.prepare(`SELECT deviceId, ts, accelEnergyG, gyroEnergyDps, jerkRms, cadenceHz, cadenceStrength, sampleCount FROM imuActivity WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+
+  // The strap's firmware event log over a range (WhoopStore `event` table). The rows are whatever the
+  // strap banked and the phone offloaded over BLE — WHOOP-only in practice: nothing on the cloud-import
+  // path (oura-api) writes here, so an events question about an Oura source is always empty.
+  //
+  // `kind` PROVENANCE, read off the producer rather than assumed: StreamStore.swift inserts e.kind
+  // verbatim, and that string comes from WhoopProtocol Schema.swift's `enumName`, which returns
+  // "\(name)(\(v))" when the schema names the opcode and String(format: "0x%02X(%d)", v, v) when it
+  // doesn't. So the opcode is ALWAYS present in parentheses, and a "0x6E(110)" kind means "the strap
+  // sent event 110 and our schema has no name for it" — real signal, not corruption.
+  //
+  // Columns are listed explicitly because migration v5 added a `synced` upload flag the cloud never
+  // surfaces. hasTable-guarded for the same reason as stepSamplesRange: a fixture or foreign mirror
+  // may not carry it.
+  eventsRange(opts: { fromTs: number; toTs: number; deviceId?: string; kinds?: string[]; limit: number }): EventRow[] {
+    if (!this.hasTable("event")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    if (opts.kinds?.length) { const f = kindFilterSql(opts.kinds); where.push(f.sql); args.push(...f.args); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, kind, payloadJSON FROM event WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+
+  // Per-kind counts over the SAME range/filters as eventsRange, aggregated in SQL rather than derived
+  // from the returned rows. That difference is load-bearing: eventsRange is capped, so counting the
+  // rows it hands back would under-report exactly when the window is busiest — the moment a caller most
+  // needs a true tally. This aggregate is never truncated.
+  eventKindCounts(opts: { fromTs: number; toTs: number; deviceId?: string; kinds?: string[] }): EventKindCount[] {
+    if (!this.hasTable("event")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    if (opts.kinds?.length) { const f = kindFilterSql(opts.kinds); where.push(f.sql); args.push(...f.args); }
+    return this.db.prepare(`SELECT kind, COUNT(*) n, MIN(ts) firstTs, MAX(ts) lastTs FROM event WHERE ${where.join(" AND ")} GROUP BY kind ORDER BY n DESC, kind`).all(...args) as any[];
   }
 
   // Real phone schema carries stepSample/gravitySample from CoreMotion, but any mirror ingested
