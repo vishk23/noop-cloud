@@ -471,6 +471,49 @@ export function tempSeries(cfg: Config, args: { from: string; to: string; device
   } finally { m.close(); }
 }
 
+// sleep_state_series: the strap's OWN per-second band sleep-state (WhoopStore `sleepStateSample`, @81
+// high nibble, #175), run-length-encoded into a state timeline. state 0=wake / 1=still / 2=asleep /
+// 3=up — a COARSE activity/wear band the strap reports itself, NOT the light/deep/rem sleep architecture
+// (that is NOOP's own analytics staging in sleepSession.stagesJSON, surfaced by sleep_detail). Distinct
+// signal, useful for cross-checking staging vs the strap's raw opinion. A gap longer than gapSeconds
+// (default 120) ENDS a segment rather than bridging a data hole, so off-wrist stretches read as breaks,
+// not invented state.
+const SLEEP_STATE_LABELS: Record<number, string> = { 0: "wake", 1: "still", 2: "asleep", 3: "up" };
+export function sleepStateSeries(cfg: Config, args: { from: string; to: string; deviceId?: string; gapSeconds?: number }) {
+  if (!fs.existsSync(cfg.mirrorPath)) return { segments: [], notIngested: true };
+  const fromTs = toTs(args.from), toT = toTs(args.to, true);
+  if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
+  if (toT - fromTs > MAX_SPAN_S) return { error: "span_too_wide", maxDays: 7 };
+  const gap = Math.min(3600, Math.max(1, args.gapSeconds ?? 120));
+  const m = new Mirror(cfg.mirrorPath);
+  try {
+    if (!m.hasTable("sleepStateSample")) {
+      return { segments: [], notCaptured: true, hint: "no band sleep-state — the uploading build predates the sleepStateSample stream" };
+    }
+    const rows = m.sleepStateSamplesRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: SERIES_CAP });
+    const extent = m.sleepStateExtent(args.deviceId);
+    const dataExtent = extent ? { firstTs: extent.firstTs, lastTs: extent.lastTs, n: extent.n } : undefined;
+    type Seg = { state: number; label: string; deviceId: string; startTs: number; endTs: number };
+    const segs: Seg[] = [];
+    let cur: Seg | null = null;
+    for (const r of rows) {
+      const label = SLEEP_STATE_LABELS[r.state] ?? `state_${r.state}`;
+      if (cur && cur.state === r.state && cur.deviceId === r.deviceId && r.ts - cur.endTs <= gap) {
+        cur.endTs = r.ts;
+      } else {
+        if (cur) segs.push(cur);
+        cur = { state: r.state, label, deviceId: r.deviceId, startTs: r.ts, endTs: r.ts };
+      }
+    }
+    if (cur) segs.push(cur);
+    const totals: Record<string, number> = {};
+    for (const s of segs) totals[s.label] = (totals[s.label] ?? 0) + (s.endTs - s.startTs);
+    const iso = (t: number) => new Date(t * 1000).toISOString();
+    const segments = segs.map((s) => ({ state: s.state, label: s.label, deviceId: s.deviceId, family: sourceFamily(s.deviceId), startTs: s.startTs, endTs: s.endTs, startIso: iso(s.startTs), endIso: iso(s.endTs), durationS: s.endTs - s.startTs }));
+    return { segments, totals, sampleCount: rows.length, ...(dataExtent ? { dataExtent } : {}), ...(rows.length === SERIES_CAP ? { truncated: true, hint: "narrow the from/to window" } : {}) };
+  } finally { m.close(); }
+}
+
 // battery_series: the paired strap's own battery telemetry (WhoopStore `battery` table) over a range.
 // Shaped like hrSeries (raw by default, bucketed only when asked) rather than the always-bucketed
 // motion/imu/hrv tools on purpose: the question this exists to answer — "when did it die / start
@@ -768,6 +811,13 @@ export function registerGranularTools(server: McpServer, cfg: Config): void {
     inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(tempSeries(cfg, a)));
+
+  server.registerTool("sleep_state_series", {
+    title: "Band sleep-state series (strap's own)",
+    description: "The STRAP's OWN per-second band sleep-state for a time range (max 7 days), run-length-encoded into a timeline of segments. state 0=wake / 1=still / 2=asleep / 3=up — this is a COARSE activity/wear band the WHOOP strap reports about itself (WhoopStore sleepStateSample, @81 high nibble, #175). IT IS NOT SLEEP ARCHITECTURE: there is no light/deep/REM here — for the staged hypnogram use sleep_detail (which reads NOOP's own analytics staging). The value of this tool is exactly that it's the strap's RAW opinion, independent of NOOP's scoring, so it's the cross-check for a disputed night (does the strap agree we were asleep when the analytics said awake?). WHOOP-only. Each segment: state + label, startTs/endTs (+ISO), durationS; `totals` gives seconds in each band; `dataExtent` is the stream's full retention span. A silence longer than gapSeconds (default 120) ends a segment rather than bridging it, so off-wrist holes show as breaks, not invented state. notCaptured:true means the uploading build predates the stream.",
+    inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), gapSeconds: z.number().int().min(1).max(3600).optional().describe("A silence longer than this ends a segment (default 120).") },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async (a) => asTool(sleepStateSeries(cfg, a)));
 
   server.registerTool("battery_series", {
     title: "Strap battery series (state-of-charge)",

@@ -96,6 +96,49 @@ export function healthSnapshot(cfg: Config, args: { days?: number }) {
   } finally { m.close(); }
 }
 
+// Which MCP tool reads each mirror table — the map that makes `streams` self-describing. Kept here (not
+// derived) on purpose: it encodes the intended contract "this stream has a reader", so a populated stream
+// that ISN'T in this map surfaces as a gap rather than silently looking covered.
+const STREAM_READERS: Record<string, string> = {
+  hrSample: "hr_series", rrInterval: "hrv_series", skinTempSample: "temp_series",
+  sleepStateSample: "sleep_state_series", gravitySample: "motion_series", stepSample: "motion_series",
+  appleStepHour: "motion_series", imuActivity: "imu_series / imu_coverage", battery: "battery_series",
+  event: "device_events", sleepSession: "sleep_summary / sleep_detail", workout: "workout_summary",
+  dailyMetric: "health_snapshot / compare_sources / metric_series", metricSeries: "metric_series",
+  rawBatch: "deep_buffer_coverage / deep_buffer_window",
+};
+// Per-stream caveats, so a 0-row or deliberately-unread stream isn't misread as a build target.
+const STREAM_NOTES: Record<string, string> = {
+  ppgHrSample: "experimental PPG→HR, withdrawn (#194) — instrumentation only, intentionally unread",
+  spo2Sample: "not emitted by the WHOOP 5/MG — expect 0 rows",
+  respSample: "no per-sample respiratory rate captured — expect 0 rows",
+};
+// Populated members of this set with no reader are reported as `gaps` (capture-without-a-reader). Rollup
+// tables (dailyMetric/metricSeries) and internal/bookkeeping tables are deliberately out of scope, as is
+// ppgHrSample (annotated experimental above rather than flagged).
+const GAP_CANDIDATES = new Set([
+  "hrSample", "rrInterval", "skinTempSample", "sleepStateSample", "gravitySample", "stepSample",
+  "imuActivity", "battery", "event", "sleepSession", "workout",
+]);
+
+export function streamsInventory(cfg: Config) {
+  if (!fs.existsSync(cfg.mirrorPath)) return { streams: [], gaps: [], notIngested: true };
+  const m = new Mirror(cfg.mirrorPath);
+  try {
+    const streams = m.streamInventory().map((s) => {
+      const readBy = STREAM_READERS[s.table] ?? null;
+      const fmt = (v: number | string | null) => v == null ? null : (s.timeCol === "day" ? v : new Date((v as number) * 1000).toISOString());
+      return {
+        table: s.table, rows: s.rows, deviceIds: s.deviceIds, readBy,
+        ...(STREAM_NOTES[s.table] ? { note: STREAM_NOTES[s.table] } : {}),
+        ...(s.timeCol ? { timeCol: s.timeCol, first: fmt(s.first), last: fmt(s.last) } : {}),
+      };
+    }).sort((a, b) => b.rows - a.rows);
+    const gaps = streams.filter((s) => s.rows > 0 && !s.readBy && GAP_CANDIDATES.has(s.table)).map((s) => s.table);
+    return { streams, gaps, note: gaps.length ? "gaps = populated biometric streams with NO MCP reader — candidates for a new tool" : "every populated biometric stream has a reader" };
+  } finally { m.close(); }
+}
+
 const asTool = (obj: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }], structuredContent: obj as Record<string, unknown> });
 
 export function registerCoreTools(server: McpServer, cfg: Config): void {
@@ -105,6 +148,13 @@ export function registerCoreTools(server: McpServer, cfg: Config): void {
     inputSchema: {},
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async () => asTool(dataFreshness(cfg)));
+
+  server.registerTool("streams", {
+    title: "Raw stream inventory",
+    description: "The self-describing map of the mirror: every raw table with its row count, time span, contributing deviceIds, and — crucially — WHICH MCP tool reads it (`readBy`), so an agent can see what granular data exists and how to get it without inspecting the DB. `gaps` lists populated biometric streams that have NO reader yet (capture-without-a-reader — a candidate for a new tool); an empty `gaps` means every populated stream is reachable. Per-stream `note` flags the deliberate non-gaps (e.g. spo2Sample is 0 rows on the 5/MG; ppgHrSample is the withdrawn experimental PPG→HR). Rollups (dailyMetric/metricSeries) and bookkeeping tables are listed but excluded from `gaps`. Call this to answer 'what data do we actually have and can I query it' before guessing.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async () => asTool(streamsInventory(cfg)));
 
   server.registerTool("health_snapshot", {
     title: "Health snapshot",

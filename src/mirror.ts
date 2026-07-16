@@ -300,6 +300,47 @@ export class Mirror {
     return new Map(rows.map((r) => [r.id, r.model]));
   }
 
+  // The strap's OWN per-second band sleep-state (WhoopStore `sleepStateSample`, migration @81 high nibble,
+  // #175): `state` is 0=wake / 1=still / 2=asleep / 3=up — a coarse activity band, NOT the light/deep/rem
+  // hypnogram (that lives in sleepSession.stagesJSON, surfaced by sleep_detail). hasTable-guarded like the
+  // other opt-era streams. sleep_state_series does the labelling + run-length encoding.
+  sleepStateSamplesRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }): { deviceId: string; ts: number; state: number }[] {
+    if (!this.hasTable("sleepStateSample")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, state FROM sleepStateSample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+  sleepStateExtent(deviceId?: string): { firstTs: number; lastTs: number; n: number } | null {
+    if (!this.hasTable("sleepStateSample")) return null;
+    const where = deviceId ? "WHERE deviceId = ?" : "";
+    const args = deviceId ? [deviceId] : [];
+    const r = this.db.prepare(`SELECT MIN(ts) firstTs, MAX(ts) lastTs, COUNT(*) n FROM sleepStateSample ${where}`).get(...args) as any;
+    return r && r.n > 0 ? r : null;
+  }
+
+  // Per-table inventory of the whole mirror — row count, time span, and contributing deviceIds — for the
+  // `streams` discovery tool, so an agent can see WHAT raw streams exist and how much data each holds
+  // without reading the DB out of band. Table names come from sqlite_master (never user input), so
+  // interpolating them is safe; PRAGMA/aggregate can't be parameterised anyway. `timeCol` is whichever of
+  // ts/startTs/day the table carries (null for keyless tables); `first`/`last` are that column's min/max
+  // (epoch ints for ts/startTs, YYYY-MM-DD strings for day). COUNT(*)/DISTINCT scan, which is fine for an
+  // occasional meta-call but is why this isn't on a hot path.
+  streamInventory(): { table: string; rows: number; timeCol: string | null; first: number | string | null; last: number | string | null; deviceIds: string[] }[] {
+    const tables = (this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as { name: string }[]).map((r) => r.name);
+    const out: { table: string; rows: number; timeCol: string | null; first: number | string | null; last: number | string | null; deviceIds: string[] }[] = [];
+    for (const table of tables) {
+      const cols = (this.db.prepare(`PRAGMA table_info("${table}")`).all() as { name: string }[]).map((c) => c.name);
+      const timeCol = ["ts", "startTs", "day"].find((c) => cols.includes(c)) ?? null;
+      const rows = (this.db.prepare(`SELECT COUNT(*) n FROM "${table}"`).get() as any).n as number;
+      let first: number | string | null = null, last: number | string | null = null, deviceIds: string[] = [];
+      if (rows > 0 && timeCol) { const r = this.db.prepare(`SELECT MIN(${timeCol}) a, MAX(${timeCol}) b FROM "${table}"`).get() as any; first = r.a; last = r.b; }
+      if (rows > 0 && cols.includes("deviceId")) deviceIds = (this.db.prepare(`SELECT DISTINCT deviceId FROM "${table}"`).all() as any[]).map((r) => r.deviceId);
+      out.push({ table, rows, timeCol, first, last, deviceIds });
+    }
+    return out;
+  }
+
   // The paired wearable's own battery telemetry, banked over BLE (WhoopStore `battery` table). UNITS,
   // confirmed against the producer rather than assumed: `soc` is PERCENT (0-100) as a REAL, NOT a 0-1
   // fraction — the WHOOP BATTERY_LEVEL decoder emits it as the wire word / 10 tagged "%" (Interpreter
