@@ -38,7 +38,27 @@ const HR_DETAIL_RAW_CAP = 250_000;
 // never silently dropped.
 const RR_RAW_CAP = 500_000;
 const round3 = (x: number) => Math.round(x * 1000) / 1000;
+const round2 = (x: number) => Math.round(x * 100) / 100;
 const round1 = (x: number) => Math.round(x * 10) / 10;
+
+// Family-aware raw skin-temp register → °C, ported from WhoopProtocol Streams.swift `skinTempCelsius`
+// (#938) + DeviceFamily.forRegistryModel (#171) — kept in lockstep with those. WHOOP 5/MG banks a
+// centidegree register so °C = raw/100 (PROVEN on real 5/MG captures: worn 3057 = 30.6 °C, off-wrist
+// 2247 = 22.5 °C). WHOOP 4.0 banks a raw ADC needing an affine map anchored at a worn resting value
+// (33.0 °C ↔ raw 826) with a PROVISIONAL 0.05 °C/raw slope — approximate in absolute terms but
+// directionally right, and the downstream skinTempDevC is a deviation from the user's OWN baseline so
+// the constant offset cancels. Only a positively-identified 4.0 model uses the 4.0 scale; every other
+// or legacy/unknown label ("5.0", bare "WHOOP", nil, non-WHOOP) keeps the 5/MG /100 fallback, exactly
+// as the Swift resolver does.
+const WHOOP4_TEMP_ANCHOR_RAW = 826, WHOOP4_TEMP_ANCHOR_C = 33.0, WHOOP4_TEMP_SLOPE_C_PER_RAW = 0.05;
+function tempFamilyForModel(model: string | null): "whoop4" | "whoop5" {
+  return model === "4.0" || model === "WHOOP 4.0" ? "whoop4" : "whoop5";
+}
+function skinTempCelsius(raw: number, family: "whoop4" | "whoop5"): number {
+  return family === "whoop4"
+    ? WHOOP4_TEMP_ANCHOR_C + (raw - WHOOP4_TEMP_ANCHOR_RAW) * WHOOP4_TEMP_SLOPE_C_PER_RAW
+    : raw / 100;
+}
 
 function dropDeleted(samples: { deviceId: string; ts: number; bpm: number }[], ranges: { deviceId: string; fromTs: number; toTs: number }[]) {
   if (!ranges.length) return samples;
@@ -405,6 +425,52 @@ export function imuSeries(cfg: Config, args: { from: string; to: string; deviceI
   } finally { m.close(); }
 }
 
+// temp_series: per-second skin temperature (WhoopStore `skinTempSample`, migration v3) over a range —
+// the raw stream the nightly `skinTempDevC` deviation is derived from on-device. Shaped like hrSeries
+// (raw by default, bucketed when bucketSeconds is passed) since the question is about level/curve.
+// Sensor is ~1 Hz, so a full night exceeds RAW_CAP → callers bucket. Conversion is FAMILY-AWARE
+// (skinTempCelsius above): `tempC` is the interpreted value, `raw` is always carried so nothing is
+// lost and a caller can re-derive. `dataExtent` reports the table's full ts span (the retention
+// answer). notCaptured means no skinTempSample table (an upload from before migration v3).
+export function tempSeries(cfg: Config, args: { from: string; to: string; deviceId?: string; bucketSeconds?: number }) {
+  if (!fs.existsSync(cfg.mirrorPath)) return { samples: [], notIngested: true };
+  const fromTs = toTs(args.from), toT = toTs(args.to, true);
+  if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
+  if (toT - fromTs > MAX_SPAN_S) return { error: "span_too_wide", maxDays: 7 };
+  const m = new Mirror(cfg.mirrorPath);
+  try {
+    if (!m.hasTable("skinTempSample")) {
+      return { samples: [], notCaptured: true, hint: "no per-second skin temperature — the uploading build predates the skinTempSample table (WhoopStore migration v3)" };
+    }
+    const models = m.pairedDeviceModels();
+    const cOf = (deviceId: string, raw: number) => skinTempCelsius(raw, tempFamilyForModel(models.get(deviceId) ?? null));
+    const raw = m.skinTempSamplesRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: SERIES_CAP });
+    const extent = m.skinTempExtent(args.deviceId);
+    const dataExtent = extent ? { firstTs: extent.firstTs, lastTs: extent.lastTs, n: extent.n } : undefined;
+    if (args.bucketSeconds) {
+      const b = Math.min(3600, Math.max(60, args.bucketSeconds));
+      const byBucket = new Map<string, { ts: number; deviceId: string; sumC: number; minC: number; maxC: number; sumRaw: number; n: number }>();
+      for (const s of raw) {
+        const c = cOf(s.deviceId, s.raw);
+        const bt = Math.floor(s.ts / b) * b;
+        const key = `${s.deviceId}|${bt}`;
+        const cur = byBucket.get(key) ?? { ts: bt, deviceId: s.deviceId, sumC: 0, minC: c, maxC: c, sumRaw: 0, n: 0 };
+        cur.sumC += c; cur.minC = Math.min(cur.minC, c); cur.maxC = Math.max(cur.maxC, c); cur.sumRaw += s.raw; cur.n += 1;
+        byBucket.set(key, cur);
+      }
+      const buckets = [...byBucket.values()].sort((a, c) => a.ts - c.ts || a.deviceId.localeCompare(c.deviceId))
+        .map((x) => ({ ts: x.ts, deviceId: x.deviceId, family: sourceFamily(x.deviceId), avgC: round2(x.sumC / x.n), minC: round2(x.minC), maxC: round2(x.maxC), avgRaw: round1(x.sumRaw / x.n), n: x.n }));
+      return { buckets, ...(dataExtent ? { dataExtent } : {}), ...(raw.length === SERIES_CAP ? { truncated: true, hint: "narrow the from/to window" } : {}) };
+    }
+    const capped = raw.slice(0, RAW_CAP);
+    return {
+      samples: capped.map((s) => ({ deviceId: s.deviceId, ts: s.ts, raw: s.raw, tempC: round2(cOf(s.deviceId, s.raw)), family: sourceFamily(s.deviceId) })),
+      ...(dataExtent ? { dataExtent } : {}),
+      ...(raw.length > RAW_CAP ? { truncated: true, hint: "per-second temp is ~1 Hz, so a night exceeds the raw cap — pass bucketSeconds to aggregate" } : {}),
+    };
+  } finally { m.close(); }
+}
+
 // battery_series: the paired strap's own battery telemetry (WhoopStore `battery` table) over a range.
 // Shaped like hrSeries (raw by default, bucketed only when asked) rather than the always-bucketed
 // motion/imu/hrv tools on purpose: the question this exists to answer — "when did it die / start
@@ -695,6 +761,13 @@ export function registerGranularTools(server: McpServer, cfg: Config): void {
     inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(imuSeries(cfg, a)));
+
+  server.registerTool("temp_series", {
+    title: "Skin-temperature series (per-second)",
+    description: "Per-second skin temperature in °C for a time range (max 7 days) — the raw sensor stream the nightly `skinTempDevC` deviation is derived from on-device, so this is the tool for INTRA-NIGHT temperature (when in the night you ran warm) that the one-value-per-night dailyMetric can't show. WHOOP-only (skinTempSample, WhoopStore migration v3): cloud-imported sources (oura-api) never carry it. Conversion is DEVICE-FAMILY-AWARE — WHOOP 5/MG is a proven raw/100 centidegree register; WHOOP 4.0 uses a PROVISIONAL affine map (absolute °C approximate but directionally right, issue #938) — and each sample carries both the interpreted `tempC` and the untouched `raw`. Raw by default (capped at 5000 samples), or per-bucket when bucketSeconds is passed: per bucket avgC/minC/maxC (°C), avgRaw, n. Because the sensor is ~1 Hz a full night exceeds the raw cap, so pass bucketSeconds (e.g. 300–900) for an overnight overview and raw only for a tight window. `raw` PASSES THROUGH LOSSLESSLY including off-wrist/ambient reads (worn skin is ~30–35 °C; a plunge toward low-20s °C is the strap coming off the wrist, not a fever breaking) — this tool does no wear-gating, unlike the nightly rollup. `dataExtent` (firstTs/lastTs/n over the whole table) answers 'how far back does per-second temp retain?'. notCaptured:true means the uploading build predates skinTempSample. This is ABSOLUTE skin temp; for the baseline-relative nightly number use skinTempDevC via health_snapshot/compare_sources.",
+    inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async (a) => asTool(tempSeries(cfg, a)));
 
   server.registerTool("battery_series", {
     title: "Strap battery series (state-of-charge)",

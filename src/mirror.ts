@@ -21,6 +21,11 @@ export interface MetricPointRow { deviceId: string; family: Family; day: string;
 // activityClass is a nullable INTEGER enum (0=still, 1=walk, 2=run), added in a later migration.
 export interface StepSampleRow { deviceId: string; ts: number; counter: number; activityClass: number | null; }
 export interface GravitySampleRow { deviceId: string; ts: number; x: number; y: number; z: number; }
+// Per-second WHOOP skin-temperature register (WhoopStore `skinTempSample`, migration v3). `raw` is the
+// SCALE-AGNOSTIC register the historical decoder banks (WhoopProtocol `SkinTempSample`), NOT °C — the
+// raw→°C conversion is DEVICE-FAMILY-AWARE (5/MG raw/100 vs 4.0 affine, issue #938) and lives with
+// temp_series in tools/granular.ts, not here, so this reader stays lossless.
+export interface SkinTempSampleRow { deviceId: string; ts: number; raw: number; }
 export interface RRIntervalRow { deviceId: string; ts: number; rrMs: number; }
 // `soc` is PERCENT (0-100), not a 0-1 fraction — see batterySamplesRange below for the provenance.
 // All three value columns are nullable: the command-response battery path fills only what it read.
@@ -264,6 +269,35 @@ export class Mirror {
     if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
     args.push(opts.limit);
     return this.db.prepare(`SELECT deviceId, ts, x, y, z FROM gravitySample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+
+  // Raw per-second skin-temperature register over a range (WhoopStore `skinTempSample`, migration v3).
+  // hasTable-guarded like the other opt-era sample readers: an upload from before v3 shipped won't
+  // carry it. `raw` passes through untouched (off-wrist/ambient reads included) — Default: capture and
+  // expose the stream losslessly; temp_series does the family-aware raw→°C and any wear interpretation.
+  skinTempSamplesRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }): SkinTempSampleRow[] {
+    if (!this.hasTable("skinTempSample")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, raw FROM skinTempSample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+  // Full ts extent of skinTempSample — the "how far back does per-second temp retain?" answer, which a
+  // 7-day-capped temp_series can't give. Cheap min/max over the (deviceId, ts) primary key.
+  skinTempExtent(deviceId?: string): { firstTs: number; lastTs: number; n: number } | null {
+    if (!this.hasTable("skinTempSample")) return null;
+    const where = deviceId ? "WHERE deviceId = ?" : "";
+    const args = deviceId ? [deviceId] : [];
+    const r = this.db.prepare(`SELECT MIN(ts) firstTs, MAX(ts) lastTs, COUNT(*) n FROM skinTempSample ${where}`).get(...args) as any;
+    return r && r.n > 0 ? r : null;
+  }
+  // deviceId → registry `model` label (pairedDevice), for temp_series' family-aware raw→°C conversion.
+  // Guarded (empty map on a mirror without the table) so conversion falls back to the 5/MG scale, which
+  // is exactly what DeviceFamily.forRegistryModel does for a nil/unknown model.
+  pairedDeviceModels(): Map<string, string | null> {
+    if (!this.hasTable("pairedDevice")) return new Map();
+    const rows = this.db.prepare("SELECT id, model FROM pairedDevice").all() as { id: string; model: string | null }[];
+    return new Map(rows.map((r) => [r.id, r.model]));
   }
 
   // The paired wearable's own battery telemetry, banked over BLE (WhoopStore `battery` table). UNITS,
