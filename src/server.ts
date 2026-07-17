@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Config, loadConfig } from "./config.js";
-import { requireScope, tokenScope } from "./auth.js";
+import { requireScope, tokenScope, safeEqual } from "./auth.js";
 import { ingestNoopbak, IngestError, normalizePhoneTz } from "./ingest.js";
 import { buildMcpServer } from "./mcp.js";
 import { journalSince, ackEdits } from "./staging.js";
@@ -39,8 +39,7 @@ export function createApp(cfg: Config): express.Express {
     res.json({ registered: true, count });
   });
 
-  app.post("/mcp", requireScope(cfg, "ro"), express.json({ limit: "4mb" }), async (req, res) => {
-    const scope = tokenScope(cfg, req.header("authorization")) ?? "ro"; // requireScope already vetted it
+  const runMcp = async (scope: "ro" | "rw", req: express.Request, res: express.Response) => {
     const server = buildMcpServer(cfg, scope);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => { transport.close().catch(() => {}); server.close().catch(() => {}); });
@@ -51,6 +50,22 @@ export function createApp(cfg: Config): express.Express {
       console.error("mcp error", e);
       if (!res.headersSent) res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "internal error" }, id: null });
     }
+  };
+
+  app.post("/mcp", requireScope(cfg, "ro"), express.json({ limit: "4mb" }), async (req, res) => {
+    const scope = tokenScope(cfg, req.header("authorization")) ?? "ro"; // requireScope already vetted it
+    await runMcp(scope, req, res);
+  });
+
+  // No-auth entry point for clients that cannot send an Authorization header (ChatGPT's "No Auth"
+  // connector). The path segment IS the credential; a miss is a 404 so the route never advertises
+  // itself. Read-only ALWAYS — a URL secret must never reach the rw edit tools. Disabled (404) unless
+  // MCP_URL_SECRET is configured.
+  app.post("/mcp/:secret", express.json({ limit: "4mb" }), async (req, res) => {
+    if (!cfg.mcpUrlSecret || !safeEqual(req.params.secret, cfg.mcpUrlSecret)) {
+      return res.status(404).json({ error: "not_found" });
+    }
+    await runMcp("ro", req, res);
   });
   app.all("/mcp", (_req, res) => res.status(405).json({ error: "method_not_allowed" }));
 

@@ -7,6 +7,10 @@ export interface Config {
   serverDbPath: string;
   roToken: string;
   rwToken: string;
+  /** Secret path segment for the no-auth MCP entry point (POST /mcp/:secret). Unset = route disabled,
+   *  every /mcp/* returns 404. The URL IS the credential, so this exists only to let clients that
+   *  cannot send an Authorization header (e.g. ChatGPT's "No Auth" connector) reach the read-only MCP. */
+  mcpUrlSecret?: string;
   maxIngestBytes: number;
   // Push-triggered on-demand sync (request_sync MCP tool + POST /register-device). All four
   // optional together: unset means the tool responds {configured:false} instead of failing.
@@ -46,6 +50,7 @@ export function loadConfig(): Config {
     serverDbPath: path.join(dataDir, "server.sqlite"),
     roToken: required("RO_TOKEN"),
     rwToken: required("RW_TOKEN"),
+    mcpUrlSecret: process.env.MCP_URL_SECRET,
     maxIngestBytes: Number(process.env.MAX_INGEST_BYTES ?? 262_144_000),
     apnsKeyP8: process.env.APNS_KEY_P8,
     apnsKeyId: process.env.APNS_KEY_ID,
