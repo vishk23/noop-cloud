@@ -47,6 +47,9 @@ export function registerSearchFetch(server: McpServer, cfg: Config): void {
     title: "Search",
     description: "ChatGPT Deep Research search: find day-records. Returns {id,title,url}. Use a YYYY-MM-DD in the query to target a day. Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads.",
     inputSchema: { query: z.string() },
+    // The ChatGPT Deep Research contract shape. Loose: `results` is the only guaranteed key (the
+    // no-data path adds notIngested, which a non-strict object simply ignores).
+    outputSchema: { results: z.array(z.object({ id: z.string(), title: z.string(), url: z.string() })) },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => { const r = search(cfg, a); return { content: [{ type: "text", text: JSON.stringify(r) }], structuredContent: r }; });
 
@@ -54,6 +57,12 @@ export function registerSearchFetch(server: McpServer, cfg: Config): void {
     title: "Fetch",
     description: "ChatGPT Deep Research fetch: full text of a record by id (e.g. day:2026-06-13). Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads.",
     inputSchema: { id: z.string() },
+    // ChatGPT Deep Research fetch contract. metadata is a free-form object (varies by record), so it
+    // passes through unconstrained.
+    outputSchema: {
+      id: z.string(), title: z.string(), text: z.string(), url: z.string(),
+      metadata: z.object({}).passthrough().optional(),
+    },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => { const r = fetch(cfg, a); return { content: [{ type: "text", text: JSON.stringify(r) }], structuredContent: r }; });
 }

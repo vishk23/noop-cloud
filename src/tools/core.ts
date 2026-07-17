@@ -146,6 +146,21 @@ export function registerCoreTools(server: McpServer, cfg: Config): void {
     title: "Data freshness",
     description: "How stale the mirror is and which sources it holds (deviceIds that only ever write raw samples, e.g. hrSample-only straps, are included via `tables`), plus discoverable `dailyMetricColumns` and `metricSeriesKeys` (per-family counts) for building compare_sources/metric_series calls. Call this first.",
     inputSchema: {},
+    // Loose: only fields present in BOTH the mirror and no-mirror branches, with per-item objects left
+    // passthrough so conditional keys (phoneTz, notIngested, per-source latestDay, note supersededCount)
+    // never fail validation. Documents the shape without constraining the variable parts.
+    outputSchema: {
+      mirrorAgeSeconds: z.number().nullable(),
+      lastIngestAt: z.string().nullable(),
+      phoneTz: z.string().nullable().optional(),
+      latestDataDay: z.string().nullable(),
+      sources: z.array(z.object({ deviceId: z.string(), family: z.string(), tables: z.array(z.string()) }).passthrough()),
+      dailyMetricColumns: z.array(z.string()),
+      metricSeriesKeys: z.array(z.object({ key: z.string() }).passthrough()),
+      pendingEdits: z.number(),
+      journalSeq: z.number(),
+      baselineNotes: z.array(z.object({ note: z.string(), deviceId: z.string().nullable(), at: z.number() }).passthrough()),
+    },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async () => asTool(dataFreshness(cfg)));
 
