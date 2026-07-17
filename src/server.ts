@@ -39,7 +39,7 @@ export function createApp(cfg: Config): express.Express {
     res.json({ registered: true, count });
   });
 
-  const runMcp = async (scope: "ro" | "rw", req: express.Request, res: express.Response) => {
+  const runMcp = async (scope: "public" | "ro" | "rw", req: express.Request, res: express.Response) => {
     const server = buildMcpServer(cfg, scope);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => { transport.close().catch(() => {}); server.close().catch(() => {}); });
@@ -59,13 +59,16 @@ export function createApp(cfg: Config): express.Express {
 
   // No-auth entry point for clients that cannot send an Authorization header (ChatGPT's "No Auth"
   // connector). The path segment IS the credential; a miss is a 404 so the route never advertises
-  // itself. Read-only ALWAYS — a URL secret must never reach the rw edit tools. Disabled (404) unless
-  // MCP_URL_SECRET is configured.
-  app.post("/mcp/:secret", express.json({ limit: "4mb" }), async (req, res) => {
+  // itself. Serves the strict "public" scope — pure reads only, never the write-proposal or push
+  // tools. Disabled (404) unless MCP_URL_SECRET is configured. app.all so a wrong secret 404s on any
+  // method and a right secret + non-POST 405s (like the bearer /mcp route), rather than falling
+  // through to a bare Express 404 that a probing connector could misread as a wrong URL.
+  app.all("/mcp/:secret", express.json({ limit: "4mb" }), async (req, res) => {
     if (!cfg.mcpUrlSecret || !safeEqual(req.params.secret, cfg.mcpUrlSecret)) {
       return res.status(404).json({ error: "not_found" });
     }
-    await runMcp("ro", req, res);
+    if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
+    await runMcp("public", req, res);
   });
   app.all("/mcp", (_req, res) => res.status(405).json({ error: "method_not_allowed" }));
 

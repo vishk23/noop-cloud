@@ -30,7 +30,7 @@ function urlSecretCall(port: number, secret: string, body: object): Promise<{ st
 }
 
 describe("/mcp/:secret (no-auth URL secret)", () => {
-  it("serves read-only tools with the correct URL secret and no bearer", async () => {
+  it("serves the strict public read-only surface with the correct URL secret and no bearer", async () => {
     fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true });
     const zip = path.join(dataDir, "b.noopbak"); buildNoopbak(zip); ingestNoopbak(fs.readFileSync(zip), cfg());
     const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;
@@ -38,9 +38,24 @@ describe("/mcp/:secret (no-auth URL secret)", () => {
     const names = (json?.result?.tools ?? []).map((t: any) => t.name);
     server.close();
     expect(status).toBe(200);
+    // Pure reads are present...
     expect(names).toContain("data_freshness");
-    // Read-only scope: rw-only edit-resolution tools must NOT be exposed on this route.
-    expect(names).not.toContain("confirm_edit");
+    expect(names).toContain("hr_series");
+    expect(names).toContain("search");
+    // ...but NO write-proposal, edit-resolution, or phone-poking tools reach an anonymous URL caller.
+    for (const forbidden of ["propose_edit", "list_pending", "edit_journal", "confirm_edit", "reject_edit", "undo_edit", "request_sync"]) {
+      expect(names).not.toContain(forbidden);
+    }
+  });
+
+  it("405s (not 404) on GET with the correct secret, so a probing connector sees method-not-supported", async () => {
+    const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;
+    const status: number = await new Promise((resolve) => {
+      const r = http.request({ port, path: `/mcp/${SECRET}`, method: "GET", headers: { accept: "text/event-stream" } }, (res) => { res.resume(); resolve(res.statusCode!); });
+      r.end();
+    });
+    server.close();
+    expect(status).toBe(405);
   });
 
   it("404s on a wrong URL secret", async () => {

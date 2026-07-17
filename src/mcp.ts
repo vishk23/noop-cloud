@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "./config.js";
 import { registerTools } from "./tools/index.js";
 
-export function buildMcpServer(cfg: Config, scope: "ro" | "rw"): McpServer {
+export function buildMcpServer(cfg: Config, scope: "public" | "ro" | "rw"): McpServer {
   const server = new McpServer({ name: "noop-cloud", version: "0.1.0" });
 
   server.registerPrompt("morning_report", {
