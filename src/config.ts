@@ -33,6 +33,10 @@ export interface Config {
   maxDeepbufBytes: number;
   /** Decompressed ceiling for one chunk — the zip-bomb bound (see ingestDeepBufferChunk). */
   maxDeepbufRawBytes: number;
+  /** Free bytes /ingest insists on keeping AFTER staging its second full copy of the mirror. */
+  minFreeBytes: number;
+  /** A `.staged-*` artifact older than this is a crash corpse and gets swept (see sweepStagedArtifacts). */
+  stagedSweepAgeMs: number;
 }
 
 function required(name: string): string {
@@ -74,5 +78,14 @@ export function loadConfig(): Config {
     // 64 MB decompressed: comfortably above the phone's 16 MB raw chunk, far below anything that
     // could exhaust the 2 GB machine. Enforced by inflateRaw's own maxOutputLength.
     maxDeepbufRawBytes: Number(process.env.MAX_DEEPBUF_RAW_BYTES ?? 67_108_864),
+    // 256 MB. /ingest writes a SECOND full copy of the mirror (~510 MB today) before renaming it over
+    // the first, so the real requirement is `mirror + headroom`, computed per-request in ingestNoopbak.
+    // This is only the slack left over — enough that server.sqlite's WAL, a checkpoint, and SQLite's
+    // temp files still have somewhere to go on a volume that just absorbed a swap. The 2026-07-26
+    // outage was exactly this margin reaching zero: SQLite could not even create the mirror's -shm.
+    minFreeBytes: Number(process.env.MIN_FREE_BYTES ?? 268_435_456),
+    // 1 hour. ingestNoopbak is synchronous and a ~500 MB stage finishes in seconds, so nothing this
+    // old can belong to a live request — but the guard means a sweep can never race a real upload.
+    stagedSweepAgeMs: Number(process.env.STAGED_SWEEP_AGE_MS ?? 3_600_000),
   };
 }

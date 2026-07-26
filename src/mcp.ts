@@ -1,9 +1,39 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "./config.js";
 import { registerTools } from "./tools/index.js";
+import { isStorageError, storageFailureMessage } from "./storage.js";
+
+/**
+ * Make every tool answer a storage fault with an explanation instead of a driver string.
+ *
+ * On 2026-07-26 the Fly volume hit 0 bytes free and every mirror-backed tool returned exactly
+ * `disk I/O error` — no indication of which layer failed, whether the caller's arguments were
+ * wrong, or whether retrying would help. It reads like a client bug and is not one.
+ *
+ * Wrapping registerTool (rather than each handler) means this covers the tools registered below AND
+ * any tool added later, with no opt-in step to forget. Non-storage errors propagate untouched, so
+ * ordinary validation failures keep their existing behaviour. `isError: true` is the MCP-native way
+ * to fail a single tool call without tearing down the session — and the SDK deliberately skips
+ * outputSchema validation for error results, so this stays legal on tools that declare one.
+ */
+function installStorageGuard(server: McpServer, cfg: Config): void {
+  const original = server.registerTool.bind(server);
+  (server as unknown as Record<string, unknown>).registerTool = (
+    name: string, config: unknown, handler: (...a: unknown[]) => unknown,
+  ) => original(name as never, config as never, (async (...args: unknown[]) => {
+    try {
+      return await handler(...args);
+    } catch (e) {
+      if (!isStorageError(e)) throw e;
+      console.error(`tool ${name} storage failure:`, e instanceof Error ? e.message : e);
+      return { isError: true, content: [{ type: "text" as const, text: storageFailureMessage(cfg, e) }] };
+    }
+  }) as never);
+}
 
 export function buildMcpServer(cfg: Config, scope: "public" | "ro" | "rw"): McpServer {
   const server = new McpServer({ name: "noop-cloud", version: "0.1.0" });
+  installStorageGuard(server, cfg);
 
   server.registerPrompt("morning_report", {
     title: "Morning report",

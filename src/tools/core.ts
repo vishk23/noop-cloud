@@ -6,6 +6,7 @@ import { Mirror, Family } from "../mirror.js";
 import { latestIngest } from "../ingest.js";
 import { listPending, journalSince } from "../staging.js";
 import { computeOverlay, pointKeyOf } from "../edits/overlay.js";
+import { storageReport, isStorageError, storageFailureMessage } from "../storage.js";
 
 // set_baseline_note is append-only in the journal (staging.ts never deletes/rewrites rows), but
 // surfacing full history means a stale note sits right next to its own replacement — audit-exposed: a
@@ -22,21 +23,45 @@ function latestBaselineNotes(notes: { note: string; deviceId: string | null; at:
   return [...byDevice.values()].map(({ supersededCount, ...rest }) => (supersededCount > 0 ? { ...rest, supersededCount } : rest));
 }
 
+// data_freshness is documented as "Call this first", which makes it the one tool that MUST survive a
+// broken volume — during the 2026-07-26 outage it died with the same bare `disk I/O error` as
+// everything else, so the diagnostic tool was unavailable exactly when it was needed. Every read
+// below is now individually guarded and the storage report is attached unconditionally, so a
+// degraded server still answers with WHY it is degraded instead of throwing.
 export function dataFreshness(cfg: Config) {
-  if (!fs.existsSync(cfg.mirrorPath)) {
-    const baselineNotes = latestBaselineNotes(computeOverlay(cfg).baselineNotes);
-    const j = journalSince(cfg, 0);
-    const journalSeq = j.length ? j[j.length - 1].seq : 0;
-    return { mirrorAgeSeconds: null, lastIngestAt: null, latestDataDay: null, sources: [], dailyMetricColumns: [], metricSeriesKeys: [], pendingEdits: listPending(cfg).length, journalSeq, baselineNotes, notIngested: true };
-  }
-  const m = new Mirror(cfg.mirrorPath);
+  const storage = storageReport(cfg);
+
+  // The journal/overlay/pending reads all open server.sqlite, which lives on the same volume as the
+  // mirror — so they fail for the same reason and need the same guard.
+  let baselineNotes: ReturnType<typeof latestBaselineNotes> = [];
+  let journalSeq = 0, pendingEdits = 0;
+  let serverDbError: string | undefined;
   try {
+    baselineNotes = latestBaselineNotes(computeOverlay(cfg).baselineNotes);
+    const j = journalSince(cfg, 0);
+    journalSeq = j.length ? j[j.length - 1].seq : 0;
+    pendingEdits = listPending(cfg).length;
+  } catch (e) {
+    if (!isStorageError(e)) throw e;
+    serverDbError = e instanceof Error ? e.message : String(e);
+  }
+
+  const shell = {
+    mirrorAgeSeconds: null, lastIngestAt: null, latestDataDay: null,
+    sources: [] as any[], dailyMetricColumns: [] as string[], metricSeriesKeys: [] as any[],
+    pendingEdits, journalSeq, baselineNotes, storage,
+    ...(serverDbError ? { serverDbError } : {}),
+  };
+
+  if (!fs.existsSync(cfg.mirrorPath)) return { ...shell, notIngested: true };
+
+  let m: Mirror | undefined;
+  try {
+    m = new Mirror(cfg.mirrorPath);
     const li = latestIngest(cfg);
     const now = Math.floor(Date.now() / 1000);
-    const baselineNotes = latestBaselineNotes(computeOverlay(cfg).baselineNotes);
-    const j = journalSince(cfg, 0);
-    const journalSeq = j.length ? j[j.length - 1].seq : 0;
     return {
+      storage,
       mirrorAgeSeconds: li ? now - li.receivedAt : null,
       lastIngestAt: li ? new Date(li.receivedAt * 1000).toISOString() : null,
       // The phone's IANA timezone as of the most recent upload (X-Phone-Timezone header). null when the
@@ -50,11 +75,16 @@ export function dataFreshness(cfg: Config) {
       // call rather than hardcoded, so a phone-side schema change surfaces automatically.
       dailyMetricColumns: m.dailyMetricColumns(),
       metricSeriesKeys: m.metricSeriesKeyCounts(),
-      pendingEdits: listPending(cfg).length,
+      pendingEdits,
       journalSeq,
       baselineNotes,
     };
-  } finally { m.close(); }
+  } catch (e) {
+    if (!isStorageError(e)) throw e;
+    // The mirror is unreadable but the report itself still lands: `storage` carries the disk numbers,
+    // `degraded` tells a caller not to interpret the empty arrays as "no data exists".
+    return { ...shell, degraded: true, error: storageFailureMessage(cfg, e) };
+  } finally { m?.close(); }
 }
 
 export function healthSnapshot(cfg: Config, args: { days?: number }) {
@@ -144,7 +174,7 @@ const asTool = (obj: unknown) => ({ content: [{ type: "text" as const, text: JSO
 export function registerCoreTools(server: McpServer, cfg: Config): void {
   server.registerTool("data_freshness", {
     title: "Data freshness",
-    description: "How stale the mirror is and which sources it holds (deviceIds that only ever write raw samples, e.g. hrSample-only straps, are included via `tables`), plus discoverable `dailyMetricColumns` and `metricSeriesKeys` (per-family counts) for building compare_sources/metric_series calls. Call this first.",
+    description: "How stale the mirror is and which sources it holds (deviceIds that only ever write raw samples, e.g. hrSample-only straps, are included via `tables`), plus discoverable `dailyMetricColumns` and `metricSeriesKeys` (per-family counts) for building compare_sources/metric_series calls. Also returns `storage` — disk free/total, mirror size, orphaned staging bytes, and age of the last successful ingest — so server-side degradation is visible here rather than as an opaque failure in some other tool. `degraded: true` means the mirror could not be READ (empty arrays mean unreachable, not absent). Call this first.",
     inputSchema: {},
     // Loose: only fields present in BOTH the mirror and no-mirror branches, with per-item objects left
     // passthrough so conditional keys (phoneTz, notIngested, per-source latestDay, note supersededCount)
@@ -160,6 +190,12 @@ export function registerCoreTools(server: McpServer, cfg: Config): void {
       pendingEdits: z.number(),
       journalSeq: z.number(),
       baselineNotes: z.array(z.object({ note: z.string(), deviceId: z.string().nullable(), at: z.number() }).passthrough()),
+      // Storage/ingest health, always present. `degraded` + `error` appear only when the mirror could
+      // not be read, in which case the arrays above are empty because the DATA IS UNREACHABLE, not
+      // because it is absent — a distinction nothing surfaced during the 2026-07-26 outage.
+      storage: z.object({ ok: z.boolean(), warnings: z.array(z.string()) }).passthrough().optional(),
+      degraded: z.boolean().optional(),
+      error: z.string().optional(),
     },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async () => asTool(dataFreshness(cfg)));

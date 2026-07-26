@@ -33,10 +33,51 @@ docker run -p 8080:8080 \
 The server listens on `:8080`; `GET /healthz` is the health check. Then `POST /ingest` a
 `.noopbak` with `Authorization: Bearer <RW_TOKEN>` and point any MCP client at `http://<host>:8080/mcp`
 with the `RO_TOKEN`. Env vars: `DATA_DIR` (default `/data` in the image), `PORT` (8080),
-`RO_TOKEN`, `RW_TOKEN`, `MAX_INGEST_BYTES`, plus the optional `APNS_*` push credentials below —
+`RO_TOKEN`, `RW_TOKEN`, `MAX_INGEST_BYTES`, `MIN_FREE_BYTES`, `STAGED_SWEEP_AGE_MS`,
+plus the optional `APNS_*` push credentials below —
 pass them with `-e` or an `--env-file` instead of `fly secrets`. `better-sqlite3` is a native
 module, so build the image on (or for) your target CPU architecture — the Dockerfile compiles it
 during the build.
+
+## Storage health (`GET /status`)
+
+`/ingest` performs an atomic swap: it stages a **second full copy** of the database next to the live
+mirror, validates it, then renames it into place. So the volume must always hold roughly **2× the
+mirror** plus slack, and "free space" is only meaningful relative to the mirror's own size.
+
+`GET /status` (needs `RO_TOKEN`) reports exactly that — disk free/total, mirror size, orphaned
+staging bytes, and how long since the last successful ingest:
+
+```bash
+curl -sH "Authorization: Bearer $RO_TOKEN" https://<app>.fly.dev/status | jq
+```
+
+The field to watch is **`nextIngestFits`**. It goes `false` while there is still free space — as soon
+as the volume can no longer absorb one more swap — which is the actionable moment, well before
+anything breaks. `warnings[]` explains any non-`ok` state in words. The same block is returned by the
+`data_freshness` MCP tool, so an agent sees storage health without a second call.
+
+`GET /healthz` stays a pure liveness probe and **always returns 200**, adding `degraded: true` and
+`warnings[]` when storage is unhealthy. That is deliberate: Fly's health check points at it, so a
+non-2xx would pull the machine out of routing and block deploying the fix.
+
+Guardrails, all exercised by `test/storage*.test.ts` and `test/ingest-space-guard.test.ts`:
+
+- **Preflight.** An upload with nowhere to land is refused up front with **507** `insufficient_space`
+  (not 400 — the backup is valid and the phone should retry later), so a partial multi-hundred-MB
+  write is never left behind.
+- **No staged leaks.** The staged file and the `-wal`/`-shm` sidecars SQLite opens beside it are
+  removed on every exit path, success included — `rename` moves only the main file.
+- **Sweep.** `.staged-*` artifacts older than `STAGED_SWEEP_AGE_MS` (1h) are reclaimed at startup and
+  before each ingest. The age guard is what makes this safe against an upload in flight.
+- **Readable failures.** MCP tools answer a storage fault with an explanation naming the layer, the
+  numbers, and the fix — never a bare driver string like `disk I/O error`.
+
+> Post-mortem, 2026-07-26: the Fly volume filled to 3.0G/3.0G because ~2.4 GB of orphaned
+> `.staged-*` files had accumulated — `writeFileSync` sat outside the try/catch, so once space got
+> tight each failed ingest leaked a ~500 MB partial and made the next failure likelier. Every
+> mirror-backed tool then returned `disk I/O error`, `/healthz` still said 200, and uploads had been
+> silently failing for 8 days.
 
 ## Upload data (iOS Shortcut, no app changes)
 

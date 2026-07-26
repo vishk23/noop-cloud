@@ -8,13 +8,53 @@ import { ingestNoopbak, IngestError, normalizePhoneTz } from "./ingest.js";
 import { buildMcpServer } from "./mcp.js";
 import { journalSince, ackEdits } from "./staging.js";
 import { upsertDeviceToken } from "./push/registry.js";
+import { ingestDeepBufferChunk, DeepBufError, parseChunkHeaders } from "./deepbuf.js";
+import { makeObjectStore } from "./objectstore.js";
+import { storageReport, sweepStagedArtifacts } from "./storage.js";
 
 const DEVICE_TOKEN_RE = /^[0-9a-fA-F]{32,100}$/;
 
 export function createApp(cfg: Config): express.Express {
   fs.mkdirSync(cfg.dataDir, { recursive: true });
   const app = express();
-  app.get("/healthz", (_req, res) => res.json({ ok: true }));
+  // Built once, not per request: the S3 client pools connections, and the phone drains up to 8 chunks
+  // back-to-back in a single background wake. null = bulk storage unconfigured (see makeObjectStore).
+  const objectStore = makeObjectStore(cfg);
+
+  // Reclaim staged corpses left by a crash/OOM/SIGKILL during a previous boot's ingest. Nothing is in
+  // flight at construction time, but sweepStagedArtifacts keeps its age guard anyway and swallows its
+  // own errors — startup must never be blocked by cleanup.
+  try {
+    const swept = sweepStagedArtifacts(cfg.dataDir, { olderThanMs: cfg.stagedSweepAgeMs });
+    if (swept.removed) console.log(`swept ${swept.removed} orphaned staging artifact(s), reclaimed ${swept.bytes} bytes`);
+  } catch { /* best-effort */ }
+
+  // Liveness ONLY, and deliberately still 200 when storage is degraded.
+  //
+  // Fly's [[http_service.checks]] points here, so a non-2xx pulls the machine out of routing and
+  // fails deploys. During the 2026-07-26 full-volume outage that would have turned "every tool
+  // returns a clear storage error" into "the host is unreachable" — strictly worse to debug, and it
+  // would have blocked deploying the very fix. So the disk verdict rides along as a `degraded` flag
+  // (absent when healthy, which keeps the response exactly `{ok:true}`), and /status carries detail.
+  app.get("/healthz", (_req, res) => {
+    let degraded: string[] | null = null;
+    try {
+      const s = storageReport(cfg);
+      if (!s.ok) degraded = s.warnings;
+    } catch { /* a health probe must not throw */ }
+    res.json(degraded ? { ok: true, degraded: true, warnings: degraded } : { ok: true });
+  });
+
+  // Full storage/ingest diagnostics: disk free %, mirror size, orphaned staging bytes, and how long
+  // since the last successful ingest — the numbers that would have made the outage visible days
+  // early. Behind `ro` because it reports host paths and volume geometry.
+  app.get("/status", requireScope(cfg, "ro"), (_req, res) => {
+    try {
+      res.json(storageReport(cfg));
+    } catch (e) {
+      res.status(500).json({ ok: false, error: "status_failed", detail: e instanceof Error ? e.message : String(e) });
+    }
+  });
 
   app.post("/ingest", requireScope(cfg, "rw"),
     express.raw({ type: "*/*", limit: cfg.maxIngestBytes }),
@@ -24,9 +64,44 @@ export function createApp(cfg: Config): express.Express {
         const out = ingestNoopbak(req.body as Buffer, cfg, phoneTz);
         res.json(out);
       } catch (e) {
-        if (e instanceof IngestError) return res.status(400).json({ error: e.code });
+        // e.status, not a flat 400: `insufficient_space`/`storage_unavailable` are 507s so the phone
+        // reads them as "server has no room, keep the backup and retry later" rather than "this
+        // upload is malformed, discard it". `detail` carries the actual byte numbers.
+        if (e instanceof IngestError) {
+          if (e.status >= 500) console.error("ingest storage error", e.code, e.message);
+          return res.status(e.status).json({ error: e.code, ...(e.status >= 500 ? { detail: e.message } : {}) });
+        }
         console.error("ingest error", e);
         res.status(500).json({ error: "ingest_failed" });
+      }
+    });
+
+  // One line-aligned, raw-DEFLATE byte range of the phone's append-only deep-buffer log (#423).
+  // Its own body limit, NOT cfg.maxIngestBytes (which is 768 MB for the whole-DB /ingest) — a chunk is
+  // bounded at ~24 MB compressed and there is no reason to let this path allocate three orders of
+  // magnitude more than it can legitimately need.
+  app.post("/deepbuf", requireScope(cfg, "rw"),
+    express.raw({ type: "*/*", limit: cfg.maxDeepbufBytes }),
+    async (req, res) => {
+      // 503, never a Fly-volume fallback: ~600 MB/day of archive against ~547 MB free would take the
+      // whole server down with it (see src/objectstore.ts). Refusing loudly is the safe failure.
+      if (!objectStore) return res.status(503).json({ error: "storage_not_configured" });
+      try {
+        const headers = parseChunkHeaders({
+          generation: req.header("x-deepbuf-generation"),
+          byteStart: req.header("x-deepbuf-byte-start"),
+          byteEnd: req.header("x-deepbuf-byte-end"),
+          compression: req.header("x-deepbuf-compression"),
+        });
+        const out = await ingestDeepBufferChunk(req.body as Buffer, headers, cfg, objectStore, {
+          deviceId: req.header("x-deepbuf-device") ?? null,
+          phoneTz: normalizePhoneTz(req.header("x-phone-timezone")),
+        });
+        res.json(out);
+      } catch (e) {
+        if (e instanceof DeepBufError) return res.status(400).json({ error: e.code });
+        console.error("deepbuf error", e);
+        res.status(500).json({ error: "deepbuf_failed" });
       }
     });
 
