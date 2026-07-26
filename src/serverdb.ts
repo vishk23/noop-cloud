@@ -19,6 +19,26 @@ export function openServerDb(cfg: Pick<Config, "serverDbPath">): Database.Databa
     CREATE TABLE IF NOT EXISTS deviceToken (
       token TEXT PRIMARY KEY, platform TEXT NOT NULL, updatedAt INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS pushState (id INTEGER PRIMARY KEY CHECK (id = 1), lastPushAt INTEGER);
+    -- The deep-buffer archive's INDEX (#423). The payload itself lives in object storage (see
+    -- src/objectstore.ts — ~9 GB/month would destroy the ~547 MB Fly volume); this table is what makes
+    -- it queryable without fetching any of it back. One row per ~16 MB chunk is ~1100 rows/month, i.e.
+    -- kilobytes — the asymmetry that makes the split work.
+    --
+    -- UNIQUE(generation, byteStart) is load-bearing, not hygiene: it is exactly the phone's watermark
+    -- unit, so it makes a retried at-least-once upload a no-op instead of a duplicate row.
+    CREATE TABLE IF NOT EXISTS deepBufferChunk (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      generation TEXT NOT NULL, byteStart INTEGER NOT NULL, byteEnd INTEGER NOT NULL,
+      objectKey TEXT NOT NULL, deviceId TEXT,
+      storedBytes INTEGER NOT NULL, rawBytes INTEGER NOT NULL, lines INTEGER NOT NULL,
+      firstTsMs INTEGER, lastTsMs INTEGER, firstStrapTs INTEGER, lastStrapTs INTEGER,
+      n1244 INTEGER NOT NULL DEFAULT 0, n2140 INTEGER NOT NULL DEFAULT 0,
+      nOther INTEGER NOT NULL DEFAULT 0, nImu INTEGER NOT NULL DEFAULT 0,
+      nOffload INTEGER NOT NULL DEFAULT 0, badLines INTEGER NOT NULL DEFAULT 0,
+      receivedAt INTEGER NOT NULL, phoneTz TEXT,
+      UNIQUE (generation, byteStart));
+    -- Coverage/window queries range over strap_ts (the second the STRAP stamped), never over receivedAt.
+    CREATE INDEX IF NOT EXISTS deepBufferChunk_strap ON deepBufferChunk (firstStrapTs, lastStrapTs);
   `);
   const cols = db.prepare("PRAGMA table_info(editJournal)").all() as any[];
   if (!cols.some((c) => c.name === "ackedAt")) db.exec("ALTER TABLE editJournal ADD COLUMN ackedAt INTEGER");

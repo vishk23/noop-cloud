@@ -7,6 +7,7 @@ import { registerSearchFetch } from "./search-fetch.js";
 import { registerWriteTools } from "./writes.js";
 import { registerGranularTools } from "./granular.js";
 import { registerPushTools } from "./push.js";
+import { registerDeepBufferTools } from "./deepbuf.js";
 
 // "public" is the strict read-only surface served on the no-auth URL-secret route (POST /mcp/:secret):
 // pure reads only, so an anonymous caller (e.g. ChatGPT's "No Auth" connector, or anything that gets
@@ -18,6 +19,9 @@ export function registerTools(server: McpServer, cfg: Config, scope: "public" | 
   registerCompareSources(server, cfg); // compare_sources (Task 9)
   registerSearchFetch(server, cfg); // search + fetch (Task 10)
   registerGranularTools(server, cfg); // hr_series + sleep_detail (Phase 2b Task 1)
+  // deep_buffer_coverage + deep_buffer_window (#423). Strictly read-only over the raw-buffer archive,
+  // so safe on every scope including public; neither can mutate the mirror or the edit journal.
+  registerDeepBufferTools(server, cfg);
   if (scope !== "public") {
     registerWriteTools(server, cfg, scope); // propose_edit/list_pending/edit_journal (+ rw-only resolution tools) (Task 4/5)
     registerPushTools(server, cfg); // request_sync — pokes the phone; not for anonymous URL callers
