@@ -48,7 +48,7 @@ describe("requestSync (business logic, mirrors dataFreshness/healthSnapshot's di
     const send: SendFn = async () => { calls++; return { status: 200, body: "" }; };
 
     const first = await requestSync(cfg, send);
-    expect(first).toMatchObject({ pushed: 1, expectFreshWithinSec: 90, hint: "poll data_freshness until mirrorAgeSeconds resets" });
+    expect(first).toMatchObject({ devices: 1, pushed: 1, pruned: 0, expectFreshWithinSec: 90, hint: "poll data_freshness until mirrorAgeSeconds resets" });
     expect(Object.keys(first)).toContain("mirrorAgeSeconds");
     expect(calls).toBe(1);
 
@@ -57,6 +57,20 @@ describe("requestSync (business logic, mirrors dataFreshness/healthSnapshot's di
     expect(second.retryInSec).toBeGreaterThan(0);
     expect(second.retryInSec).toBeLessThanOrEqual(120);
     expect(calls).toBe(1); // throttled path never reaches the transport
+  });
+
+  // Regression (2026-07-26): a phone whose build lacked `aps-environment` never re-registered, so the
+  // registry held only a token from an earlier install. APNs accepted pushes to it (`pushed: 1`) and
+  // nothing synced — `pushed` alone cannot tell a live phone from a zombie token. Surfacing `pruned`
+  // (and the pre-push `devices` count) makes the dead-token case legible the moment APNs reports it.
+  it("surfaces the pruned count and re-registration hint when APNs reports the only token dead", async () => {
+    const cfg = baseCfg({ ...APNS_ENV, apnsKeyId: "KID-pruned" });
+    upsertDeviceToken(cfg, "2".repeat(64), "ios");
+    const send: SendFn = async () => ({ status: 410, body: JSON.stringify({ reason: "Unregistered", timestamp: 0 }) });
+
+    const r: any = await requestSync(cfg, send);
+    expect(r).toMatchObject({ devices: 1, pushed: 0, pruned: 1 });
+    expect(r.hint).toBe("every registered token was dead and has been dropped — open NOOP once so the phone re-registers");
   });
 });
 

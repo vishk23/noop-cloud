@@ -25,7 +25,7 @@ function mcpCall(port: number, token: string, body: object): Promise<{ status: n
 describe("/mcp", () => {
   it("401 without ro token", async () => {
     fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true });
-    const zip = path.join(dataDir, "b.noopbak"); buildNoopbak(zip); ingestNoopbak(fs.readFileSync(zip), cfg());
+    const zip = path.join(dataDir, "b.noopbak"); buildNoopbak(zip); await ingestNoopbak(fs.readFileSync(zip), cfg());
     const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;
     const { status } = await mcpCall(port, "wrong", { jsonrpc: "2.0", id: 1, method: "tools/list" });
     server.close(); expect(status).toBe(401);

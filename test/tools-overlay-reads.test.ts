@@ -12,9 +12,9 @@ const SLEEP_TS = Math.floor(new Date("2026-06-13T03:00:00Z").getTime() / 1000);
 const RUN_TS = Math.floor(new Date("2026-06-12T18:00:00Z").getTime() / 1000);
 const NEW_END = Math.floor(new Date("2026-06-13T06:00:00Z").getTime() / 1000);
 
-beforeAll(() => {
+beforeAll(async () => {
   fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true });
-  const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfg);
+  const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), cfg);
   appendJournal(cfg, { editId: "e_sleep", kind: "adjust_sleep_bounds", payloadJSON: JSON.stringify({ deviceId: "my-whoop", startTs: SLEEP_TS, newEndTs: NEW_END }), beforeJSON: null, rationale: null });
   appendJournal(cfg, { editId: "e_del", kind: "delete_workout", payloadJSON: JSON.stringify({ deviceId: "my-whoop", startTs: RUN_TS, sport: "running" }), beforeJSON: null, rationale: null });
   appendJournal(cfg, { editId: "e_add", kind: "add_workout", payloadJSON: JSON.stringify({ startTs: RUN_TS + 7200, endTs: RUN_TS + 9000, sport: "yoga" }), beforeJSON: null, rationale: null });

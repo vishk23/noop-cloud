@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import type { RequestHandler } from "express";
 import type { Config } from "./config.js";
 
-function safeEqual(a: string, b: string): boolean {
+export function safeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a), bb = Buffer.from(b);
   if (ab.length !== bb.length) return false;
   return crypto.timingSafeEqual(ab, bb);

@@ -21,9 +21,36 @@ export interface MetricPointRow { deviceId: string; family: Family; day: string;
 // activityClass is a nullable INTEGER enum (0=still, 1=walk, 2=run), added in a later migration.
 export interface StepSampleRow { deviceId: string; ts: number; counter: number; activityClass: number | null; }
 export interface GravitySampleRow { deviceId: string; ts: number; x: number; y: number; z: number; }
+// Per-second WHOOP skin-temperature register (WhoopStore `skinTempSample`, migration v3). `raw` is the
+// SCALE-AGNOSTIC register the historical decoder banks (WhoopProtocol `SkinTempSample`), NOT °C — the
+// raw→°C conversion is DEVICE-FAMILY-AWARE (5/MG raw/100 vs 4.0 affine, issue #938) and lives with
+// temp_series in tools/granular.ts, not here, so this reader stays lossless.
+export interface SkinTempSampleRow { deviceId: string; ts: number; raw: number; }
 export interface RRIntervalRow { deviceId: string; ts: number; rrMs: number; }
+// `soc` is PERCENT (0-100), not a 0-1 fraction — see batterySamplesRange below for the provenance.
+// All three value columns are nullable: the command-response battery path fills only what it read.
+// `charging` is SQLite BOOLEAN, i.e. an INTEGER 0/1 (or null) out of better-sqlite3 — battery_series
+// in tools/granular.ts is what normalizes it to a real boolean for callers.
+export interface BatterySampleRow { deviceId: string; ts: number; soc: number | null; mv: number | null; charging: number | null; }
+// The strap's own firmware event log (WhoopStore `event` table, migration v1). `kind` is NOT a bare
+// label — it is always "LABEL(opcode)" (e.g. "WRIST_ON(9)") for an event the protocol schema names, and
+// "0xNN(opcode)" (e.g. "0x6E(110)") for one it doesn't; see eventsRange below for the provenance.
+// `payloadJSON` is TEXT NOT NULL and is "{}" for almost every kind — device_events in tools/granular.ts
+// is what parses it and splits `kind` into label/opcode.
+export interface EventRow { deviceId: string; ts: number; kind: string; payloadJSON: string; }
+export interface EventKindCount { kind: string; n: number; firstTs: number; lastTs: number; }
 
 const withFamily = <T extends { deviceId: string }>(r: T) => ({ ...r, family: sourceFamily(r.deviceId) });
+
+// Match a caller-supplied kind either EXACTLY ("WRIST_ON(9)") or by its bare LABEL ("WRIST_ON"), so an
+// agent that never saw the "(opcode)" suffix can still filter. Deliberately substr/instr rather than
+// `kind LIKE ? || '('`: event labels are full of underscores (WRIST_ON, BLE_CONNECTION_UP) and `_` is a
+// LIKE single-char wildcard, so the LIKE form would quietly match neighbouring labels. Labels never
+// contain "(" (Schema.enumName builds them as name + "(" + v + ")"), so the first "(" is the split.
+function kindFilterSql(kinds: string[]): { sql: string; args: string[] } {
+  const clause = "(kind = ? OR (instr(kind, '(') > 0 AND substr(kind, 1, instr(kind, '(') - 1) = ?))";
+  return { sql: `(${kinds.map(() => clause).join(" OR ")})`, args: kinds.flatMap((k) => [k, k]) };
+}
 
 export class Mirror {
   private db: Database.Database;
@@ -143,12 +170,77 @@ export class Mirror {
   // buffer (WhoopStore `imuActivity` table). WHOOP 5/MG-only, and only present once that migration
   // shipped AND a deep-buffer capture ran — imu_series guards with hasTable("imuActivity") before
   // calling this, which assumes the table exists. cadenceHz is nullable (a still/bursty wrist).
+  // sampleCount is not selected: no caller reads it, and it holds the producer's OVERLAPPING
+  // trailing-window size rather than the second's own samples, so it is not a quantity to aggregate
+  // (see imuCoverageRange).
   imuActivityRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }):
-    { deviceId: string; ts: number; accelEnergyG: number; gyroEnergyDps: number; jerkRms: number; cadenceHz: number | null; cadenceStrength: number; sampleCount: number }[] {
+    { deviceId: string; ts: number; accelEnergyG: number; gyroEnergyDps: number; jerkRms: number; cadenceHz: number | null; cadenceStrength: number }[] {
     const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
     if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
     args.push(opts.limit);
-    return this.db.prepare(`SELECT deviceId, ts, accelEnergyG, gyroEnergyDps, jerkRms, cadenceHz, cadenceStrength, sampleCount FROM imuActivity WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+    return this.db.prepare(`SELECT deviceId, ts, accelEnergyG, gyroEnergyDps, jerkRms, cadenceHz, cadenceStrength FROM imuActivity WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+
+  // Per-second IMU rows reduced to a COVERAGE question ("do I have deep buffers at all, and when?")
+  // rather than the feature values imu_series buckets. Selects only what the session roll-up needs, so
+  // this stays cheap on a wide window: the whole point is that a caller can ask about months without
+  // pulling accel/gyro/jerk for every second. sampleCount is NOT among them, and adding it back would be
+  // a mistake rather than an omission: it carries the producer's OVERLAPPING trailing-window size, not
+  // the second's own samples, so a coverage roll-up has nothing honest to do with it (see imuCoverage).
+  // ORDER BY deviceId, ts — imuCoverage walks it in that order to cut sessions per device. Table-guarded
+  // like stepSamplesRange: opt-in 5/MG capture means plenty of real mirrors never carry it.
+  imuCoverageRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }):
+    { deviceId: string; ts: number; cadenceHz: number | null; accelEnergyG: number }[] {
+    if (!this.hasTable("imuActivity")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, cadenceHz, accelEnergyG FROM imuActivity WHERE ${where.join(" AND ")} ORDER BY deviceId, ts LIMIT ?`).all(...args) as any[];
+  }
+
+  // The full ts extent of imuActivity, ignoring any range — what a from/to-less imu_coverage call
+  // anchors on so "when do I have buffers at all?" needs no guessed window. Cheap: min/max over the
+  // (deviceId, ts) primary key.
+  imuActivityExtent(deviceId?: string): { firstTs: number; lastTs: number; n: number } | null {
+    if (!this.hasTable("imuActivity")) return null;
+    const where = deviceId ? "WHERE deviceId = ?" : "";
+    const args = deviceId ? [deviceId] : [];
+    const r = this.db.prepare(`SELECT MIN(ts) firstTs, MAX(ts) lastTs, COUNT(*) n FROM imuActivity ${where}`).get(...args) as any;
+    return r && r.n > 0 ? r : null;
+  }
+
+  // The strap's firmware event log over a range (WhoopStore `event` table). The rows are whatever the
+  // strap banked and the phone offloaded over BLE — WHOOP-only in practice: nothing on the cloud-import
+  // path (oura-api) writes here, so an events question about an Oura source is always empty.
+  //
+  // `kind` PROVENANCE, read off the producer rather than assumed: StreamStore.swift inserts e.kind
+  // verbatim, and that string comes from WhoopProtocol Schema.swift's `enumName`, which returns
+  // "\(name)(\(v))" when the schema names the opcode and String(format: "0x%02X(%d)", v, v) when it
+  // doesn't. So the opcode is ALWAYS present in parentheses, and a "0x6E(110)" kind means "the strap
+  // sent event 110 and our schema has no name for it" — real signal, not corruption.
+  //
+  // Columns are listed explicitly because migration v5 added a `synced` upload flag the cloud never
+  // surfaces. hasTable-guarded for the same reason as stepSamplesRange: a fixture or foreign mirror
+  // may not carry it.
+  eventsRange(opts: { fromTs: number; toTs: number; deviceId?: string; kinds?: string[]; limit: number }): EventRow[] {
+    if (!this.hasTable("event")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    if (opts.kinds?.length) { const f = kindFilterSql(opts.kinds); where.push(f.sql); args.push(...f.args); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, kind, payloadJSON FROM event WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+
+  // Per-kind counts over the SAME range/filters as eventsRange, aggregated in SQL rather than derived
+  // from the returned rows. That difference is load-bearing: eventsRange is capped, so counting the
+  // rows it hands back would under-report exactly when the window is busiest — the moment a caller most
+  // needs a true tally. This aggregate is never truncated.
+  eventKindCounts(opts: { fromTs: number; toTs: number; deviceId?: string; kinds?: string[] }): EventKindCount[] {
+    if (!this.hasTable("event")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    if (opts.kinds?.length) { const f = kindFilterSql(opts.kinds); where.push(f.sql); args.push(...f.args); }
+    return this.db.prepare(`SELECT kind, COUNT(*) n, MIN(ts) firstTs, MAX(ts) lastTs FROM event WHERE ${where.join(" AND ")} GROUP BY kind ORDER BY n DESC, kind`).all(...args) as any[];
   }
 
   // Real phone schema carries stepSample/gravitySample from CoreMotion, but any mirror ingested
@@ -177,6 +269,97 @@ export class Mirror {
     if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
     args.push(opts.limit);
     return this.db.prepare(`SELECT deviceId, ts, x, y, z FROM gravitySample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+
+  // Raw per-second skin-temperature register over a range (WhoopStore `skinTempSample`, migration v3).
+  // hasTable-guarded like the other opt-era sample readers: an upload from before v3 shipped won't
+  // carry it. `raw` passes through untouched (off-wrist/ambient reads included) — Default: capture and
+  // expose the stream losslessly; temp_series does the family-aware raw→°C and any wear interpretation.
+  skinTempSamplesRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }): SkinTempSampleRow[] {
+    if (!this.hasTable("skinTempSample")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, raw FROM skinTempSample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+  // Full ts extent of skinTempSample — the "how far back does per-second temp retain?" answer, which a
+  // 7-day-capped temp_series can't give. Cheap min/max over the (deviceId, ts) primary key.
+  skinTempExtent(deviceId?: string): { firstTs: number; lastTs: number; n: number } | null {
+    if (!this.hasTable("skinTempSample")) return null;
+    const where = deviceId ? "WHERE deviceId = ?" : "";
+    const args = deviceId ? [deviceId] : [];
+    const r = this.db.prepare(`SELECT MIN(ts) firstTs, MAX(ts) lastTs, COUNT(*) n FROM skinTempSample ${where}`).get(...args) as any;
+    return r && r.n > 0 ? r : null;
+  }
+  // deviceId → registry `model` label (pairedDevice), for temp_series' family-aware raw→°C conversion.
+  // Guarded (empty map on a mirror without the table) so conversion falls back to the 5/MG scale, which
+  // is exactly what DeviceFamily.forRegistryModel does for a nil/unknown model.
+  pairedDeviceModels(): Map<string, string | null> {
+    if (!this.hasTable("pairedDevice")) return new Map();
+    const rows = this.db.prepare("SELECT id, model FROM pairedDevice").all() as { id: string; model: string | null }[];
+    return new Map(rows.map((r) => [r.id, r.model]));
+  }
+
+  // The strap's OWN per-second band sleep-state (WhoopStore `sleepStateSample`, migration @81 high nibble,
+  // #175): `state` is 0=wake / 1=still / 2=asleep / 3=up — a coarse activity band, NOT the light/deep/rem
+  // hypnogram (that lives in sleepSession.stagesJSON, surfaced by sleep_detail). hasTable-guarded like the
+  // other opt-era streams. sleep_state_series does the labelling + run-length encoding.
+  sleepStateSamplesRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }): { deviceId: string; ts: number; state: number }[] {
+    if (!this.hasTable("sleepStateSample")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, state FROM sleepStateSample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+  }
+  sleepStateExtent(deviceId?: string): { firstTs: number; lastTs: number; n: number } | null {
+    if (!this.hasTable("sleepStateSample")) return null;
+    const where = deviceId ? "WHERE deviceId = ?" : "";
+    const args = deviceId ? [deviceId] : [];
+    const r = this.db.prepare(`SELECT MIN(ts) firstTs, MAX(ts) lastTs, COUNT(*) n FROM sleepStateSample ${where}`).get(...args) as any;
+    return r && r.n > 0 ? r : null;
+  }
+
+  // Per-table inventory of the whole mirror — row count, time span, and contributing deviceIds — for the
+  // `streams` discovery tool, so an agent can see WHAT raw streams exist and how much data each holds
+  // without reading the DB out of band. Table names come from sqlite_master (never user input), so
+  // interpolating them is safe; PRAGMA/aggregate can't be parameterised anyway. `timeCol` is whichever of
+  // ts/startTs/day the table carries (null for keyless tables); `first`/`last` are that column's min/max
+  // (epoch ints for ts/startTs, YYYY-MM-DD strings for day). COUNT(*)/DISTINCT scan, which is fine for an
+  // occasional meta-call but is why this isn't on a hot path.
+  streamInventory(): { table: string; rows: number; timeCol: string | null; first: number | string | null; last: number | string | null; deviceIds: string[] }[] {
+    const tables = (this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as { name: string }[]).map((r) => r.name);
+    const out: { table: string; rows: number; timeCol: string | null; first: number | string | null; last: number | string | null; deviceIds: string[] }[] = [];
+    for (const table of tables) {
+      const cols = (this.db.prepare(`PRAGMA table_info("${table}")`).all() as { name: string }[]).map((c) => c.name);
+      const timeCol = ["ts", "startTs", "day"].find((c) => cols.includes(c)) ?? null;
+      const rows = (this.db.prepare(`SELECT COUNT(*) n FROM "${table}"`).get() as any).n as number;
+      let first: number | string | null = null, last: number | string | null = null, deviceIds: string[] = [];
+      if (rows > 0 && timeCol) { const r = this.db.prepare(`SELECT MIN(${timeCol}) a, MAX(${timeCol}) b FROM "${table}"`).get() as any; first = r.a; last = r.b; }
+      if (rows > 0 && cols.includes("deviceId")) deviceIds = (this.db.prepare(`SELECT DISTINCT deviceId FROM "${table}"`).all() as any[]).map((r) => r.deviceId);
+      out.push({ table, rows, timeCol, first, last, deviceIds });
+    }
+    return out;
+  }
+
+  // The paired wearable's own battery telemetry, banked over BLE (WhoopStore `battery` table). UNITS,
+  // confirmed against the producer rather than assumed: `soc` is PERCENT (0-100) as a REAL, NOT a 0-1
+  // fraction — the WHOOP BATTERY_LEVEL decoder emits it as the wire word / 10 tagged "%" (Interpreter
+  // .swift's `battery_pct` @21 and PostHooks.swift's "soc@17(/10) mv@21 charge@26" region note in the
+  // NOOP app repo), the Oura BLE mapping stores `Double(v.percent)` (OuraStreamMapping.swift), and
+  // StrandAnalytics' BatteryEstimator documents its anchor as "the latest SoC ... in percent" with
+  // percent-scale constants (nearFullPct 90, chargeStepPct 1). That /10 means real readings carry one
+  // decimal (e.g. 82.5), so callers must not round to an int. `mv` is raw cell millivolts.
+  //
+  // Columns are named explicitly rather than SELECT * because migration v5 added a `synced` upload flag
+  // the cloud never surfaces. `charging` came in v6 and is assumed present — the app is long past it and
+  // every other reader here likewise assumes its era's columns — while hasTable() guards the table
+  // itself for the same reason stepSamplesRange does: a fixture or foreign mirror may not carry it.
+  batterySamplesRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }): BatterySampleRow[] {
+    if (!this.hasTable("battery")) return [];
+    const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
+    args.push(opts.limit);
+    return this.db.prepare(`SELECT deviceId, ts, soc, mv, charging FROM battery WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
   }
 
   // appleStepHour is populated by the iPhone-side hourly step import (NOOP commit d47525ea), written

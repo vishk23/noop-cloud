@@ -9,7 +9,7 @@ const dataDir = path.join(process.cwd(), "test/.tmp/edits-diff");
 const cfg = { dataDir, mirrorPath: path.join(dataDir, "mirror.sqlite"), serverDbPath: path.join(dataDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
 const RUN_TS = Math.floor(new Date("2026-06-12T18:00:00Z").getTime() / 1000); // fixture running workout
 
-beforeAll(() => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfg); });
+beforeAll(async () => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), cfg); });
 
 describe("edit kinds", () => {
   it("validates payloads per kind", () => {

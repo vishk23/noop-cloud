@@ -38,7 +38,27 @@ const HR_DETAIL_RAW_CAP = 250_000;
 // never silently dropped.
 const RR_RAW_CAP = 500_000;
 const round3 = (x: number) => Math.round(x * 1000) / 1000;
+const round2 = (x: number) => Math.round(x * 100) / 100;
 const round1 = (x: number) => Math.round(x * 10) / 10;
+
+// Family-aware raw skin-temp register → °C, ported from WhoopProtocol Streams.swift `skinTempCelsius`
+// (#938) + DeviceFamily.forRegistryModel (#171) — kept in lockstep with those. WHOOP 5/MG banks a
+// centidegree register so °C = raw/100 (PROVEN on real 5/MG captures: worn 3057 = 30.6 °C, off-wrist
+// 2247 = 22.5 °C). WHOOP 4.0 banks a raw ADC needing an affine map anchored at a worn resting value
+// (33.0 °C ↔ raw 826) with a PROVISIONAL 0.05 °C/raw slope — approximate in absolute terms but
+// directionally right, and the downstream skinTempDevC is a deviation from the user's OWN baseline so
+// the constant offset cancels. Only a positively-identified 4.0 model uses the 4.0 scale; every other
+// or legacy/unknown label ("5.0", bare "WHOOP", nil, non-WHOOP) keeps the 5/MG /100 fallback, exactly
+// as the Swift resolver does.
+const WHOOP4_TEMP_ANCHOR_RAW = 826, WHOOP4_TEMP_ANCHOR_C = 33.0, WHOOP4_TEMP_SLOPE_C_PER_RAW = 0.05;
+function tempFamilyForModel(model: string | null): "whoop4" | "whoop5" {
+  return model === "4.0" || model === "WHOOP 4.0" ? "whoop4" : "whoop5";
+}
+function skinTempCelsius(raw: number, family: "whoop4" | "whoop5"): number {
+  return family === "whoop4"
+    ? WHOOP4_TEMP_ANCHOR_C + (raw - WHOOP4_TEMP_ANCHOR_RAW) * WHOOP4_TEMP_SLOPE_C_PER_RAW
+    : raw / 100;
+}
 
 function dropDeleted(samples: { deviceId: string; ts: number; bpm: number }[], ranges: { deviceId: string; fromTs: number; toTs: number }[]) {
   if (!ranges.length) return samples;
@@ -405,6 +425,350 @@ export function imuSeries(cfg: Config, args: { from: string; to: string; deviceI
   } finally { m.close(); }
 }
 
+// temp_series: per-second skin temperature (WhoopStore `skinTempSample`, migration v3) over a range —
+// the raw stream the nightly `skinTempDevC` deviation is derived from on-device. Shaped like hrSeries
+// (raw by default, bucketed when bucketSeconds is passed) since the question is about level/curve.
+// Sensor is ~1 Hz, so a full night exceeds RAW_CAP → callers bucket. Conversion is FAMILY-AWARE
+// (skinTempCelsius above): `tempC` is the interpreted value, `raw` is always carried so nothing is
+// lost and a caller can re-derive. `dataExtent` reports the table's full ts span (the retention
+// answer). notCaptured means no skinTempSample table (an upload from before migration v3).
+export function tempSeries(cfg: Config, args: { from: string; to: string; deviceId?: string; bucketSeconds?: number }) {
+  if (!fs.existsSync(cfg.mirrorPath)) return { samples: [], notIngested: true };
+  const fromTs = toTs(args.from), toT = toTs(args.to, true);
+  if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
+  if (toT - fromTs > MAX_SPAN_S) return { error: "span_too_wide", maxDays: 7 };
+  const m = new Mirror(cfg.mirrorPath);
+  try {
+    if (!m.hasTable("skinTempSample")) {
+      return { samples: [], notCaptured: true, hint: "no per-second skin temperature — the uploading build predates the skinTempSample table (WhoopStore migration v3)" };
+    }
+    const models = m.pairedDeviceModels();
+    const cOf = (deviceId: string, raw: number) => skinTempCelsius(raw, tempFamilyForModel(models.get(deviceId) ?? null));
+    const raw = m.skinTempSamplesRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: SERIES_CAP });
+    const extent = m.skinTempExtent(args.deviceId);
+    const dataExtent = extent ? { firstTs: extent.firstTs, lastTs: extent.lastTs, n: extent.n } : undefined;
+    if (args.bucketSeconds) {
+      const b = Math.min(3600, Math.max(60, args.bucketSeconds));
+      const byBucket = new Map<string, { ts: number; deviceId: string; sumC: number; minC: number; maxC: number; sumRaw: number; n: number }>();
+      for (const s of raw) {
+        const c = cOf(s.deviceId, s.raw);
+        const bt = Math.floor(s.ts / b) * b;
+        const key = `${s.deviceId}|${bt}`;
+        const cur = byBucket.get(key) ?? { ts: bt, deviceId: s.deviceId, sumC: 0, minC: c, maxC: c, sumRaw: 0, n: 0 };
+        cur.sumC += c; cur.minC = Math.min(cur.minC, c); cur.maxC = Math.max(cur.maxC, c); cur.sumRaw += s.raw; cur.n += 1;
+        byBucket.set(key, cur);
+      }
+      const buckets = [...byBucket.values()].sort((a, c) => a.ts - c.ts || a.deviceId.localeCompare(c.deviceId))
+        .map((x) => ({ ts: x.ts, deviceId: x.deviceId, family: sourceFamily(x.deviceId), avgC: round2(x.sumC / x.n), minC: round2(x.minC), maxC: round2(x.maxC), avgRaw: round1(x.sumRaw / x.n), n: x.n }));
+      return { buckets, ...(dataExtent ? { dataExtent } : {}), ...(raw.length === SERIES_CAP ? { truncated: true, hint: "narrow the from/to window" } : {}) };
+    }
+    const capped = raw.slice(0, RAW_CAP);
+    return {
+      samples: capped.map((s) => ({ deviceId: s.deviceId, ts: s.ts, raw: s.raw, tempC: round2(cOf(s.deviceId, s.raw)), family: sourceFamily(s.deviceId) })),
+      ...(dataExtent ? { dataExtent } : {}),
+      ...(raw.length > RAW_CAP ? { truncated: true, hint: "per-second temp is ~1 Hz, so a night exceeds the raw cap — pass bucketSeconds to aggregate" } : {}),
+    };
+  } finally { m.close(); }
+}
+
+// sleep_state_series: the strap's OWN per-second band sleep-state (WhoopStore `sleepStateSample`, @81
+// high nibble, #175), run-length-encoded into a state timeline. state 0=wake / 1=still / 2=asleep /
+// 3=up — a COARSE activity/wear band the strap reports itself, NOT the light/deep/rem sleep architecture
+// (that is NOOP's own analytics staging in sleepSession.stagesJSON, surfaced by sleep_detail). Distinct
+// signal, useful for cross-checking staging vs the strap's raw opinion. A gap longer than gapSeconds
+// (default 120) ENDS a segment rather than bridging a data hole, so off-wrist stretches read as breaks,
+// not invented state.
+const SLEEP_STATE_LABELS: Record<number, string> = { 0: "wake", 1: "still", 2: "asleep", 3: "up" };
+export function sleepStateSeries(cfg: Config, args: { from: string; to: string; deviceId?: string; gapSeconds?: number }) {
+  if (!fs.existsSync(cfg.mirrorPath)) return { segments: [], notIngested: true };
+  const fromTs = toTs(args.from), toT = toTs(args.to, true);
+  if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
+  if (toT - fromTs > MAX_SPAN_S) return { error: "span_too_wide", maxDays: 7 };
+  const gap = Math.min(3600, Math.max(1, args.gapSeconds ?? 120));
+  const m = new Mirror(cfg.mirrorPath);
+  try {
+    if (!m.hasTable("sleepStateSample")) {
+      return { segments: [], notCaptured: true, hint: "no band sleep-state — the uploading build predates the sleepStateSample stream" };
+    }
+    const rows = m.sleepStateSamplesRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: SERIES_CAP });
+    const extent = m.sleepStateExtent(args.deviceId);
+    const dataExtent = extent ? { firstTs: extent.firstTs, lastTs: extent.lastTs, n: extent.n } : undefined;
+    type Seg = { state: number; label: string; deviceId: string; startTs: number; endTs: number };
+    const segs: Seg[] = [];
+    let cur: Seg | null = null;
+    for (const r of rows) {
+      const label = SLEEP_STATE_LABELS[r.state] ?? `state_${r.state}`;
+      if (cur && cur.state === r.state && cur.deviceId === r.deviceId && r.ts - cur.endTs <= gap) {
+        cur.endTs = r.ts;
+      } else {
+        if (cur) segs.push(cur);
+        cur = { state: r.state, label, deviceId: r.deviceId, startTs: r.ts, endTs: r.ts };
+      }
+    }
+    if (cur) segs.push(cur);
+    const totals: Record<string, number> = {};
+    for (const s of segs) totals[s.label] = (totals[s.label] ?? 0) + (s.endTs - s.startTs);
+    const iso = (t: number) => new Date(t * 1000).toISOString();
+    const segments = segs.map((s) => ({ state: s.state, label: s.label, deviceId: s.deviceId, family: sourceFamily(s.deviceId), startTs: s.startTs, endTs: s.endTs, startIso: iso(s.startTs), endIso: iso(s.endTs), durationS: s.endTs - s.startTs }));
+    return { segments, totals, sampleCount: rows.length, ...(dataExtent ? { dataExtent } : {}), ...(rows.length === SERIES_CAP ? { truncated: true, hint: "narrow the from/to window" } : {}) };
+  } finally { m.close(); }
+}
+
+// battery_series: the paired strap's own battery telemetry (WhoopStore `battery` table) over a range.
+// Shaped like hrSeries (raw by default, bucketed only when asked) rather than the always-bucketed
+// motion/imu/hrv tools on purpose: the question this exists to answer — "when did it die / start
+// charging?" — is about TRANSITIONS, and a bucket average blurs the exact edge the caller wants.
+//
+// soc is PERCENT (0-100) with one real decimal, mv is cell millivolts — see batterySamplesRange in
+// src/mirror.ts for the provenance of that (it is confirmed against the app-side producer, not assumed).
+//
+// soc, mv and charging are ALL nullable columns, so nulls pass through as null and are SKIPPED by the
+// bucket aggregates rather than coerced to 0 — a 0 here would read as "flat battery", which is exactly
+// the false alarm this tool exists to resolve. charging in particular is null on the whole
+// command-response path (only the dense BATTERY_LEVEL-event path reports it, WhoopStore migration v6),
+// so null means UNKNOWN, never "not charging".
+const asBool = (v: number | null | undefined) => (v == null ? null : !!v);
+
+export function batterySeries(cfg: Config, args: { from: string; to: string; deviceId?: string; bucketSeconds?: number }) {
+  // Mode-appropriate empty payload, so a bucketSeconds caller isn't handed a `samples` key (and vice
+  // versa) on the no-data paths below.
+  const empty = args.bucketSeconds ? { buckets: [] as unknown[] } : { samples: [] as unknown[] };
+  if (!fs.existsSync(cfg.mirrorPath)) return { ...empty, notIngested: true };
+  const fromTs = toTs(args.from), toT = toTs(args.to, true);
+  if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
+  if (toT - fromTs > MAX_SPAN_S) return { error: "span_too_wide", maxDays: 7 };
+  const m = new Mirror(cfg.mirrorPath);
+  try {
+    const raw = m.batterySamplesRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: SERIES_CAP });
+    // Zero readings is a RESULT, not an error, and it's the tool's most diagnostic answer — the strap
+    // reported nothing across the whole window. Say so instead of returning an empty series a caller
+    // could read as "battery fine". Covers both a mirror with no battery table at all (older/foreign
+    // upload — batterySamplesRange returns [] for that) and a real table with nothing in range.
+    if (raw.length === 0) {
+      return { ...empty, notCaptured: true, hint: "no battery readings in range — the strap reported none: dead, off wrist, unpaired, or out of BLE range for the whole window (or the phone never synced it). Absence is evidence, not an error: call data_freshness to tell 'strap was silent' from 'phone hasn't uploaded'." };
+    }
+    const last = raw[raw.length - 1];
+    // The most recent reading INSIDE [from,to] — deliberately not called "current": the mirror only
+    // holds what the phone last uploaded. Carries its own deviceId so it stays unambiguous on a
+    // multi-strap mirror.
+    const latest = { ts: last.ts, deviceId: last.deviceId, family: sourceFamily(last.deviceId), soc: last.soc, mv: last.mv, charging: asBool(last.charging) };
+    // Landing exactly on the cap means the read was clipped — later readings in the range may be gone.
+    const truncated = raw.length === SERIES_CAP ? { truncated: true, hint: "narrow the from/to window" } : {};
+    if (args.bucketSeconds) {
+      const b = Math.min(3600, Math.max(60, args.bucketSeconds));
+      type Cell = { ts: number; deviceId: string; socs: number[]; mvs: number[]; chargingTrue: number; chargingKnown: number; n: number };
+      const byBucket = new Map<string, Cell>();
+      for (const r of raw) {
+        const bucketTs = Math.floor(r.ts / b) * b;
+        const key = `${r.deviceId}|${bucketTs}`;
+        let c = byBucket.get(key);
+        if (!c) { c = { ts: bucketTs, deviceId: r.deviceId, socs: [], mvs: [], chargingTrue: 0, chargingKnown: 0, n: 0 }; byBucket.set(key, c); }
+        if (r.soc != null) c.socs.push(r.soc);
+        if (r.mv != null) c.mvs.push(r.mv);
+        if (r.charging != null) { c.chargingKnown += 1; if (r.charging) c.chargingTrue += 1; }
+        c.n += 1;
+      }
+      // raw is ORDER BY ts, so per-bucket push order is time order: [0] is first, at() is last.
+      const buckets = [...byBucket.values()]
+        .sort((a, c) => a.ts - c.ts || a.deviceId.localeCompare(c.deviceId))
+        .map((c) => ({
+          ts: c.ts, deviceId: c.deviceId, family: sourceFamily(c.deviceId),
+          // first/last carry the DIRECTION within the bucket (falling = discharge, rising = charge);
+          // null only when every reading in the bucket had a null soc.
+          socFirst: c.socs.length ? c.socs[0] : null,
+          socLast: c.socs.length ? c.socs[c.socs.length - 1] : null,
+          socMin: c.socs.length ? Math.min(...c.socs) : null,
+          socMax: c.socs.length ? Math.max(...c.socs) : null,
+          mvLast: c.mvs.length ? c.mvs[c.mvs.length - 1] : null,
+          // Three-state, honouring the nullability above: true if ANY reading in the bucket reported
+          // charging, false if every reporting reading said no, null if NONE reported (unknown).
+          charging: c.chargingKnown === 0 ? null : c.chargingTrue > 0,
+          n: c.n,
+        }));
+      return { buckets, latest, ...truncated };
+    }
+    // Even decimation, not a head slice: past the cap a head slice would return the START of the window
+    // and silently drop the tail — i.e. exactly the moment the battery died. Same correction (and the
+    // same helper) as sleepDetail's hrDuringSleep read; see HR_DETAIL_RAW_CAP above for the live
+    // investigation that one misled. In practice battery readings are far too sparse to reach this.
+    const dec = decimateEvenly(raw, RAW_CAP);
+    return {
+      samples: dec.rows.map((r) => ({ ts: r.ts, deviceId: r.deviceId, family: sourceFamily(r.deviceId), soc: r.soc, mv: r.mv, charging: asBool(r.charging) })),
+      latest,
+      ...(dec.decimated ? { decimated: true, stride: dec.stride, totalSamples: dec.total, hint: "evenly thinned across the window — exact transition timing may be lost; narrow the range for it" } : {}),
+      ...truncated,
+    };
+  } finally { m.close(); }
+}
+
+// device_events: the STRAP's own firmware event log (WhoopStore `event` table) over a range — the
+// wear/charge/boot/connection transitions the strap itself reported, as opposed to anything the phone
+// or the analytics inferred. This is the DB-backed half of "is my strap healthy and capturing?".
+//
+// `kind` is always "LABEL(opcode)" or "0xNN(opcode)" — never a bare label; see eventsRange in
+// src/mirror.ts for the provenance (WhoopProtocol Schema.enumName builds it). Rather than make callers
+// carry that quirk, each event is returned with `kind` verbatim PLUS a parsed `label` and `opcode`, and
+// the `kinds` filter accepts either spelling.
+const KIND_RE = /^(.*)\((\d+)\)$/;
+function splitKind(kind: string): { label: string; opcode: number | null } {
+  // Greedy (.*) so the split is on the LAST "(", which is the opcode group Schema.enumName appends.
+  const m = KIND_RE.exec(kind);
+  return m ? { label: m[1], opcode: Number(m[2]) } : { label: kind, opcode: null };
+}
+// payloadJSON is TEXT NOT NULL and is "{}" for all but one kind on a real mirror (of VK's 11 457 live
+// rows only BATTERY_LEVEL(3) carries fields), so an always-present `payload: {}` would be pure noise on
+// thousands of rows. Omit it when empty; keep it verbatim when it isn't. A payload that won't parse is
+// surfaced as payloadRaw rather than dropped or guessed at.
+function parsePayload(json: string): { payload?: unknown; payloadRaw?: string } {
+  if (!json || json === "{}") return {};
+  try {
+    const p = JSON.parse(json);
+    if (p && typeof p === "object" && !Array.isArray(p) && Object.keys(p).length === 0) return {};
+    return { payload: p };
+  } catch { return { payloadRaw: json }; }
+}
+
+export function deviceEvents(cfg: Config, args: { from: string; to: string; deviceId?: string; kinds?: string[]; countsOnly?: boolean }) {
+  const empty = { counts: [] as unknown[], ...(args.countsOnly ? {} : { events: [] as unknown[] }) };
+  if (!fs.existsSync(cfg.mirrorPath)) return { ...empty, notIngested: true };
+  const fromTs = toTs(args.from), toT = toTs(args.to, true);
+  if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
+  if (toT - fromTs > MAX_SPAN_S) return { error: "span_too_wide", maxDays: 7 };
+  const m = new Mirror(cfg.mirrorPath);
+  try {
+    // Counts first and from their own SQL aggregate: they stay TRUE even when the event read below is
+    // capped (see eventKindCounts in src/mirror.ts).
+    const counts = m.eventKindCounts({ fromTs, toTs: toT, deviceId: args.deviceId, kinds: args.kinds })
+      .map((c) => ({ kind: c.kind, ...splitKind(c.kind), n: c.n, firstTs: c.firstTs, lastTs: c.lastTs }));
+    if (counts.length === 0) {
+      // Zero events is a RESULT and a diagnostic one: the strap reported nothing across the window.
+      // Covers a mirror with no `event` table (older/foreign upload), a real table with nothing in
+      // range, and a `kinds` filter that matched nothing — the hint names all three so a caller can
+      // tell "strap was silent" from "I filtered myself to nothing".
+      return { ...empty, notCaptured: true, hint: "no strap events in range — either the strap reported none (unpaired, dead, off wrist, or out of BLE range for the whole window, or the phone never synced), or `kinds` filtered everything out. Cloud-imported sources (oura-api) NEVER write events, so an events question about one is always empty. Call data_freshness to tell 'strap was silent' from 'phone hasn't uploaded'." };
+    }
+    if (args.countsOnly) return { counts };
+    const rows = m.eventsRange({ fromTs, toTs: toT, deviceId: args.deviceId, kinds: args.kinds, limit: RAW_CAP });
+    const events = rows.map((r) => ({ ts: r.ts, deviceId: r.deviceId, family: sourceFamily(r.deviceId), kind: r.kind, ...splitKind(r.kind), ...parsePayload(r.payloadJSON) }));
+    const last = rows[rows.length - 1];
+    const latest = { ts: last.ts, deviceId: last.deviceId, family: sourceFamily(last.deviceId), kind: last.kind, ...splitKind(last.kind) };
+    // Head-slice + a loud flag, NOT battery_series' even decimation: an event log is discrete, and
+    // thinning it would drop whole one-off kinds — the BOOT or RTC_LOST a caller is hunting is exactly
+    // the row a stride would skip. `counts` above already tells the truth about the whole range, so the
+    // honest shape is a contiguous prefix plus "there are more".
+    const truncated = rows.length === RAW_CAP
+      ? { truncated: true, hint: "only the first 5000 events in range are listed — `counts` is still complete for the whole window; narrow from/to or pass `kinds` to see the rest" }
+      : {};
+    return { counts, events, latest, ...truncated };
+  } finally { m.close(); }
+}
+
+// imu_coverage: WHERE the deep IMU buffers exist, not what they say — the availability question
+// imu_series can't answer without blind-scanning ranges. Answers "did my overnight capture actually
+// work?" in one call, and with from/to omitted, "do I have ANY deep buffers, ever?".
+//
+// Rows in imuActivity are ONE PER SECOND (WhoopStore ImuActivityStore.swift: "One second's worth of
+// IMU-derived activity features", and the live mirror agrees — 2941 of 2944 adjacent gaps are exactly
+// 1 s). That is what makes a row count meaningful as `seconds` and coverage a real ratio rather than a
+// guess.
+//
+// Reported as contiguous SESSIONS rather than per-day buckets on purpose: a capture run is the natural
+// unit of "did it work", and sessions are timezone-independent — a UTC-day roll-up would split an
+// overnight at a boundary that means nothing to the wearer (and the phone's tz is per-day metadata this
+// table has no claim on).
+const IMU_COVERAGE_MAX_SPAN_S = 366 * 86_400;
+const IMU_COVERAGE_CAP = 1_000_000;
+
+export function imuCoverage(cfg: Config, args: { from?: string; to?: string; deviceId?: string; gapSeconds?: number }) {
+  if (!fs.existsSync(cfg.mirrorPath)) return { sessions: [], notIngested: true };
+  const m = new Mirror(cfg.mirrorPath);
+  try {
+    if (!m.hasTable("imuActivity")) {
+      return { sessions: [], notCaptured: true, hint: "no imuActivity table — this mirror predates the WhoopStore v28-imu-activity migration, so the phone build that uploaded it could not record deep IMU buffers at all. Needs a WHOOP 5/MG on a build carrying that migration, with the deep-buffer capture toggle on." };
+    }
+    // With no window, anchor on the table's own extent: "do I have buffers at all?" shouldn't require
+    // guessing a range — which is the exact blind-scanning this tool exists to remove.
+    const extent = m.imuActivityExtent(args.deviceId);
+    if (!extent) {
+      return { sessions: [], notCaptured: true, hint: "imuActivity table exists but is EMPTY — the build supports deep IMU capture and no buffer was ever banked: the capture toggle was off, the strap is a WHOOP 4.0 (5/MG-only feature), or no offload burst has been decoded yet." };
+    }
+    const fromTs = args.from ? toTs(args.from) : extent.firstTs;
+    const toT = args.to ? toTs(args.to, true) : extent.lastTs;
+    if (!Number.isFinite(fromTs) || !Number.isFinite(toT)) return { error: "bad_range" };
+    // A far wider cap than the 7-day series tools: this reads four narrow columns and returns one row
+    // per capture RUN, so "have I ever captured anything?" over a year is a fair question here in a way
+    // it isn't for hr_series. Still bounded — an unbounded window is a mistake, not a feature.
+    if (toT - fromTs > IMU_COVERAGE_MAX_SPAN_S) return { error: "span_too_wide", maxDays: 366 };
+    // A gap longer than this ENDS a session. Default 60 s: deep capture lands one row per second, so a
+    // minute of silence is a real dropout, not jitter — reporting two honest runs beats one run with an
+    // invented hole bridged across it.
+    const gap = Math.min(86_400, Math.max(1, args.gapSeconds ?? 60));
+    const rows = m.imuCoverageRange({ fromTs, toTs: toT, deviceId: args.deviceId, limit: IMU_COVERAGE_CAP });
+    if (rows.length === 0) {
+      return { sessions: [], notCaptured: true, window: { fromTs, toTs: toT }, dataExtent: { firstTs: extent.firstTs, lastTs: extent.lastTs, seconds: extent.n }, hint: "no IMU buffers in THIS range, though the mirror holds some elsewhere — see dataExtent for where they actually are, or call with no from/to to see every capture run." };
+    }
+    type S = { deviceId: string; startTs: number; endTs: number; seconds: number; rhythmic: number; accelPeak: number; gaps: number; largestGap: number };
+    const sessions: S[] = [];
+    let cur: S | null = null;
+    // rows are ORDER BY deviceId, ts — so a device change starts a new session as surely as a time gap.
+    for (const r of rows) {
+      if (!cur || cur.deviceId !== r.deviceId || r.ts - cur.endTs > gap) {
+        cur = { deviceId: r.deviceId, startTs: r.ts, endTs: r.ts, seconds: 0, rhythmic: 0, accelPeak: 0, gaps: 0, largestGap: 0 };
+        sessions.push(cur);
+      } else {
+        // An internal hole: adjacent rows should be 1 s apart, so anything more is missing seconds
+        // (but <= gap, or the branch above would have cut a new session).
+        const missing = r.ts - cur.endTs - 1;
+        if (missing > 0) { cur.gaps += 1; cur.largestGap = Math.max(cur.largestGap, missing); }
+      }
+      cur.endTs = r.ts; cur.seconds += 1;
+      if (r.cadenceHz != null) cur.rhythmic += 1;
+      cur.accelPeak = Math.max(cur.accelPeak, r.accelEnergyG);
+    }
+    const out = sessions.map((s) => {
+      const spanSeconds = s.endTs - s.startTs + 1;
+      return {
+        deviceId: s.deviceId, family: sourceFamily(s.deviceId),
+        startTs: s.startTs, endTs: s.endTs,
+        // ISO alongside the epoch ts (UTC, like every timestamp in the mirror) — this is an
+        // observability tool, and "when did my capture run" shouldn't need a second conversion step.
+        start: new Date(s.startTs * 1000).toISOString(), end: new Date(s.endTs * 1000).toISOString(),
+        seconds: s.seconds, spanSeconds,
+        // The headline: seconds banked vs seconds the run spans. < 1 means the capture dropped rows
+        // mid-run, which is the failure this tool exists to make visible — so ONLY a genuinely gapless
+        // run may report exactly 1. Rounding is clamped rather than trusted: VK's live 2175/2176-second
+        // run computes 0.99954, which round3 would hand back as a clean 1.0 while missingSeconds said 1
+        // — defeating the `coverage < 1` check this tool's own description tells callers to make.
+        coverage: s.seconds === spanSeconds ? 1 : Math.min(round3(s.seconds / spanSeconds), 0.999),
+        missingSeconds: spanSeconds - s.seconds,
+        gaps: s.gaps, largestGapSeconds: s.largestGap,
+        rhythmicSeconds: s.rhythmic,
+        // NO sample count here, deliberately — and imuCoverageRange doesn't even read the column. The
+        // producer computes each row's features over a TRAILING window of up to 6 contiguous 1-second
+        // buffers and stores THAT WINDOW's total in sampleCount, so adjacent rows re-count the same raw
+        // samples: a steady 100 Hz run reads 100,200,300,400,500,600,600,… and resets to 100 after any
+        // hole. Summing it inflates ~6x — a 100-second run banks 10 000 samples but sums to 58 500.
+        // seconds*sampleRateHz can't stand in either: the mirror never stores the rate, so that number
+        // would be invented rather than measured — the same sin as the rounded-up coverage above.
+        // `seconds` IS the honest volume answer; imu_series reads the buffers themselves.
+        accelEnergyPeakG: round3(s.accelPeak),
+      };
+    });
+    const totalSeconds = out.reduce((a, s) => a + s.seconds, 0);
+    return {
+      sessions: out,
+      totals: {
+        sessions: out.length, seconds: totalSeconds,
+        firstTs: out[0].startTs, lastTs: out[out.length - 1].endTs,
+        days: new Set(rows.map((r) => new Date(r.ts * 1000).toISOString().slice(0, 10))).size,
+      },
+      window: { fromTs, toTs: toT },
+      dataExtent: { firstTs: extent.firstTs, lastTs: extent.lastTs, seconds: extent.n },
+      ...(rows.length === IMU_COVERAGE_CAP ? { truncated: true, hint: "hit the 1000000-second read cap — later sessions in the range may be missing; narrow from/to" } : {}),
+    };
+  } finally { m.close(); }
+}
+
 export function registerGranularTools(server: McpServer, cfg: Config): void {
   server.registerTool("hr_series", {
     title: "Heart-rate series",
@@ -440,4 +804,47 @@ export function registerGranularTools(server: McpServer, cfg: Config): void {
     inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(imuSeries(cfg, a)));
+
+  server.registerTool("temp_series", {
+    title: "Skin-temperature series (per-second)",
+    description: "Per-second skin temperature in °C for a time range (max 7 days) — the raw sensor stream the nightly `skinTempDevC` deviation is derived from on-device, so this is the tool for INTRA-NIGHT temperature (when in the night you ran warm) that the one-value-per-night dailyMetric can't show. WHOOP-only (skinTempSample, WhoopStore migration v3): cloud-imported sources (oura-api) never carry it. Conversion is DEVICE-FAMILY-AWARE — WHOOP 5/MG is a proven raw/100 centidegree register; WHOOP 4.0 uses a PROVISIONAL affine map (absolute °C approximate but directionally right, issue #938) — and each sample carries both the interpreted `tempC` and the untouched `raw`. Raw by default (capped at 5000 samples), or per-bucket when bucketSeconds is passed: per bucket avgC/minC/maxC (°C), avgRaw, n. Because the sensor is ~1 Hz a full night exceeds the raw cap, so pass bucketSeconds (e.g. 300–900) for an overnight overview and raw only for a tight window. `raw` PASSES THROUGH LOSSLESSLY including off-wrist/ambient reads (worn skin is ~30–35 °C; a plunge toward low-20s °C is the strap coming off the wrist, not a fever breaking) — this tool does no wear-gating, unlike the nightly rollup. `dataExtent` (firstTs/lastTs/n over the whole table) answers 'how far back does per-second temp retain?'. notCaptured:true means the uploading build predates skinTempSample. This is ABSOLUTE skin temp; for the baseline-relative nightly number use skinTempDevC via health_snapshot/compare_sources.",
+    inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async (a) => asTool(tempSeries(cfg, a)));
+
+  server.registerTool("sleep_state_series", {
+    title: "Band sleep-state series (strap's own)",
+    description: "The STRAP's OWN per-second band sleep-state for a time range (max 7 days), run-length-encoded into a timeline of segments. state 0=wake / 1=still / 2=asleep / 3=up — this is a COARSE activity/wear band the WHOOP strap reports about itself (WhoopStore sleepStateSample, @81 high nibble, #175). IT IS NOT SLEEP ARCHITECTURE: there is no light/deep/REM here — for the staged hypnogram use sleep_detail (which reads NOOP's own analytics staging). The value of this tool is exactly that it's the strap's RAW opinion, independent of NOOP's scoring, so it's the cross-check for a disputed night (does the strap agree we were asleep when the analytics said awake?). WHOOP-only. Each segment: state + label, startTs/endTs (+ISO), durationS; `totals` gives seconds in each band; `dataExtent` is the stream's full retention span. A silence longer than gapSeconds (default 120) ends a segment rather than bridging it, so off-wrist holes show as breaks, not invented state. notCaptured:true means the uploading build predates the stream.",
+    inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), gapSeconds: z.number().int().min(1).max(3600).optional().describe("A silence longer than this ends a segment (default 120).") },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async (a) => asTool(sleepStateSeries(cfg, a)));
+
+  server.registerTool("battery_series", {
+    title: "Strap battery series (state-of-charge)",
+    description: "The STRAP's own battery for a time range (max 7 days) — raw readings, or per-bucket when bucketSeconds is passed. This is the paired wearable's battery reported over BLE (in practice the WHOOP strap), never the phone's; cloud-imported sources (oura-api) never carry it. soc is PERCENT 0-100 (a real with one decimal, e.g. 82.5 — the strap reports tenths), mv is raw cell millivolts. Answers 'how much battery is left' via `latest`, the most recent reading INSIDE the range — NOT necessarily now, since the mirror only holds what the phone last uploaded, so pair it with data_freshness — and 'when did it die / start charging' by scanning soc for the fall to ~0 or the rise. An ABSENT or FLAT series is the real diagnostic signal, not a bug: notCaptured:true means zero readings in range, i.e. the strap wasn't reporting at all (dead, off wrist, unpaired, or out of BLE range), and a series that simply stops mid-range dates the moment it went quiet. charging is NULLABLE and frequently null: only the dense BATTERY_LEVEL-event path reports it, while the command-response path leaves it null — so charging:null means UNKNOWN, never 'not charging'; infer a charge from rising soc instead. soc/mv are nullable too and pass through as null, never 0. Per bucket: socFirst/socLast (the direction within that bucket), socMin/socMax, mvLast, n, and charging as three-state (true if any reading in the bucket reported charging, false if every reporting reading said no, null if none reported). decimated:true means over 5000 raw readings were evenly thinned across the window, so exact transition timing may be lost — narrow the range to recover it.",
+    inputSchema: { from: z.string(), to: z.string(), deviceId: z.string().optional(), bucketSeconds: z.number().int().min(60).max(3600).optional() },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async (a) => asTool(batterySeries(cfg, a)));
+
+  server.registerTool("device_events", {
+    title: "Strap firmware event log",
+    description: "What the STRAP itself reported for a time range (max 7 days) — the wear/charge/boot/connection log, not anything the phone or the analytics inferred. This is the strap-health tool: WRIST_ON/WRIST_OFF (was it actually worn), CHARGING_ON/CHARGING_OFF and BATTERY_PACK_CONNECTED/REMOVED (on the charger), BLE_CONNECTION_UP/DOWN (was the phone in range to collect), BOOT / BLE_SYSTEM_RESET / RTC_LOST / FLASH_INIT_COMPLETE (the strap rebooted or lost its clock — a prime suspect for missing or mis-timed data), STRAP_CONDITION_REPORT, DOUBLE_TAP, HAPTICS_FIRED. WHOOP-ONLY: cloud-imported sources (oura-api) never write events, so asking about one always returns notCaptured. `kind` is always 'LABEL(opcode)' (e.g. 'WRIST_ON(9)') for events the protocol schema names and '0xNN(opcode)' (e.g. '0x6E(110)') for ones it doesn't — an 0xNN kind is a REAL event whose meaning is simply undecoded, not corruption, and on a live WHOOP 5 these are among the most common. Each event carries `kind` verbatim plus parsed `label` and `opcode`, and the `kinds` filter accepts EITHER spelling ('WRIST_ON' or 'WRIST_ON(9)'). `counts` (per kind, with firstTs/lastTs) is aggregated in SQL over the WHOLE range and is always complete even when the event list is capped — call with countsOnly:true for a cheap 'what happened' glance. PAYLOADS ARE ALMOST ALWAYS EMPTY: payloadJSON is '{}' for every kind except BATTERY_LEVEL(3) (which carries battery_pct/battery_mV/battery_charging), so the `payload` key is OMITTED rather than returned as {} — an event here is usually a bare timestamped fact, and its `kind` is the whole message. Use battery_series for state-of-charge over time; this is for transitions and faults. notCaptured:true means zero events in range — the strap was silent (unpaired, dead, off wrist, out of BLE range) or `kinds` filtered everything out; pair with data_freshness to tell that from 'the phone never uploaded'. truncated:true means over 5000 events matched and only the first 5000 are listed (they are NOT thinned — a stride would drop the one-off BOOT you are hunting); `counts` still covers the full window.",
+    inputSchema: {
+      from: z.string(), to: z.string(), deviceId: z.string().optional(),
+      kinds: z.array(z.string()).optional().describe("Filter to these kinds; accepts a bare label ('WRIST_ON') or the full kind ('WRIST_ON(9)')."),
+      countsOnly: z.boolean().optional().describe("Return only the per-kind `counts` summary, not the event list."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async (a) => asTool(deviceEvents(cfg, a)));
+
+  server.registerTool("imu_coverage", {
+    title: "Deep IMU capture coverage",
+    description: "WHERE the WHOOP 5/MG deep IMU buffers exist — the availability question imu_series cannot answer without blind-scanning ranges. Answers 'did my overnight capture actually work?' and, with from/to OMITTED (the default, which anchors on the table's own extent), 'do I have ANY deep buffers, ever?'. Returns contiguous capture SESSIONS rather than per-day buckets: a run is the natural unit of 'did it work', and sessions are timezone-independent, so an overnight is never split at a meaningless UTC boundary. Rows in imuActivity are ONE PER SECOND (confirmed against the producer and the live mirror), which is what makes `seconds` a row count and `coverage` a real ratio. Per session: startTs/endTs plus ISO start/end (UTC), `seconds` (seconds actually banked), `spanSeconds` (wall-clock length of the run), `coverage` = seconds/spanSeconds — COVERAGE < 1 IS THE FAILURE SIGNAL, meaning the capture dropped rows mid-run — `missingSeconds`, `gaps` and `largestGapSeconds` (internal holes shorter than gapSeconds), `rhythmicSeconds` (seconds with a cadence lock), and accelEnergyPeakG. There is deliberately NO raw-sample count: the producer's per-row sampleCount is the size of an OVERLAPPING trailing 6-second feature window, so no honest per-run sample total can be derived from it — report `seconds` (which IS a true count, one row per second) and don't invent one from a sample rate the mirror doesn't store. A gap longer than `gapSeconds` (default 60) ENDS a session rather than being bridged, so a dropout shows up as two honest runs, not one run with an invented hole. Span limit is a generous 366 days, unlike the 7-day series tools, because this reads narrow columns and returns one row per run. THREE DISTINCT EMPTY ANSWERS, worth telling apart: notCaptured with a 'predates the migration' hint means the uploading phone build could not capture IMU at all; notCaptured on an EMPTY table means the build supports it but nothing was ever banked (capture toggle off, or a WHOOP 4.0 — this is 5/MG-only); and notCaptured WITH a `dataExtent` means nothing in your range but buffers do exist elsewhere — read dataExtent and retry, or drop from/to. Use imu_series for what the buffers actually say.",
+    inputSchema: {
+      from: z.string().optional().describe("Omit both from and to to cover every capture run in the mirror."),
+      to: z.string().optional(), deviceId: z.string().optional(),
+      gapSeconds: z.number().int().min(1).max(86400).optional().describe("A silence longer than this ends a session (default 60)."),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  }, async (a) => asTool(imuCoverage(cfg, a)));
 }

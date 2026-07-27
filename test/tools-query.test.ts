@@ -5,7 +5,7 @@ import { metricSeries, sleepSummary, workoutSummary } from "../src/tools/query.j
 
 const dataDir = path.join(process.cwd(), "test/.tmp/tools-query");
 const cfg = { dataDir, mirrorPath: path.join(dataDir, "mirror.sqlite"), serverDbPath: path.join(dataDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
-beforeAll(() => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfg); });
+beforeAll(async () => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), cfg); });
 
 describe("query tools", () => {
   it("metric_series returns Oura reference keys", () => {
@@ -27,11 +27,11 @@ describe("query tools", () => {
     const r = workoutSummary(cfg, { from: "2026-06-10", to: "2026-06-13" });
     expect(r.workouts.some((w) => w.sport === "running")).toBe(true);
   });
-  it("sleep_summary attaches per-night tzId, resolving the local day across the UTC boundary", () => {
+  it("sleep_summary attaches per-night tzId, resolving the local day across the UTC boundary", async () => {
     const tzDir = path.join(process.cwd(), "test/.tmp/tools-query-tz");
     fs.rmSync(tzDir, { recursive: true, force: true }); fs.mkdirSync(tzDir, { recursive: true });
     const tzCfg = { dataDir: tzDir, mirrorPath: path.join(tzDir, "mirror.sqlite"), serverDbPath: path.join(tzDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
-    const z = path.join(tzDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), tzCfg);
+    const z = path.join(tzDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), tzCfg);
 
     // Seed the v28 phoneTimezone table into the mirror. The my-whoop session on the last fixture day
     // starts at 03:00 UTC on 2026-06-13, which is the EVENING of 2026-06-12 in Los Angeles — so the

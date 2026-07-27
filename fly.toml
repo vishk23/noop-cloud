@@ -7,7 +7,10 @@ primary_region = "iad"
 [env]
   DATA_DIR = "/data"
   PORT = "8080"
-  MAX_INGEST_BYTES = "805306368"
+  # 1 GiB — same value as src/config.ts's default, deliberately. /ingest streams the body to the
+  # volume and inflates it there, so this bounds DISK, not memory; MIN_FREE_BYTES + the per-request
+  # preflight are what actually refuse an upload the volume cannot hold today.
+  MAX_INGEST_BYTES = "1073741824"
 
 [[mounts]]
   source = "noop_data"
@@ -18,7 +21,25 @@ primary_region = "iad"
   force_https = true
   auto_stop_machines = "stop"
   auto_start_machines = true
-  min_machines_running = 0
+  # Keep ONE machine warm. This was 0, and scale-to-zero is what made the first MCP tool call after
+  # an idle period fail with `Error POSTing to endpoint:` while an immediate retry succeeded.
+  #
+  # Measured on 2026-07-27, machine 7811d19db5d998: idle ~8 min -> `has excess capacity, autostopping
+  # machine ... 0 out of 1 machines left running`. The next request pays a cold start the proxy timed
+  # at `machine became reachable in 6.339993517s` (Firecracker + encrypted-volume mount ~1.3 s, then
+  # ~4 s of Node boot before it listens); a slower variant measured `Machine created and started in
+  # 8.521s`. A WARM request is ~0.08 s. MCP clients give up long before 6-8 s, so the failure was a
+  # client-side timeout on a machine that was booting correctly — which is why /healthz polled a
+  # moment later always looked fine and hid the problem.
+  #
+  # NOT auto_stop_machines = "off": this knob is the precise one. It floors the PRIMARY region at one
+  # running machine while still letting any additional machine autostop, so scaling out stays cheap.
+  # auto_start_machines stays true so a machine stopped by anything else still starts on demand.
+  #
+  # Cost: a shared-cpu-1x:2gb runs ~$10.70/mo 24/7 vs ~$2-3/mo at the previous duty cycle — about
+  # +$8/mo. Deliberately NOT paid for by shrinking the VM: the 2 GB is headroom this server earned
+  # during the 2026-07-26 OOM, and buying uptime with memory would trade one outage class for another.
+  min_machines_running = 1
 
   # Service-level check: gates deploys and routing (a top-level [checks] block is monitoring-only).
   [[http_service.checks]]

@@ -63,14 +63,16 @@ docker run -p 8080:8080 \
 
 The server listens on `:8080`; `GET /healthz` is the health check. Then `POST /ingest` a `.noopbak` with `Authorization: Bearer <RW_TOKEN>` and point any MCP client at `http://<host>:8080/mcp` with the `RO_TOKEN`.
 
-**Environment variables:** `RO_TOKEN` and `RW_TOKEN` are required (each ≥32 chars). `DATA_DIR` (default `/data` in the image, `./data` otherwise), `PORT` (default `8080`), `MAX_INGEST_BYTES` (default `262144000` = 250 MiB), plus the optional `APNS_KEY_P8` / `APNS_KEY_ID` / `APPLE_TEAM_ID` / `APNS_TOPIC` push credentials (see [Push-triggered on-demand sync](#push-triggered-on-demand-sync)). Pass them with `-e` or an `--env-file` instead of `fly secrets`. `better-sqlite3` is a native module, so build the image on (or for) your target CPU architecture — the Dockerfile compiles it during the build.
+**Environment variables:** `RO_TOKEN` and `RW_TOKEN` are required (each ≥32 chars). `DATA_DIR` (default `/data` in the image, `./data` otherwise), `PORT` (default `8080`), `MAX_INGEST_BYTES` (default `1073741824` = 1 GiB — a **disk** budget, not a memory one, since `/ingest` streams; keep it equal to `fly.toml`'s), `MIN_FREE_BYTES` (default `268435456` = 256 MiB), `STAGED_SWEEP_AGE_MS` (default `3600000` = 1h), plus the optional `APNS_KEY_P8` / `APNS_KEY_ID` / `APPLE_TEAM_ID` / `APNS_TOPIC` push credentials (see [Push-triggered on-demand sync](#push-triggered-on-demand-sync)). Pass them with `-e` or an `--env-file` instead of `fly secrets`. `better-sqlite3` is a native module, so build the image on (or for) your target CPU architecture — the Dockerfile compiles it during the build.
 
 ## Tools & prompts
 
-20 MCP tools and 3 prompts, grouped by function (read-token tools are visible to every caller; write-token tools appear only for `RW_TOKEN` clients):
+28 MCP tools and 3 prompts, grouped by function (read-token tools are visible to every caller; write-token tools appear only for `RW_TOKEN` clients):
 
 - **Summaries & trends (read, 6):** `data_freshness`, `health_snapshot`, `metric_series`, `sleep_summary`, `workout_summary`, `compare_sources` (WHOOP vs Oura vs Apple corroboration).
-- **Raw sensor evidence (read, 5):** `hr_series` (beat-level heart rate), `sleep_detail` (full hypnogram + in-sleep HR), `hrv_series` (RMSSD from R-R intervals), `motion_series` (steps + wrist posture), `imu_series` (WHOOP 5/MG activity).
+- **Raw sensor evidence (read, 7):** `hr_series` (beat-level heart rate), `sleep_detail` (full hypnogram + in-sleep HR), `sleep_state_series` (the hypnogram as a series), `hrv_series` (RMSSD from R-R intervals), `motion_series` (steps + wrist posture), `imu_series` (WHOOP 5/MG activity), `temp_series` (per-second skin temperature).
+- **Device & capture inventory (read, 4):** `streams` (what raw streams exist and over what span), `battery_series` (strap state-of-charge), `device_events` (the strap's firmware event log), `imu_coverage` (deep-IMU capture availability).
+- **Deep-buffer archive (read, 2):** `deep_buffer_coverage`, `deep_buffer_window` — read-only over the raw-buffer object store, available on every scope.
 - **Edits — propose (read token, 3):** `propose_edit`, `list_pending`, `edit_journal`.
 - **Edits — resolve (write token only, 3):** `confirm_edit`, `reject_edit`, `undo_edit`.
 - **ChatGPT Deep Research (2):** `search`, `fetch`.
@@ -93,6 +95,116 @@ log row, so the server knows which zone the phone was in as of that upload. `dat
 it as `phoneTz`, and `sleep_summary` attaches a per-night `tzId` by resolving each session's local
 day (across the UTC-day boundary) against the phone's per-day `phoneTimezone` table when present.
 Mirrors uploaded before that table shipped simply omit the field.
+
+## Storage health (`GET /status`)
+
+`/ingest` performs an atomic swap: it stages a **second full copy** of the database next to the live
+mirror, validates it, then renames it into place. So the volume must always hold roughly **2× the
+mirror** plus slack, and "free space" is only meaningful relative to the mirror's own size.
+
+The upload is **streamed end to end** — the request body goes straight to a `.staged-*.noopbak` on
+the volume, and the database inside it is inflated from there to the staged path through a 64 KB
+pipe. Nothing proportional to the database is ever held in memory, so `MAX_INGEST_BYTES` (1 GiB) is a
+**disk** budget, not a memory one: a 961 MB database ingests with a ~150 MB peak RSS, the same as a
+600 MB one. Growing the machine's RAM is never the fix for a large upload.
+
+`GET /status` (needs `RO_TOKEN`) reports exactly that — disk free/total, mirror size, orphaned
+staging bytes, and how long since the last successful ingest:
+
+```bash
+curl -sH "Authorization: Bearer $RO_TOKEN" https://<app>.fly.dev/status | jq
+```
+
+The field to watch is **`nextIngestFits`**. It goes `false` while there is still free space — as soon
+as the volume can no longer absorb one more swap — which is the actionable moment, well before
+anything breaks. `warnings[]` explains any non-`ok` state in words. The same block is returned by the
+`data_freshness` MCP tool, so an agent sees storage health without a second call.
+
+`GET /healthz` **always returns 200**, adding `degraded: true` and `warnings[]` when storage is
+unhealthy. The 200 is deliberate: Fly's health check points at it, so a non-2xx would pull the
+machine out of routing and block deploying the fix.
+
+It is a *serving* check, not a liveness check. Besides disk, orphans and `server.sqlite`, it opens
+the mirror the way the tools open it (`Mirror` + a `sqlite_master` read) and reports
+`mirror.readable`. Without that a mirror corrupted in place left every other signal green — so
+`/healthz` answered exactly `{"ok":true}` while every mirror-backed MCP tool was failing, which is
+the same green-through-an-outage shape as the 2026-07-26 post-mortem below. No
+`PRAGMA integrity_check`: that scans the whole file, and this runs every 30 s against 766 MB.
+
+Guardrails, all exercised by `test/storage*.test.ts`, `test/ingest-space-guard.test.ts` and
+`test/ingest-streaming.test.ts`:
+
+- **Preflight, twice.** An upload with nowhere to land is refused up front with **507**
+  `insufficient_space` (not 400 — the backup is valid and the phone should retry later): once
+  against the declared `Content-Length` before the transfer is accepted, then again against the
+  entry's decompressed size before the staged copy is written. A partial multi-hundred-MB write is
+  never left behind.
+- **Bounded output.** The decompressed ceiling is enforced *as the entry inflates*, not from the
+  zip's own header — that field is attacker-controlled and can be forged to 0. A zip bomb costs one
+  64 KB chunk.
+- **No staged leaks.** The staged file and the `-wal`/`-shm` sidecars SQLite opens beside it are
+  removed on every exit path, success included — `rename` moves only the main file.
+- **Sweep.** `.staged-*` artifacts older than `STAGED_SWEEP_AGE_MS` (1h) are reclaimed at startup and
+  before each ingest. The age guard is what makes this safe against an upload in flight.
+- **Readable failures.** MCP tools answer a storage fault with an explanation naming the layer, the
+  numbers, and the fix — never a bare driver string like `disk I/O error`.
+
+> Post-mortem, 2026-07-26 (disk): the Fly volume filled to 3.0G/3.0G because ~2.4 GB of orphaned
+> `.staged-*` files had accumulated — `writeFileSync` sat outside the try/catch, so once space got
+> tight each failed ingest leaked a ~500 MB partial and made the next failure likelier. Every
+> mirror-backed tool then returned `disk I/O error`, `/healthz` still said 200, and uploads had been
+> silently failing for 8 days.
+>
+> Post-mortem, 2026-07-26 (memory): with the disk fixed, the next upload was **OOM-killed**
+> (`anon-rss:1901376kB`) and the phone got a `502`. `/ingest` buffered the whole body with
+> `express.raw`, gave it to AdmZip, and called `getData()` — three full copies of a 608 MB database
+> in a 2 GB machine. Measured on that size: peak RSS **1993 MB before, 232 MB after**. RAM had
+> already been doubled twice (512 MB → 1 GB → 2 GB) for the same failure, each doubling buying only
+> the weeks it took the database to grow into it; streaming removed the scaling instead.
+
+## Page-churn telemetry (`pageChurn` on `/status`)
+
+Stage **P0** of [`docs/SYNC_BUILD_VS_BUY.md`](docs/SYNC_BUILD_VS_BUY.md), and a **falsification
+experiment before it is a feature**. That document proposes replacing the whole-database upload with
+page-level replication — ship only the changed 4 KB SQLite pages — and its entire case rests on one
+number nobody had ever measured: how much of the file actually changes between two syncs. If routine
+churn is ~1–3% the plan is right; if it is above ~10%, the plan is wrong and several weeks of work
+are not worth starting.
+
+At the instant of the atomic swap the server transiently holds **both** databases — the outgoing
+mirror and the validated incoming snapshot — which is the only moment that diff can be counted. So
+`src/pagechurn.ts` walks both files at the page size read from the SQLite header (bytes 16–17
+big-endian; **never assumed to be 4096**) and records one row per ingest in `ingestPageChurn`:
+
+```bash
+curl -sH "Authorization: Bearer $RO_TOKEN" https://<app>.fly.dev/status | jq '.pageChurn[0]'
+```
+
+`deltaBytes` (what a page-diff upload *would* have carried, uncompressed) sits directly beside
+`uploadBytes` (what `/ingest` actually carried, compressed), so the win — or its absence — needs no
+arithmetic. Read the **series**, not one row: a single sync cannot tell "1% every time" apart from
+"1% now, 40% after the next recompute". `bootstrap` and `pageSizeChanged` rows are flagged because
+they are 100% by definition and are not churn evidence.
+
+Two properties are load-bearing and both are pinned by `test/pagechurn.test.ts`:
+
+- **It cannot fail an upload.** The ingest path only ever calls `measurePageChurn`, which converts
+  every possible failure — unreadable mirror, corrupt header, short read, a missing table — into a
+  logged `null`. The atomic swap below it is byte-for-byte unchanged, and a measurement that costs a
+  sync would be worth less than no measurement.
+- **It cannot grow memory.** Both files stream through two reused ~1 MiB buffers via positional
+  `readSync`; neither is ever resident. Measured against the real 766 MB mirror **on the deployed
+  shared-cpu-1x**: peak RSS **49.9 MB for the whole process**, of which the walk is ~3 MB. (On a
+  local NVMe, a 776 MB → 786 MB pair compares in 256–381 ms at 74 MB peak RSS.)
+- **It cannot starve the event loop.** The same Fly measurement puts a *cold* 766 MB walk at
+  **35.9 s** — the volume reads at ~21 MB/s cold, then 682 ms and 145 ms once the page cache is warm.
+  Node has one thread and Fly's service check on `/healthz` has a 5 s timeout, so a synchronous walk
+  that long would pull the machine out of routing *during an ingest*. The walk therefore yields every
+  64 MiB. `compareMs` records the real wall clock either way, so the cost is never a guess.
+
+The report is scoped to `/status` on purpose: the same object is embedded in every `data_freshness`
+MCP response and in `/healthz`, and an experiment's log does not belong in either. It is also outside
+the `ok` verdict, so a telemetry fault can never turn a health check red.
 
 ## Push-triggered on-demand sync
 

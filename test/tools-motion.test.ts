@@ -10,7 +10,7 @@ const cfg = { dataDir, mirrorPath: path.join(dataDir, "mirror.sqlite"), serverDb
 const NIGHT = Math.floor(new Date("2026-06-13T03:00:00Z").getTime() / 1000);
 const WAKE = NIGHT + 25200; // sleepSession endTs for my-whoop on this night (10:00Z)
 
-beforeAll(() => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfg); });
+beforeAll(async () => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), cfg); });
 
 describe("motion_series", () => {
   it("buckets posture (gravity) averages across the stable night window, with family + n", () => {
@@ -91,11 +91,11 @@ describe("motion_series", () => {
     expect(bucket.n).toBe(5); // baseline + 4 classed samples, all raw-row evidence
   });
 
-  it("tolerates a mirror missing stepSample/gravitySample (pre-feature mirror) — empty, not throw", () => {
+  it("tolerates a mirror missing stepSample/gravitySample (pre-feature mirror) — empty, not throw", async () => {
     const oldDir = path.join(process.cwd(), "test/.tmp/motion-old");
     fs.rmSync(oldDir, { recursive: true, force: true }); fs.mkdirSync(oldDir, { recursive: true });
     const cfgOld = { dataDir: oldDir, mirrorPath: path.join(oldDir, "mirror.sqlite"), serverDbPath: path.join(oldDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
-    const z = path.join(oldDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfgOld);
+    const z = path.join(oldDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), cfgOld);
     const raw = new Database(cfgOld.mirrorPath);
     raw.exec("DROP TABLE stepSample; DROP TABLE gravitySample;");
     raw.close();
@@ -140,11 +140,11 @@ describe("motion_series apple-health hourly overlay (appleStepHour)", () => {
     expect(r.buckets.some((b: any) => b.deviceId === "apple-health")).toBe(false);
   });
 
-  it("tolerates a mirror missing appleStepHour (pre-feature mirror) at hourly granularity — no throw, no apple rows", () => {
+  it("tolerates a mirror missing appleStepHour (pre-feature mirror) at hourly granularity — no throw, no apple rows", async () => {
     const oldDir = path.join(process.cwd(), "test/.tmp/motion-old-apple");
     fs.rmSync(oldDir, { recursive: true, force: true }); fs.mkdirSync(oldDir, { recursive: true });
     const cfgOld = { dataDir: oldDir, mirrorPath: path.join(oldDir, "mirror.sqlite"), serverDbPath: path.join(oldDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
-    const z = path.join(oldDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfgOld);
+    const z = path.join(oldDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), cfgOld);
     const raw = new Database(cfgOld.mirrorPath);
     raw.exec("DROP TABLE appleStepHour;");
     raw.close();
