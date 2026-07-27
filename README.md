@@ -63,9 +63,16 @@ as the volume can no longer absorb one more swap — which is the actionable mom
 anything breaks. `warnings[]` explains any non-`ok` state in words. The same block is returned by the
 `data_freshness` MCP tool, so an agent sees storage health without a second call.
 
-`GET /healthz` stays a pure liveness probe and **always returns 200**, adding `degraded: true` and
-`warnings[]` when storage is unhealthy. That is deliberate: Fly's health check points at it, so a
-non-2xx would pull the machine out of routing and block deploying the fix.
+`GET /healthz` **always returns 200**, adding `degraded: true` and `warnings[]` when storage is
+unhealthy. The 200 is deliberate: Fly's health check points at it, so a non-2xx would pull the
+machine out of routing and block deploying the fix.
+
+It is a *serving* check, not a liveness check. Besides disk, orphans and `server.sqlite`, it opens
+the mirror the way the tools open it (`Mirror` + a `sqlite_master` read) and reports
+`mirror.readable`. Without that a mirror corrupted in place left every other signal green — so
+`/healthz` answered exactly `{"ok":true}` while every mirror-backed MCP tool was failing, which is
+the same green-through-an-outage shape as the 2026-07-26 post-mortem below. No
+`PRAGMA integrity_check`: that scans the whole file, and this runs every 30 s against 766 MB.
 
 Guardrails, all exercised by `test/storage*.test.ts`, `test/ingest-space-guard.test.ts` and
 `test/ingest-streaming.test.ts`:

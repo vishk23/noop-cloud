@@ -146,6 +146,47 @@ describe("/healthz and /status", () => {
     expect(json.warnings.join(" ")).toMatch(/orphaned/);
   });
 
+  it("/healthz goes degraded when the mirror EXISTS but cannot be read", async () => {
+    // The gap this closes. Disk is fine, there are no orphans and server.sqlite opens, so every
+    // signal /healthz used to look at is green — while every mirror-backed MCP tool is failing.
+    // Before probeMirror this returned exactly {ok:true}, which is the 2026-07-26 signature: a green
+    // health check through a total serving outage.
+    await ingestFixture();
+    breakMirror();
+    const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;
+    const { status, json } = await get(port, "/healthz");
+    server.close();
+    expect(status).toBe(200);            // still 200 — routing and deploys must not be blocked
+    expect(json.degraded).toBe(true);
+    expect(json.warnings.join(" ")).toMatch(/mirror\.sqlite EXISTS but cannot be read/);
+  });
+
+  it("a mirror that was never uploaded is NOT degraded", async () => {
+    // A fresh server is new, not broken. `fileMustExist` would throw here, so the probe has to be
+    // skipped rather than allowed to report the absence as a fault.
+    const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;
+    const { status, json } = await get(port, "/healthz");
+    server.close();
+    expect(status).toBe(200);
+    expect(json).toEqual({ ok: true });
+  });
+
+  it("/status reports mirror.readable", async () => {
+    await ingestFixture();
+    const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;
+    const { json } = await get(port, "/status", cfg().roToken);
+    server.close();
+    expect(json.mirror.readable).toBe(true);
+  });
+
+  it("data_freshness does NOT pay for the probe", async () => {
+    // It opens the mirror itself and has its own `degraded` flag, so probing inside storageReport
+    // would open a 766 MB database twice on every call. null = not probed, not "unreadable".
+    await ingestFixture();
+    const r: any = dataFreshness(cfg());
+    expect(r.storage.mirror.readable).toBeNull();
+  });
+
   it("/status requires a token", async () => {
     const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;
     const { status } = await get(port, "/status");

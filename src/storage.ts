@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { openServerDb } from "./serverdb.js";
+import { Mirror } from "./mirror.js";
 import { recentPageChurn, type PageChurnRow } from "./pagechurn.js";
 import type { Config } from "./config.js";
 
@@ -174,11 +175,38 @@ export class StorageDegradedError extends Error {
 // Storage report — the thing that should have existed before the outage
 // ---------------------------------------------------------------------------
 
+/**
+ * Can the mirror actually be SERVED right now — not "does the file exist", but "does opening it the
+ * way every tool opens it, and reading its schema, succeed"?
+ *
+ * Deliberately the real serving path (`new Mirror(...)` + a sqlite_master read, exactly what
+ * `hasTable` does) rather than a stat or a header sniff. A stat cannot tell a good 766 MB mirror from
+ * a corrupt one, and the header alone survives the common corruption shape — SQLite only raises
+ * SQLITE_NOTADB on the first real page read.
+ *
+ * Cheap enough for a 30-second health check: a read-only open reads the header and one schema page,
+ * not the file. No PRAGMA integrity/quick_check — those scan the whole database and would turn the
+ * health check into 766 MB of I/O every interval.
+ */
+export function mirrorReadable(mirrorPath: string): { ok: boolean; error?: string } {
+  try {
+    const m = new Mirror(mirrorPath);
+    try { m.hasTable("dailyMetric"); } finally { m.close(); }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export interface StorageReport {
   ok: boolean;
   dataDir: string;
   disk: DiskUsage | null;
-  mirror: { exists: boolean; bytes: number | null; modifiedAt: string | null };
+  /**
+   * `readable` is null unless `probeMirror` was requested, and stays null when the mirror is absent
+   * (nothing to read is not the same as unreadable — see the missing-mirror note below).
+   */
+  mirror: { exists: boolean; bytes: number | null; modifiedAt: string | null; readable: boolean | null };
   serverDb: { exists: boolean; bytes: number | null };
   stagedOrphans: { count: number; bytes: number };
   lastIngestAt: string | null;
@@ -209,7 +237,7 @@ const statOr = (p: string) => { try { return fs.statSync(p); } catch { return nu
  * that opening server.sqlite throws. Every step is individually guarded; this function must not be
  * capable of failing for the reason it exists to diagnose.
  */
-export function storageReport(cfg: StorageCfg, opts: { pageChurnLimit?: number } = {}): StorageReport {
+export function storageReport(cfg: StorageCfg, opts: { pageChurnLimit?: number; probeMirror?: boolean } = {}): StorageReport {
   const minFree = cfg.minFreeBytes ?? 268_435_456;
   const disk = diskUsage(cfg.dataDir);
   const mStat = statOr(cfg.mirrorPath);
@@ -262,6 +290,21 @@ export function storageReport(cfg: StorageCfg, opts: { pageChurnLimit?: number }
   if (orphans.length) warnings.push(`${orphans.length} orphaned .staged-* artifact(s) holding ${formatBytes(orphanBytes)} — swept automatically on the next ingest`);
   // A missing mirror is NOT a warning: a freshly-deployed server that has never been uploaded to is
   // new, not degraded. `mirror.exists: false` and a null lastIngestAt already state the fact.
+  //
+  // A mirror that EXISTS but cannot be opened is the opposite: every mirror-backed MCP tool is down.
+  // Probed only on request because the caller that has to know — /healthz — is the one place nothing
+  // else opens the mirror. data_freshness deliberately does not ask: it opens the mirror itself and
+  // reports its own `degraded` flag, so probing here would just open a 766 MB database twice per call.
+  let mirrorOk: boolean | null = null;
+  if (opts.probeMirror && mStat) {
+    const probe = mirrorReadable(cfg.mirrorPath);
+    mirrorOk = probe.ok;
+    // The gap this closes: before it, a mirror corrupted in place left disk, orphans and server.sqlite
+    // all clean, so /healthz answered exactly {ok:true} while every tool returned "storage is
+    // degraded". Same failure signature as the 2026-07-26 outage — a green health check through a
+    // total serving outage — with a different cause.
+    if (!probe.ok) warnings.push(`mirror.sqlite EXISTS but cannot be read: ${probe.error} — every mirror-backed MCP tool is failing`);
+  }
   if (lastIngestError) warnings.push(`server.sqlite unreadable: ${lastIngestError}`);
   // 48h: the phone uploads on every background wake, so a day and a half of silence is already an
   // outage, not a quiet period.
@@ -273,7 +316,7 @@ export function storageReport(cfg: StorageCfg, opts: { pageChurnLimit?: number }
     ok: warnings.length === 0,
     dataDir: cfg.dataDir,
     disk,
-    mirror: { exists: !!mStat, bytes: mStat?.size ?? null, modifiedAt: mStat ? new Date(mStat.mtimeMs).toISOString() : null },
+    mirror: { exists: !!mStat, bytes: mStat?.size ?? null, modifiedAt: mStat ? new Date(mStat.mtimeMs).toISOString() : null, readable: mirrorOk },
     serverDb: { exists: !!sStat, bytes: sStat?.size ?? null },
     stagedOrphans: { count: orphans.length, bytes: orphanBytes },
     lastIngestAt,

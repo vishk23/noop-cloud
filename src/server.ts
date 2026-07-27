@@ -42,17 +42,23 @@ export function createApp(cfg: Config): express.Express {
     if (swept.removed) console.log(`swept ${swept.removed} orphaned staging artifact(s), reclaimed ${swept.bytes} bytes`);
   } catch { /* best-effort */ }
 
-  // Liveness ONLY, and deliberately still 200 when storage is degraded.
+  // Liveness, plus an honest verdict on whether this process can actually SERVE — but deliberately
+  // still 200 when it cannot.
   //
   // Fly's [[http_service.checks]] points here, so a non-2xx pulls the machine out of routing and
   // fails deploys. During the 2026-07-26 full-volume outage that would have turned "every tool
   // returns a clear storage error" into "the host is unreachable" — strictly worse to debug, and it
-  // would have blocked deploying the very fix. So the disk verdict rides along as a `degraded` flag
+  // would have blocked deploying the very fix. So the verdict rides along as a `degraded` flag
   // (absent when healthy, which keeps the response exactly `{ok:true}`), and /status carries detail.
+  //
+  // probeMirror is what makes this a serving check rather than a process-alive check. Without it a
+  // mirror corrupted in place reads as perfectly healthy here — disk fine, no orphans, server.sqlite
+  // fine — while every mirror-backed MCP tool returns "storage is degraded". That is the same
+  // green-through-an-outage signature as 2026-07-26, which is the reason to close it.
   app.get("/healthz", (_req, res) => {
     let degraded: string[] | null = null;
     try {
-      const s = storageReport(cfg);
+      const s = storageReport(cfg, { probeMirror: true });
       if (!s.ok) degraded = s.warnings;
     } catch { /* a health probe must not throw */ }
     res.json(degraded ? { ok: true, degraded: true, warnings: degraded } : { ok: true });
@@ -67,7 +73,7 @@ export function createApp(cfg: Config): express.Express {
   // deliberately do not carry the experiment's log.
   app.get("/status", requireScope(cfg, "ro"), (_req, res) => {
     try {
-      res.json(storageReport(cfg, { pageChurnLimit: 20 }));
+      res.json(storageReport(cfg, { pageChurnLimit: 20, probeMirror: true }));
     } catch (e) {
       res.status(500).json({ ok: false, error: "status_failed", detail: e instanceof Error ? e.message : String(e) });
     }
