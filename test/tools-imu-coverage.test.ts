@@ -31,10 +31,10 @@ const DDL = `CREATE TABLE IF NOT EXISTS imuActivity (deviceId TEXT NOT NULL, ts 
 const WINDOW_S = 6, RATE_HZ = 100;
 const winSamples = (secondsSinceReset: number) => Math.min(secondsSinceReset + 1, WINDOW_S) * RATE_HZ;
 
-beforeAll(() => {
+beforeAll(async () => {
   for (const [d, c] of [[dataDir, cfg], [emptyDir, emptyCfg], [bareDir, bareCfg]] as const) {
     fs.rmSync(d, { recursive: true, force: true }); fs.mkdirSync(d, { recursive: true });
-    const z = path.join(d, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), c);
+    const z = path.join(d, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), c);
   }
   // Table but no rows: capture-capable build, nothing banked.
   const edb = new Database(emptyCfg.mirrorPath); edb.exec(DDL); edb.close();
@@ -135,7 +135,7 @@ describe("imu_coverage", () => {
     expect(r.totals).not.toHaveProperty("samples");
   });
 
-  it("never rounds coverage up to a perfect 1 while seconds are missing", () => {
+  it("never rounds coverage up to a perfect 1 while seconds are missing", async () => {
     // Regression, caught against VK's live mirror: a 2175-second run across a 2176-second span is
     // 0.99954, which round3 hands back as 1.0 — reporting a clean capture while missingSeconds said 1
     // and defeating the `coverage < 1` check this tool tells callers to make. Reproduced here at the
@@ -143,7 +143,7 @@ describe("imu_coverage", () => {
     const long = path.join(process.cwd(), "test/.tmp/imucov-long");
     fs.rmSync(long, { recursive: true, force: true }); fs.mkdirSync(long, { recursive: true });
     const c = mk(long);
-    const z = path.join(long, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), c);
+    const z = path.join(long, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), c);
     const db = new Database(c.mirrorPath); db.exec(DDL);
     const ins = db.prepare("INSERT INTO imuActivity VALUES (?,?,?,?,?,?,?,?)");
     // 2176-second span, one single second missing in the middle — 2175 rows banked. The hole at i=1000

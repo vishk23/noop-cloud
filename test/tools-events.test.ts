@@ -20,10 +20,10 @@ const cfg = { dataDir, mirrorPath: path.join(dataDir, "mirror.sqlite"), serverDb
 const bareCfg = { dataDir: bareDir, mirrorPath: path.join(bareDir, "mirror.sqlite"), serverDbPath: path.join(bareDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
 const T0 = Math.floor(new Date("2026-06-13T12:00:00Z").getTime() / 1000);
 
-beforeAll(() => {
+beforeAll(async () => {
   for (const [d, c] of [[dataDir, cfg], [bareDir, bareCfg]] as const) {
     fs.rmSync(d, { recursive: true, force: true }); fs.mkdirSync(d, { recursive: true });
-    const z = path.join(d, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), c);
+    const z = path.join(d, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), c);
   }
   const db = new Database(cfg.mirrorPath);
   db.exec(`CREATE TABLE IF NOT EXISTS event (deviceId TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL, payloadJSON TEXT NOT NULL, synced INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (deviceId, ts, kind));`);

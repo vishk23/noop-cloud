@@ -21,7 +21,7 @@ function mcp(port: number, token: string, body: object): Promise<any> {
   });
 }
 
-beforeAll(() => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfg()); });
+beforeAll(async () => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), cfg()); });
 
 describe("write tools + scope", () => {
   it("ro caller sees propose/list/journal but NOT confirm/reject/undo (rw-only tools land in Task 5)", async () => {

@@ -45,6 +45,12 @@ during the build.
 mirror, validates it, then renames it into place. So the volume must always hold roughly **2× the
 mirror** plus slack, and "free space" is only meaningful relative to the mirror's own size.
 
+The upload is **streamed end to end** — the request body goes straight to a `.staged-*.noopbak` on
+the volume, and the database inside it is inflated from there to the staged path through a 64 KB
+pipe. Nothing proportional to the database is ever held in memory, so `MAX_INGEST_BYTES` (1 GiB) is a
+**disk** budget, not a memory one: a 961 MB database ingests with a ~150 MB peak RSS, the same as a
+600 MB one. Growing the machine's RAM is never the fix for a large upload.
+
 `GET /status` (needs `RO_TOKEN`) reports exactly that — disk free/total, mirror size, orphaned
 staging bytes, and how long since the last successful ingest:
 
@@ -61,11 +67,17 @@ anything breaks. `warnings[]` explains any non-`ok` state in words. The same blo
 `warnings[]` when storage is unhealthy. That is deliberate: Fly's health check points at it, so a
 non-2xx would pull the machine out of routing and block deploying the fix.
 
-Guardrails, all exercised by `test/storage*.test.ts` and `test/ingest-space-guard.test.ts`:
+Guardrails, all exercised by `test/storage*.test.ts`, `test/ingest-space-guard.test.ts` and
+`test/ingest-streaming.test.ts`:
 
-- **Preflight.** An upload with nowhere to land is refused up front with **507** `insufficient_space`
-  (not 400 — the backup is valid and the phone should retry later), so a partial multi-hundred-MB
-  write is never left behind.
+- **Preflight, twice.** An upload with nowhere to land is refused up front with **507**
+  `insufficient_space` (not 400 — the backup is valid and the phone should retry later): once
+  against the declared `Content-Length` before the transfer is accepted, then again against the
+  entry's decompressed size before the staged copy is written. A partial multi-hundred-MB write is
+  never left behind.
+- **Bounded output.** The decompressed ceiling is enforced *as the entry inflates*, not from the
+  zip's own header — that field is attacker-controlled and can be forged to 0. A zip bomb costs one
+  64 KB chunk.
 - **No staged leaks.** The staged file and the `-wal`/`-shm` sidecars SQLite opens beside it are
   removed on every exit path, success included — `rename` moves only the main file.
 - **Sweep.** `.staged-*` artifacts older than `STAGED_SWEEP_AGE_MS` (1h) are reclaimed at startup and
@@ -73,11 +85,18 @@ Guardrails, all exercised by `test/storage*.test.ts` and `test/ingest-space-guar
 - **Readable failures.** MCP tools answer a storage fault with an explanation naming the layer, the
   numbers, and the fix — never a bare driver string like `disk I/O error`.
 
-> Post-mortem, 2026-07-26: the Fly volume filled to 3.0G/3.0G because ~2.4 GB of orphaned
+> Post-mortem, 2026-07-26 (disk): the Fly volume filled to 3.0G/3.0G because ~2.4 GB of orphaned
 > `.staged-*` files had accumulated — `writeFileSync` sat outside the try/catch, so once space got
 > tight each failed ingest leaked a ~500 MB partial and made the next failure likelier. Every
 > mirror-backed tool then returned `disk I/O error`, `/healthz` still said 200, and uploads had been
 > silently failing for 8 days.
+>
+> Post-mortem, 2026-07-26 (memory): with the disk fixed, the next upload was **OOM-killed**
+> (`anon-rss:1901376kB`) and the phone got a `502`. `/ingest` buffered the whole body with
+> `express.raw`, gave it to AdmZip, and called `getData()` — three full copies of a 608 MB database
+> in a 2 GB machine. Measured on that size: peak RSS **1993 MB before, 232 MB after**. RAM had
+> already been doubled twice (512 MB → 1 GB → 2 GB) for the same failure, each doubling buying only
+> the weeks it took the database to grow into it; streaming removed the scaling instead.
 
 ## Upload data (iOS Shortcut, no app changes)
 

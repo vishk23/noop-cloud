@@ -19,7 +19,7 @@ const cfg = { dataDir, mirrorPath: path.join(dataDir, "mirror.sqlite"), serverDb
 const DENSE_NIGHT = Math.floor(new Date("2026-06-21T02:00:00Z").getTime() / 1000); // clear of every other fixture day
 const HR_ROWS = 23_040; // 6.4h at 1Hz — matches the real night that exposed the bug
 
-beforeAll(() => {
+beforeAll(async () => {
   fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true });
   const srcSqlite = path.join(dataDir, "src.sqlite");
   buildMirrorSqlite(srcSqlite);
@@ -33,7 +33,7 @@ beforeAll(() => {
   raw.close();
   const zip = path.join(dataDir, "b.noopbak");
   buildNoopbakFrom(srcSqlite, zip);
-  ingestNoopbak(fs.readFileSync(zip), cfg);
+  await ingestNoopbak(fs.readFileSync(zip), cfg);
 });
 
 describe("sleep_detail HR — dense-session decimation (audit-exposed)", () => {

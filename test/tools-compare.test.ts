@@ -9,7 +9,7 @@ import { compareSources } from "../src/tools/compare.js";
 
 const dataDir = path.join(process.cwd(), "test/.tmp/tools-compare");
 const cfg = { dataDir, mirrorPath: path.join(dataDir, "mirror.sqlite"), serverDbPath: path.join(dataDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
-beforeAll(() => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfg); });
+beforeAll(async () => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), cfg); });
 
 describe("compare_sources", () => {
   it("puts WHOOP/Oura/Apple restingHr side by side with a spread", () => {
@@ -74,12 +74,12 @@ describe("compare_sources guard: empty mirror", () => {
 describe("compare_sources overlay: fallback respects delete_metric_point", () => {
   const overlayDataDir = path.join(process.cwd(), "test/.tmp/tools-compare-overlay");
   const overlayCfg = { dataDir: overlayDataDir, mirrorPath: path.join(overlayDataDir, "mirror.sqlite"), serverDbPath: path.join(overlayDataDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
-  beforeAll(() => {
+  beforeAll(async () => {
     fs.rmSync(overlayDataDir, { recursive: true, force: true });
     fs.mkdirSync(overlayDataDir, { recursive: true });
     const z = path.join(overlayDataDir, "b.noopbak");
     buildNoopbak(z);
-    ingestNoopbak(fs.readFileSync(z), overlayCfg);
+    await ingestNoopbak(fs.readFileSync(z), overlayCfg);
     // Delete the apple-health vo2max for 2026-06-13 — a pure-fallback metric
     appendJournal(overlayCfg, { editId: "e_vo2_del", kind: "delete_metric_point", payloadJSON: JSON.stringify({ deviceId: "apple-health", day: "2026-06-13", key: "vo2max" }), beforeJSON: null, rationale: null });
   });
@@ -113,7 +113,7 @@ describe("compare_sources day universe: metricSeries-only day (post-hoc audit fi
   const fbCfg = { dataDir: fbDataDir, mirrorPath: path.join(fbDataDir, "mirror.sqlite"), serverDbPath: path.join(fbDataDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
   const NEW_DAY = "2026-06-20"; // clear of every DAYS entry in the shared fixture
 
-  beforeAll(() => {
+  beforeAll(async () => {
     fs.rmSync(fbDataDir, { recursive: true, force: true });
     fs.mkdirSync(fbDataDir, { recursive: true });
     const srcSqlite = path.join(fbDataDir, "src.sqlite");
@@ -126,7 +126,7 @@ describe("compare_sources day universe: metricSeries-only day (post-hoc audit fi
     raw.close();
     const zip = path.join(fbDataDir, "b.noopbak");
     buildNoopbakFrom(srcSqlite, zip);
-    ingestNoopbak(fs.readFileSync(zip), fbCfg);
+    await ingestNoopbak(fs.readFileSync(zip), fbCfg);
   });
 
   it("surfaces a day whose only data is a metricSeries fallback row", () => {

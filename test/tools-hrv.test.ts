@@ -35,7 +35,7 @@ function insertAlternatingSeries(raw: Database.Database, deviceId: string, start
   }
 }
 
-beforeAll(() => {
+beforeAll(async () => {
   fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true });
   const srcSqlite = path.join(dataDir, "src.sqlite");
   buildMirrorSqlite(srcSqlite);
@@ -51,7 +51,7 @@ beforeAll(() => {
   raw.close();
   const zip = path.join(dataDir, "b.noopbak");
   buildNoopbakFrom(srcSqlite, zip);
-  ingestNoopbak(fs.readFileSync(zip), cfg);
+  await ingestNoopbak(fs.readFileSync(zip), cfg);
 });
 
 describe("hrv_series", () => {

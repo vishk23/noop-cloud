@@ -11,9 +11,9 @@ import { streamsInventory } from "../src/tools/core.js";
 const dataDir = path.join(process.cwd(), "test/.tmp/streams");
 const cfg = { dataDir, mirrorPath: path.join(dataDir, "mirror.sqlite"), serverDbPath: path.join(dataDir, "server.sqlite"), maxIngestBytes: 262_144_000 } as any;
 
-beforeAll(() => {
+beforeAll(async () => {
   fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true });
-  const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfg);
+  const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), cfg);
   const db = new Database(cfg.mirrorPath);
   db.exec(`CREATE TABLE IF NOT EXISTS sleepStateSample (deviceId TEXT, ts INTEGER, state INTEGER, PRIMARY KEY(deviceId, ts));`);
   db.prepare("INSERT INTO sleepStateSample VALUES (?,?,?)").run("my-whoop", 1780000000, 2);

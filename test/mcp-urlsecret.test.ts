@@ -32,7 +32,7 @@ function urlSecretCall(port: number, secret: string, body: object): Promise<{ st
 describe("/mcp/:secret (no-auth URL secret)", () => {
   it("serves the strict public read-only surface with the correct URL secret and no bearer", async () => {
     fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true });
-    const zip = path.join(dataDir, "b.noopbak"); buildNoopbak(zip); ingestNoopbak(fs.readFileSync(zip), cfg());
+    const zip = path.join(dataDir, "b.noopbak"); buildNoopbak(zip); await ingestNoopbak(fs.readFileSync(zip), cfg());
     const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;
     const { status, json } = await urlSecretCall(port, SECRET, { jsonrpc: "2.0", id: 1, method: "tools/list" });
     const names = (json?.result?.tools ?? []).map((t: any) => t.name);

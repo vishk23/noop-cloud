@@ -20,8 +20,12 @@ import type { Config } from "./config.js";
 // So the invariants here are: (1) never begin a swap you don't have room to finish, (2) never leave
 // a staged artifact behind on ANY exit path, and (3) make free space observable BEFORE it hits zero.
 
-/** Filenames ingestNoopbak stages under. Both the main file and the sidecars SQLite opens beside it. */
-const STAGED_RE = /^\.staged-[0-9a-f]+\.sqlite(-wal|-shm)?$/;
+/**
+ * Filenames /ingest stages under: the inflated database, the sidecars SQLite opens beside it, and
+ * the `.noopbak` the request body streams into (since the body stopped being buffered in memory,
+ * it is a file on this volume too, and a crash mid-upload leaks it exactly the same way).
+ */
+const STAGED_RE = /^\.staged-[0-9a-f]+\.(?:sqlite(?:-wal|-shm)?|noopbak)$/;
 
 export interface DiskUsage {
   totalBytes: number;

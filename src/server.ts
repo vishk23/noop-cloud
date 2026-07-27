@@ -4,15 +4,28 @@ import { fileURLToPath } from "node:url";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Config, loadConfig } from "./config.js";
 import { requireScope, tokenScope, safeEqual } from "./auth.js";
-import { ingestNoopbak, IngestError, normalizePhoneTz } from "./ingest.js";
+import { ingestNoopbakFile, receiveUploadBody, requireSpaceFor, stagedPath, IngestError, UploadAbortedError, normalizePhoneTz } from "./ingest.js";
 import { buildMcpServer } from "./mcp.js";
 import { journalSince, ackEdits } from "./staging.js";
 import { upsertDeviceToken } from "./push/registry.js";
 import { ingestDeepBufferChunk, DeepBufError, parseChunkHeaders } from "./deepbuf.js";
 import { makeObjectStore } from "./objectstore.js";
-import { storageReport, sweepStagedArtifacts } from "./storage.js";
+import { storageReport, sweepStagedArtifacts, isVolumeError, storageFailureMessage } from "./storage.js";
 
 const DEVICE_TOKEN_RE = /^[0-9a-fA-F]{32,100}$/;
+
+/**
+ * Answer once, or not at all.
+ *
+ * /ingest streams for minutes, so by the time an error surfaces the socket may already be gone or
+ * already answered. Writing to it then throws INSIDE the catch block — an unhandled rejection out of
+ * an async Express handler, which takes the whole process down. That is a strictly worse outcome
+ * than the failure being reported.
+ */
+function reply(res: express.Response, status: number, body: unknown): void {
+  if (res.headersSent || res.writableEnded) return;
+  try { res.status(status).json(body); } catch (e) { console.error("failed to send response", e); }
+}
 
 export function createApp(cfg: Config): express.Express {
   fs.mkdirSync(cfg.dataDir, { recursive: true });
@@ -56,28 +69,58 @@ export function createApp(cfg: Config): express.Express {
     }
   });
 
-  app.post("/ingest", requireScope(cfg, "rw"),
-    express.raw({ type: "*/*", limit: cfg.maxIngestBytes }),
-    (req, res) => {
-      try {
-        const phoneTz = normalizePhoneTz(req.header("x-phone-timezone"));
-        const out = ingestNoopbak(req.body as Buffer, cfg, phoneTz);
-        res.json(out);
-      } catch (e) {
-        // e.status, not a flat 400: `insufficient_space`/`storage_unavailable` are 507s so the phone
-        // reads them as "server has no room, keep the backup and retry later" rather than "this
-        // upload is malformed, discard it". `detail` carries the actual byte numbers.
-        if (e instanceof IngestError) {
-          if (e.status >= 500) console.error("ingest storage error", e.code, e.message);
-          return res.status(e.status).json({ error: e.code, ...(e.status >= 500 ? { detail: e.message } : {}) });
-        }
-        console.error("ingest error", e);
-        res.status(500).json({ error: "ingest_failed" });
+  // NO express.raw. The whole-DB body is 200-400 MB compressed and buffering it was the first of the
+  // three full copies that OOM-killed the machine on 2026-07-26 (see src/zipstream.ts). The body is
+  // streamed to a `.staged-*.noopbak` on the volume and inflated from there, so this handler's
+  // memory is flat in the size of the database.
+  app.post("/ingest", requireScope(cfg, "rw"), async (req, res) => {
+    // Cheapest rejection there is: the phone declares the size before sending a byte of it.
+    const declared = Number(req.header("content-length"));
+    if (Number.isFinite(declared) && declared > cfg.maxIngestBytes) {
+      return res.status(413).json({ error: "too_large" });
+    }
+    const upload = stagedPath(cfg.dataDir, "noopbak");
+    try {
+      fs.mkdirSync(cfg.dataDir, { recursive: true });
+      // Refuse before accepting the transfer when the volume cannot even hold the compressed body.
+      // Accepting 300 MB we have nowhere to put is how the volume filled in the first place.
+      if (Number.isFinite(declared) && declared > 0) requireSpaceFor(declared, cfg, "upload body");
+      await receiveUploadBody(req, upload, cfg);
+      const phoneTz = normalizePhoneTz(req.header("x-phone-timezone"));
+      const out = await ingestNoopbakFile(upload, cfg, phoneTz, { consume: true });
+      res.json(out);
+    } catch (e) {
+      // The phone hung up mid-upload (backgrounded, lost signal). There is no socket to answer on
+      // and nothing was corrupted — the staged body is removed below like any other failure.
+      if (e instanceof UploadAbortedError) {
+        console.warn("ingest aborted by client after", e.bytesReceived, "bytes");
+        return;
       }
-    });
+      // e.status, not a flat 400: `insufficient_space`/`storage_unavailable` are 507s so the phone
+      // reads them as "server has no room, keep the backup and retry later" rather than "this
+      // upload is malformed, discard it". `detail` carries the actual byte numbers.
+      if (e instanceof IngestError) {
+        if (e.status >= 500) console.error("ingest storage error", e.code, e.message);
+        return reply(res, e.status, { error: e.code, ...(e.status >= 500 ? { detail: e.message } : {}) });
+      }
+      // A volume fault outside ingestNoopbakFile's own try (the body write itself) still has to read
+      // as "server has no room", not as a malformed upload.
+      if (isVolumeError(e)) {
+        console.error("ingest body write failed", e);
+        return reply(res, 507, { error: "storage_unavailable", detail: storageFailureMessage(cfg, e) });
+      }
+      console.error("ingest error", e);
+      reply(res, 500, { error: "ingest_failed" });
+    } finally {
+      // Belt and braces: ingestNoopbakFile consumes the body itself, but every path that throws
+      // before it runs — and every path inside it — must leave nothing behind. A leaked 300 MB
+      // staged file is how the volume reached 0 bytes free.
+      fs.rmSync(upload, { force: true });
+    }
+  });
 
   // One line-aligned, raw-DEFLATE byte range of the phone's append-only deep-buffer log (#423).
-  // Its own body limit, NOT cfg.maxIngestBytes (which is 768 MB for the whole-DB /ingest) — a chunk is
+  // Its own body limit, NOT cfg.maxIngestBytes (1 GiB, for the whole-DB /ingest) — a chunk is
   // bounded at ~24 MB compressed and there is no reason to let this path allocate three orders of
   // magnitude more than it can legitimately need.
   app.post("/deepbuf", requireScope(cfg, "rw"),
@@ -85,7 +128,23 @@ export function createApp(cfg: Config): express.Express {
     async (req, res) => {
       // 503, never a Fly-volume fallback: ~600 MB/day of archive against ~547 MB free would take the
       // whole server down with it (see src/objectstore.ts). Refusing loudly is the safe failure.
-      if (!objectStore) return res.status(503).json({ error: "storage_not_configured" });
+      //
+      // The body says WHICH KIND of "no" this is. The phone renders a non-2xx as the raw body prefix
+      // ("The cloud sync server returned an error (503) — …"), so a bare error code made a deliberately
+      // unconfigured OPTIONAL feature look identical to the whole-DB upload being broken — and the two
+      // appeared side by side during the 2026-07-26 outage, which is how one real failure read as two.
+      // `configured:false` mirrors what the deep_buffer_* MCP tools already answer.
+      if (!objectStore) {
+        return res.status(503).json({
+          error: "storage_not_configured",
+          configured: false,
+          feature: "deepbuf",
+          detail: "Deep-buffer bulk upload is switched off on this server: no object-storage bucket is configured. " +
+            "This is an optional feature that has never been enabled, not a failure — the whole-database POST /ingest " +
+            "backup is unaffected, and no data was lost. Nothing on the phone needs fixing; retrying will keep " +
+            "returning this until a bucket is configured server-side.",
+        });
+      }
       try {
         const headers = parseChunkHeaders({
           generation: req.header("x-deepbuf-generation"),

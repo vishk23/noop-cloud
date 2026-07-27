@@ -22,11 +22,11 @@ const goodUpload = () => { const z = path.join(dataDir, "in.noopbak"); buildNoop
 const staged = () => listStagedArtifacts(dataDir).map((a) => a.name).sort();
 
 describe("ingest disk-space preflight", () => {
-  it("refuses with insufficient_space / 507 instead of starting a swap it cannot finish", () => {
+  it("refuses with insufficient_space / 507 instead of starting a swap it cannot finish", async () => {
     const cfg = base();
     cfg.minFreeBytes = Number.MAX_SAFE_INTEGER; // no real disk can satisfy this
     try {
-      ingestNoopbak(goodUpload(), cfg);
+      await ingestNoopbak(goodUpload(), cfg);
       expect.fail("should have refused");
     } catch (e: any) {
       expect(e).toBeInstanceOf(IngestError);
@@ -38,27 +38,27 @@ describe("ingest disk-space preflight", () => {
     }
   });
 
-  it("leaves NO staged file behind when it refuses — the leak must not be self-amplifying", () => {
+  it("leaves NO staged file behind when it refuses — the leak must not be self-amplifying", async () => {
     const cfg = base();
     cfg.minFreeBytes = Number.MAX_SAFE_INTEGER;
-    try { ingestNoopbak(goodUpload(), cfg); } catch { /* expected */ }
+    try { await ingestNoopbak(goodUpload(), cfg); } catch { /* expected */ }
     expect(staged()).toEqual([]);
   });
 
-  it("preserves an existing mirror when it refuses", () => {
+  it("preserves an existing mirror when it refuses", async () => {
     const cfg = base();
-    ingestNoopbak(goodUpload(), cfg);
+    await ingestNoopbak(goodUpload(), cfg);
     const before = fs.statSync(cfg.mirrorPath).size;
     cfg.minFreeBytes = Number.MAX_SAFE_INTEGER;
-    try { ingestNoopbak(goodUpload(), cfg); } catch { /* expected */ }
+    try { await ingestNoopbak(goodUpload(), cfg); } catch { /* expected */ }
     expect(fs.statSync(cfg.mirrorPath).size).toBe(before);
     const db = new Database(cfg.mirrorPath, { readonly: true });
     expect((db.prepare("SELECT COUNT(*) c FROM dailyMetric").get() as any).c).toBeGreaterThan(0);
     db.close();
   });
 
-  it("still ingests normally when there is room", () => {
-    const r = ingestNoopbak(goodUpload(), base());
+  it("still ingests normally when there is room", async () => {
+    const r = await ingestNoopbak(goodUpload(), base());
     expect(r.ok).toBe(true);
     expect(r.latestDay).toBe("2026-06-13");
   });
@@ -77,29 +77,29 @@ describe("staged artifact cleanup", () => {
     expect(sidecars.length).toBeGreaterThan(0);
   });
 
-  it("leaves no -wal/-shm orphans after a SUCCESSFUL ingest", () => {
+  it("leaves no -wal/-shm orphans after a SUCCESSFUL ingest", async () => {
     // The rename moves only the main file, so the staged sidecars used to survive every upload.
     // 34 of them had piled up on the volume by the time of the outage.
-    ingestNoopbak(goodUpload(), base());
+    await ingestNoopbak(goodUpload(), base());
     expect(staged()).toEqual([]);
   });
 
-  it("leaves no orphans after a REJECTED upload", () => {
+  it("leaves no orphans after a REJECTED upload", async () => {
     const cfg = base();
     const foreign = path.join(dataDir, "f.sqlite");
     const db = new Database(foreign); db.pragma("journal_mode = WAL"); db.exec("CREATE TABLE x(a)"); db.close();
     const z = new AdmZip(); z.addFile("noop-backup.sqlite", fs.readFileSync(foreign));
-    try { ingestNoopbak(z.toBuffer(), cfg); expect.fail("should reject"); }
+    try { await ingestNoopbak(z.toBuffer(), cfg); expect.fail("should reject"); }
     catch (e: any) { expect(e.code).toBe("foreign_db"); }
     expect(staged()).toEqual([]);
   });
 
-  it("keeps a corrupt upload a 400 — never a 507 'retry later'", () => {
+  it("keeps a corrupt upload a 400 — never a 507 'retry later'", async () => {
     // Misclassifying this would have the phone re-send the same broken bytes forever.
     const cfg = base();
     const bad = Buffer.concat([Buffer.from("SQLite format 3\0", "binary"), Buffer.alloc(4096, 0xab)]);
     const z = new AdmZip(); z.addFile("noop-backup.sqlite", bad);
-    try { ingestNoopbak(z.toBuffer(), cfg); expect.fail("should reject"); }
+    try { await ingestNoopbak(z.toBuffer(), cfg); expect.fail("should reject"); }
     catch (e: any) {
       expect(e).toBeInstanceOf(IngestError);
       expect(e.status).toBe(400);
@@ -108,7 +108,7 @@ describe("staged artifact cleanup", () => {
     expect(staged()).toEqual([]);
   });
 
-  it("sweeps crash corpses from a previous boot on the next ingest", () => {
+  it("sweeps crash corpses from a previous boot on the next ingest", async () => {
     const cfg = base();
     for (const n of [".staged-aaaaaaaaaaaa.sqlite", ".staged-aaaaaaaaaaaa.sqlite-shm", ".staged-bbbbbbbbbbbb.sqlite"]) {
       const p = path.join(dataDir, n);
@@ -117,15 +117,15 @@ describe("staged artifact cleanup", () => {
       fs.utimesSync(p, old, old);
     }
     expect(staged()).toHaveLength(3);
-    ingestNoopbak(goodUpload(), cfg);
+    await ingestNoopbak(goodUpload(), cfg);
     expect(staged()).toEqual([]);
   });
 
-  it("does not sweep a staged file young enough to belong to an in-flight upload", () => {
+  it("does not sweep a staged file young enough to belong to an in-flight upload", async () => {
     const cfg = base();
     const fresh = path.join(dataDir, ".staged-cccccccccccc.sqlite");
     fs.writeFileSync(fresh, Buffer.alloc(1024));
-    ingestNoopbak(goodUpload(), cfg);
+    await ingestNoopbak(goodUpload(), cfg);
     expect(fs.existsSync(fresh)).toBe(true);
   });
 });

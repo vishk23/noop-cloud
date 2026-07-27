@@ -24,7 +24,7 @@ const STEP_ROWS = 6001;    // 6000 wrap-aware deltas of 1 each -> sum 6000; own 
 const GRAVITY_ROWS = 6200; // > old RAW_CAP(5000); the blip sits at offsets [5700,6000) — entirely past
                             // where an old LIMIT 5000 (ORDER BY ts) read would reach.
 
-beforeAll(() => {
+beforeAll(async () => {
   fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true });
   const srcSqlite = path.join(dataDir, "src.sqlite");
   buildMirrorSqlite(srcSqlite);
@@ -46,7 +46,7 @@ beforeAll(() => {
   raw.close();
   const zip = path.join(dataDir, "b.noopbak");
   buildNoopbakFrom(srcSqlite, zip);
-  ingestNoopbak(fs.readFileSync(zip), cfg);
+  await ingestNoopbak(fs.readFileSync(zip), cfg);
 });
 
 describe("sleep_detail motion — dense-session regression (post-hoc review Critical)", () => {

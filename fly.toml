@@ -6,7 +6,10 @@ primary_region = "iad"
 [env]
   DATA_DIR = "/data"
   PORT = "8080"
-  MAX_INGEST_BYTES = "805306368"
+  # 1 GiB — same value as src/config.ts's default, deliberately. /ingest streams the body to the
+  # volume and inflates it there, so this bounds DISK, not memory; MIN_FREE_BYTES + the per-request
+  # preflight are what actually refuse an upload the volume cannot hold today.
+  MAX_INGEST_BYTES = "1073741824"
 
 [[mounts]]
   source = "noop_data"

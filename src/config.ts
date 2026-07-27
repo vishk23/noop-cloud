@@ -55,7 +55,18 @@ export function loadConfig(): Config {
     roToken: required("RO_TOKEN"),
     rwToken: required("RW_TOKEN"),
     mcpUrlSecret: process.env.MCP_URL_SECRET,
-    maxIngestBytes: Number(process.env.MAX_INGEST_BYTES ?? 262_144_000),
+    // 1 GiB, applied to BOTH the compressed body and the decompressed database inside it.
+    //
+    // Since /ingest streams (src/zipstream.ts) this number no longer costs memory — it is a DISK
+    // budget. One ingest transiently holds body + staged copy + the live mirror, so on the 3 GB
+    // volume a 1 GiB database is ~1.0 + ~0.4 + ~1.0 GB and still clears the 256 MB floor. Anything
+    // that does not actually fit on the day is refused up-front with 507 by requireSpaceFor, so this
+    // ceiling can be generous without being able to refill the volume.
+    //
+    // It was 250 MB here and 768 MB in fly.toml — a divergence that made the deployed behaviour
+    // unguessable from the source, and 768 MB is exactly what let a 608 MB database through the size
+    // check and into the OOM. Keep this value and fly.toml's identical.
+    maxIngestBytes: Number(process.env.MAX_INGEST_BYTES ?? 1_073_741_824),
     apnsKeyP8: process.env.APNS_KEY_P8,
     apnsKeyId: process.env.APNS_KEY_ID,
     appleTeamId: process.env.APPLE_TEAM_ID,

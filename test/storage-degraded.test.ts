@@ -19,9 +19,9 @@ const cfg = () => ({
   maxIngestBytes: 262_144_000, minFreeBytes: 1024, stagedSweepAgeMs: 3_600_000,
   roToken: "ro".padEnd(40, "x"), rwToken: "rw".padEnd(40, "y"), port: 0,
 } as any);
-beforeEach(() => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); });
+beforeEach(async () => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); });
 
-const ingestFixture = () => { const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfg()); };
+const ingestFixture = async () => { const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), cfg()); };
 /** Valid SQLite magic, garbage past the header — SQLite raises SQLITE_NOTADB on first read. */
 const breakMirror = () => fs.writeFileSync(cfg().mirrorPath, Buffer.concat([Buffer.from("SQLite format 3\0", "binary"), Buffer.alloc(8192, 0x7f)]));
 const plantOrphan = () => {
@@ -40,7 +40,7 @@ async function connect(server: ReturnType<typeof buildMcpServer>) {
 
 describe("MCP storage guard", () => {
   it("replaces a bare driver string with an actionable, self-locating message", async () => {
-    ingestFixture();
+    await ingestFixture();
     breakMirror();
     const client = await connect(buildMcpServer(cfg(), "ro"));
     const res: any = await client.callTool({ name: "health_snapshot", arguments: { days: 3 } });
@@ -57,7 +57,7 @@ describe("MCP storage guard", () => {
   it("does NOT swallow ordinary tool failures", async () => {
     // The guard must be surgical: only storage faults get rewritten, everything else keeps its
     // existing behaviour so real bugs stay visible.
-    ingestFixture();
+    await ingestFixture();
     const server = buildMcpServer(cfg(), "ro");
     server.registerTool("probe_boom", { title: "probe", description: "throws", inputSchema: {} },
       async () => { throw new Error("ordinary failure"); });
@@ -68,7 +68,7 @@ describe("MCP storage guard", () => {
   });
 
   it("keeps healthy tools working normally", async () => {
-    ingestFixture();
+    await ingestFixture();
     const client = await connect(buildMcpServer(cfg(), "ro"));
     const res: any = await client.callTool({ name: "health_snapshot", arguments: { days: 3 } });
     expect(res.isError).toBeFalsy();
@@ -77,8 +77,8 @@ describe("MCP storage guard", () => {
 });
 
 describe("data_freshness storage diagnostics", () => {
-  it("always reports disk, mirror size and last-ingest age", () => {
-    ingestFixture();
+  it("always reports disk, mirror size and last-ingest age", async () => {
+    await ingestFixture();
     const r: any = dataFreshness(cfg());
     expect(r.storage).toBeDefined();
     expect(r.storage.disk.totalBytes).toBeGreaterThan(0);
@@ -88,17 +88,17 @@ describe("data_freshness storage diagnostics", () => {
     expect(r.degraded).toBeUndefined();
   });
 
-  it("surfaces orphaned staging bytes before they become an outage", () => {
-    ingestFixture();
+  it("surfaces orphaned staging bytes before they become an outage", async () => {
+    await ingestFixture();
     plantOrphan();
     const r: any = dataFreshness(cfg());
     expect(r.storage.stagedOrphans.count).toBe(1);
     expect(r.storage.ok).toBe(false);
   });
 
-  it("DEGRADES instead of throwing when the mirror cannot be read", () => {
+  it("DEGRADES instead of throwing when the mirror cannot be read", async () => {
     // The whole point: the tool that explains the outage must survive the outage.
-    ingestFixture();
+    await ingestFixture();
     breakMirror();
     const r: any = dataFreshness(cfg());
     expect(r.degraded).toBe(true);
@@ -122,7 +122,7 @@ describe("/healthz and /status", () => {
   }
 
   it("/healthz stays exactly {ok:true} on a healthy server", async () => {
-    ingestFixture();
+    await ingestFixture();
     const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;
     const { status, json } = await get(port, "/healthz");
     server.close();
@@ -134,7 +134,7 @@ describe("/healthz and /status", () => {
     // 200 is deliberate: Fly's health check points here, and a non-2xx would pull the machine from
     // routing — turning "every tool explains the problem" into "the host is unreachable", and
     // blocking the deploy of the fix.
-    ingestFixture();
+    await ingestFixture();
     plantOrphan();
     const app = createApp({ ...cfg(), stagedSweepAgeMs: Number.MAX_SAFE_INTEGER }); // don't sweep the probe
     const server = app.listen(0); const port = (server.address() as any).port;
@@ -154,7 +154,7 @@ describe("/healthz and /status", () => {
   });
 
   it("/status returns the full storage report", async () => {
-    ingestFixture();
+    await ingestFixture();
     const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;
     const { status, json } = await get(port, "/status", cfg().roToken);
     server.close();
@@ -168,7 +168,7 @@ describe("/healthz and /status", () => {
   });
 
   it("createApp sweeps crash corpses at startup", async () => {
-    ingestFixture();
+    await ingestFixture();
     plantOrphan();
     createApp(cfg()); // constructing the app is what triggers the sweep
     const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;

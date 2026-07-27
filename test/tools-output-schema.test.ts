@@ -32,7 +32,7 @@ async function callTool(port: number, name: string, args: object) {
 describe("outputSchema tools validate against real output", () => {
   it("data_freshness, search, and fetch pass output-schema validation with real data", async () => {
     fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true });
-    const zip = path.join(dataDir, "b.noopbak"); buildNoopbak(zip); ingestNoopbak(fs.readFileSync(zip), cfg());
+    const zip = path.join(dataDir, "b.noopbak"); buildNoopbak(zip); await ingestNoopbak(fs.readFileSync(zip), cfg());
     const app = createApp(cfg()); const server = app.listen(0); const port = (server.address() as any).port;
     try {
       const df = await callTool(port, "data_freshness", {});

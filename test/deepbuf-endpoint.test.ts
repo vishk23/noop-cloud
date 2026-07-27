@@ -91,6 +91,13 @@ describe("POST /deepbuf", () => {
       const r = await post(port, chunkHeaders(base().rwToken, "1-2", 0, raw.length), body);
       expect(r.status).toBe(503);
       expect(r.json.error).toBe("storage_not_configured");
+      // And it says WHICH KIND of "no" this is. The phone renders a non-2xx as the raw body, so a
+      // bare code made a deliberately-disabled optional feature read like the whole-DB upload being
+      // broken — which is exactly how it read next to the real /ingest failure on 2026-07-26.
+      expect(r.json.configured).toBe(false);
+      expect(r.json.feature).toBe("deepbuf");
+      expect(r.json.detail).toMatch(/not a failure/i);
+      expect(r.json.detail).toMatch(/\/ingest/); // names the path that still works
       // And nothing was written to the data dir as a consolation prize.
       expect(fs.existsSync(path.join(dataDir, "deepbuf"))).toBe(false);
     });

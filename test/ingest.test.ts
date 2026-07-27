@@ -8,43 +8,43 @@ const cfg = () => ({ dataDir, mirrorPath: path.join(dataDir, "mirror.sqlite"), s
 beforeEach(() => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); });
 
 describe("ingest", () => {
-  it("accepts a valid .noopbak and swaps the mirror", () => {
+  it("accepts a valid .noopbak and swaps the mirror", async () => {
     const zip = path.join(dataDir, "in.noopbak"); buildNoopbak(zip);
-    const r = ingestNoopbak(fs.readFileSync(zip), cfg());
+    const r = await ingestNoopbak(fs.readFileSync(zip), cfg());
     expect(r.ok).toBe(true); expect(r.latestDay).toBe("2026-06-13");
     const db = new Database(cfg().mirrorPath, { readonly: true });
     expect((db.prepare("SELECT COUNT(*) c FROM dailyMetric").get() as any).c).toBeGreaterThan(0); db.close();
     expect(latestIngest(cfg())?.latestDay).toBe("2026-06-13");
   });
-  it("rejects oversized", () => {
+  it("rejects oversized", async () => {
     const c = cfg(); c.maxIngestBytes = 10;
-    expect(() => ingestNoopbak(Buffer.alloc(100), c)).toThrow(IngestError);
+    await expect(ingestNoopbak(Buffer.alloc(100), c)).rejects.toThrow(IngestError);
   });
-  it("rejects a zip with no sqlite entry", () => {
+  it("rejects a zip with no sqlite entry", async () => {
     const z = new AdmZip(); z.addFile("notes.txt", Buffer.from("hi"));
-    try { ingestNoopbak(z.toBuffer(), cfg()); expect.fail("should throw"); }
+    try { await ingestNoopbak(z.toBuffer(), cfg()); expect.fail("should throw"); }
     catch (e: any) { expect(e.code).toBe("no_sqlite_entry"); }
   });
-  it("rejects a foreign sqlite (no grdb_migrations)", () => {
+  it("rejects a foreign sqlite (no grdb_migrations)", async () => {
     const foreign = path.join(dataDir, "f.sqlite"); const db = new Database(foreign); db.exec("CREATE TABLE x(a)"); db.close();
     const z = new AdmZip(); z.addFile("noop-backup.sqlite", fs.readFileSync(foreign));
-    try { ingestNoopbak(z.toBuffer(), cfg()); expect.fail("should throw"); }
+    try { await ingestNoopbak(z.toBuffer(), cfg()); expect.fail("should throw"); }
     catch (e: any) { expect(e.code).toBe("foreign_db"); }
   });
-  it("does not corrupt an existing mirror when the new upload is invalid", () => {
-    const zip = path.join(dataDir, "ok.noopbak"); buildNoopbak(zip); ingestNoopbak(fs.readFileSync(zip), cfg());
-    try { ingestNoopbak(Buffer.from("not a zip"), cfg()); } catch { /* expected */ }
+  it("does not corrupt an existing mirror when the new upload is invalid", async () => {
+    const zip = path.join(dataDir, "ok.noopbak"); buildNoopbak(zip); await ingestNoopbak(fs.readFileSync(zip), cfg());
+    try { await ingestNoopbak(Buffer.from("not a zip"), cfg()); } catch { /* expected */ }
     const db = new Database(cfg().mirrorPath, { readonly: true });
     expect((db.prepare("SELECT COUNT(*) c FROM dailyMetric").get() as any).c).toBeGreaterThan(0); db.close();
   });
-  it("stores a valid phone timezone on the ingestLog row", () => {
+  it("stores a valid phone timezone on the ingestLog row", async () => {
     const zip = path.join(dataDir, "tz.noopbak"); buildNoopbak(zip);
-    ingestNoopbak(fs.readFileSync(zip), cfg(), "America/Los_Angeles");
+    await ingestNoopbak(fs.readFileSync(zip), cfg(), "America/Los_Angeles");
     expect(latestIngest(cfg())?.phoneTz).toBe("America/Los_Angeles");
   });
-  it("stores NULL phoneTz when none is supplied (default)", () => {
+  it("stores NULL phoneTz when none is supplied (default)", async () => {
     const zip = path.join(dataDir, "notz.noopbak"); buildNoopbak(zip);
-    ingestNoopbak(fs.readFileSync(zip), cfg());
+    await ingestNoopbak(fs.readFileSync(zip), cfg());
     expect(latestIngest(cfg())?.phoneTz ?? null).toBeNull();
   });
   it("normalizePhoneTz accepts IANA ids and UTC, rejects everything else", () => {
@@ -57,11 +57,11 @@ describe("ingest", () => {
     expect(normalizePhoneTz(undefined)).toBeNull();
     expect(normalizePhoneTz(42)).toBeNull();
   });
-  it("does not corrupt an existing mirror when a later upload fails AFTER staging (foreign db)", () => {
-    const zip = path.join(dataDir, "ok2.noopbak"); buildNoopbak(zip); ingestNoopbak(fs.readFileSync(zip), cfg());
+  it("does not corrupt an existing mirror when a later upload fails AFTER staging (foreign db)", async () => {
+    const zip = path.join(dataDir, "ok2.noopbak"); buildNoopbak(zip); await ingestNoopbak(fs.readFileSync(zip), cfg());
     const foreign = path.join(dataDir, "f2.sqlite"); const fdb = new Database(foreign); fdb.exec("CREATE TABLE x(a)"); fdb.close();
     const z = new AdmZip(); z.addFile("noop-backup.sqlite", fs.readFileSync(foreign));
-    try { ingestNoopbak(z.toBuffer(), cfg()); expect.fail("should throw"); }
+    try { await ingestNoopbak(z.toBuffer(), cfg()); expect.fail("should throw"); }
     catch (e: any) { expect(e.code).toBe("foreign_db"); }
     const db = new Database(cfg().mirrorPath, { readonly: true });
     expect((db.prepare("SELECT COUNT(*) c FROM dailyMetric").get() as any).c).toBeGreaterThan(0); db.close();

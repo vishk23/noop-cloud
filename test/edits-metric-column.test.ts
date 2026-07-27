@@ -26,9 +26,9 @@ function mcp(port: number, token: string, id: number, name: string, args: object
 }
 
 let port = 0; let server: any;
-beforeAll(() => {
+beforeAll(async () => {
   fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true });
-  const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); ingestNoopbak(fs.readFileSync(z), cfg());
+  const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), cfg());
   const app = createApp(cfg()); server = app.listen(0); port = (server.address() as any).port;
 });
 
