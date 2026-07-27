@@ -129,9 +129,14 @@ Two properties are load-bearing and both are pinned by `test/pagechurn.test.ts`:
   logged `null`. The atomic swap below it is byte-for-byte unchanged, and a measurement that costs a
   sync would be worth less than no measurement.
 - **It cannot grow memory.** Both files stream through two reused ~1 MiB buffers via positional
-  `readSync`; neither is ever resident. Measured on a real-sized 776 MB → 786 MB pair: **256–381 ms**
-  to compare (1.55 GB read), and **74 MB peak RSS for the whole process**, of which the comparison
-  itself accounts for ~3 MB. Against a 90–150 s sync the cost is not observable.
+  `readSync`; neither is ever resident. Measured against the real 766 MB mirror **on the deployed
+  shared-cpu-1x**: peak RSS **49.9 MB for the whole process**, of which the walk is ~3 MB. (On a
+  local NVMe, a 776 MB → 786 MB pair compares in 256–381 ms at 74 MB peak RSS.)
+- **It cannot starve the event loop.** The same Fly measurement puts a *cold* 766 MB walk at
+  **35.9 s** — the volume reads at ~21 MB/s cold, then 682 ms and 145 ms once the page cache is warm.
+  Node has one thread and Fly's service check on `/healthz` has a 5 s timeout, so a synchronous walk
+  that long would pull the machine out of routing *during an ingest*. The walk therefore yields every
+  64 MiB. `compareMs` records the real wall clock either way, so the cost is never a guess.
 
 The report is scoped to `/status` on purpose: the same object is embedded in every `data_freshness`
 MCP response and in `/healthz`, and an experiment's log does not belong in either. It is also outside

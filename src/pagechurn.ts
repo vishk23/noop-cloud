@@ -35,6 +35,17 @@ const SQLITE_HEADER_BYTES = 100;
 const SQLITE_MAGIC = "SQLite format 3\0";
 /** ~1 MiB per file, so the walk's whole memory cost is ~2 MiB no matter how large the databases are. */
 const DEFAULT_CHUNK_BYTES = 1 << 20;
+/**
+ * Hand the event loop back every 64 MiB read.
+ *
+ * Measured on the deployed shared-cpu-1x: a COLD walk of the real 766 MB mirror takes **35.9 s**
+ * (682 ms once the page cache is warm, 145 ms after that) — the volume reads at ~21 MB/s cold. Run as
+ * one synchronous block that would stall Node's single thread for 36 s, and `GET /healthz` — Fly's
+ * service check, `timeout = "5s"` — would time out repeatedly and pull the machine out of routing
+ * DURING an ingest. Yielding costs nothing measurable and removes that entirely.
+ */
+const DEFAULT_YIELD_BYTES = 64 << 20;
+const yieldToEventLoop = () => new Promise<void>((r) => setImmediate(r));
 
 /**
  * Page size from a SQLite header: bytes 16-17, big-endian u16.
@@ -109,10 +120,15 @@ const pct = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 1000) / 10 :
 /**
  * Count the pages that differ between two SQLite files, walking both at the real page size.
  *
+ * Async solely so the walk can yield: the reads themselves are positional and synchronous, which is
+ * what keeps memory flat, but a cold 766 MB pass is ~36 s of wall clock and Node has one thread.
+ *
  * Throws on anything that would make the answer a lie (missing file, bad header, short read). Callers
  * on the ingest path use `measurePageChurn` instead, which turns every throw into a logged skip.
  */
-export function comparePageFiles(oldPath: string, newPath: string, opts: { chunkBytes?: number } = {}): PageChurn {
+export async function comparePageFiles(
+  oldPath: string, newPath: string, opts: { chunkBytes?: number; yieldEveryBytes?: number } = {},
+): Promise<PageChurn> {
   const started = performance.now();
   let oldFd = -1, newFd = -1;
   try {
@@ -163,11 +179,13 @@ export function comparePageFiles(oldPath: string, newPath: string, opts: { chunk
     const bufNew = Buffer.allocUnsafe(pagesPerChunk * pageSize);
 
     const overlap = Math.min(oldPageCount, newPageCount);
-    let pagesDiffering = 0, bytesRead = SQLITE_HEADER_BYTES * 2;
+    const yieldEvery = opts.yieldEveryBytes ?? DEFAULT_YIELD_BYTES;
+    let pagesDiffering = 0, bytesRead = SQLITE_HEADER_BYTES * 2, sinceYield = 0;
     let firstChangedPage: number | null = null, lastChangedPage: number | null = null;
     const mark = (page: number) => { if (firstChangedPage === null) firstChangedPage = page; lastChangedPage = page; };
 
     for (let page = 0; page < overlap; page += pagesPerChunk) {
+      if (sinceYield >= yieldEvery) { sinceYield = 0; await yieldToEventLoop(); }
       const pages = Math.min(pagesPerChunk, overlap - page);
       const want = pages * pageSize, at = page * pageSize;
       const gotOld = readFully(oldFd, bufOld, want, at);
@@ -175,7 +193,7 @@ export function comparePageFiles(oldPath: string, newPath: string, opts: { chunk
       // Both files were stat'd above, so a short read means the file changed under us or the volume
       // is failing. Either way the count would be wrong — refuse rather than record a low number.
       if (gotOld < want || gotNew < want) throw new PageChurnError(`short read at page ${page}: old ${gotOld}/${want}, new ${gotNew}/${want}`);
-      bytesRead += gotOld + gotNew;
+      bytesRead += gotOld + gotNew; sinceYield += gotOld + gotNew;
       // One memcmp over the whole chunk first. An append-ordered database leaves most of the file
       // untouched, so this skips ~1 MiB at a time and is what keeps the walk I/O-bound.
       if (bufOld.compare(bufNew, 0, want, 0, want) === 0) continue;
@@ -208,9 +226,9 @@ export function comparePageFiles(oldPath: string, newPath: string, opts: { chunk
  * moved mid-walk — all of it degrades to a warning and a null, and the atomic swap proceeds byte-for-
  * byte as if this module did not exist.
  */
-export function measurePageChurn(oldPath: string, newPath: string): PageChurn | null {
+export async function measurePageChurn(oldPath: string, newPath: string): Promise<PageChurn | null> {
   try {
-    return comparePageFiles(oldPath, newPath);
+    return await comparePageFiles(oldPath, newPath);
   } catch (e) {
     console.warn("page-churn telemetry skipped:", e instanceof Error ? e.message : String(e));
     return null;

@@ -189,7 +189,9 @@ export async function ingestNoopbakFile(
     // is the only place the page diff between two real syncs can be counted. Pure reads, no
     // allocation proportional to either file, and `measurePageChurn` cannot throw: if it fails for
     // any reason it logs and returns null, and the swap below is byte-for-byte what it always was.
-    churn = measurePageChurn(cfg.mirrorPath, staged);
+    // Awaited because the walk yields the event loop every 64 MiB — a cold pass over the 766 MB
+    // mirror is ~36 s on this hardware, and Node's one thread owes /healthz an answer meanwhile.
+    churn = await measurePageChurn(cfg.mirrorPath, staged);
     // Atomic swap: rename staged -> mirror (same filesystem). Remove stale WAL/SHM sidecars.
     for (const ext of ["-wal", "-shm"]) { const s = cfg.mirrorPath + ext; if (fs.existsSync(s)) fs.rmSync(s); }
     fs.renameSync(staged, cfg.mirrorPath);
