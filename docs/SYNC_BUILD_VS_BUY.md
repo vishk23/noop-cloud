@@ -1,5 +1,94 @@
 # Sync: build vs. buy — and what to build instead
 
+> ## ⚠️ REVISION 2026-07-27: buy, don't build. `liters` is licensed and it is good.
+>
+> **What changed.** VK contacted Kurt Mackey directly and Kurt confirmed `liters` is being
+> MIT-licensed and that VK is free to use it now — use, modify, file issues, open PRs. §3.9's
+> "no LICENSE, all rights reserved, legally cannot vendor" verdict is **withdrawn**. That was the
+> only blocker, and with it gone the recommendation below (build a custom page protocol, P3–P5)
+> is **superseded**.
+>
+> **Also wrong in §3.9:** it said `liters` had no usable Swift story. It has one.
+> `crates/liters-ffi` is 1,483 lines of UniFFI exporting `LitersWriter` / `LitersReplica` /
+> `LitersManager`, and `scripts/build-ios.sh` produces a real `Liters.xcframework` for
+> `aarch64-apple-ios` + both simulator arches.
+>
+> **Revised recommendation:**
+> **P0 (page-churn telemetry) and P2 (phone operational hardening) still ship — they are
+> measurement and reliability, and are not superseded by anything. P3, P4 and P5 (the custom
+> `/sync-manifest` + `/ingest-pages` protocol) are cancelled. In their place, trial `liters` over
+> its own HTTP push protocol, with the phone supplying `URLSession` through the transport seam.**
+>
+> **Read the code before trusting this summary — it is unusually good.** 21,380 lines of Rust,
+> **zero** `TODO`, `FIXME`, `unimplemented!()` or `todo!()` anywhere. `crates/liters/src/verify.rs`
+> is a branch-for-branch port of Litestream's `db.go:1499-1704` decision tree with the upstream
+> issue numbers (#900, #927, #997, #896, #781) cited at each hardening. This is a careful port of
+> battle-tested logic, not a reimplementation.
+>
+> ### The one thing that must be tested before committing
+>
+> `liters` ships **WAL frames**, so it must observe every transaction. It cannot, on iOS.
+> `crates/liters/src/meta.rs:110-112` says so explicitly, and correctly:
+>
+> > *"sound while the read lock continuously prevents foreign checkpoints, which is false across a
+> > writer close/reopen — a stale `true` could skip the snapshot that recovers commits checkpointed
+> > while closed."*
+>
+> So the issue-#927 "expected truncation" shortcut is deliberately **not trusted across an app
+> restart** — which on iOS is every single time. And `crates/liters/src/checkpoint.rs:1-3`:
+> *"Because the writer's long-running read transaction starves every other checkpointer (including
+> the app's wal_autocheckpoint), liters MUST checkpoint the database itself."*
+>
+> **The failure mode, concretely:** the app is killed, GRDB's `wal_autocheckpoint` (default 1000
+> pages = 4 MB) restarts the WAL, the app writes past `liters`' old resume offset, and
+> `verify.rs:162` finds the last synced frame overwritten → `"wal overwritten by another process"`
+> → **full snapshot of the whole 766 MB database.** That is precisely the upload we are trying to
+> stop doing.
+>
+> **Mitigation, and it is the integration requirement:** set `PRAGMA wal_autocheckpoint = 0` in
+> GRDB and let `liters` be the only checkpointer. WAL growth between pushes is then bounded by
+> write volume — at 8.3 MB/day, a week offline is a ~58 MB WAL, which is fine. **The number to
+> measure in the trial is how often a push degrades to `snapshotting = true`.** If it is rare,
+> adopt. If it is routine, the physical-page-diff design in §1 is immune to this failure by
+> construction (its delta is derived from data at rest, so a missed window costs a larger diff and
+> never a full re-upload) and becomes the fallback rather than the plan.
+>
+> ### Transport: use liters' HTTP push, not direct-to-Tigris
+>
+> The tempting option is phone → Tigris (S3) directly, since `crates/liters-storage/src/s3.rs`
+> genuinely writes litestream's bucket layout (`{prefix}/{level:04x}/{min:016x}-{max:016x}.ltx`)
+> and the bucket already exists. **Don't.** Three reasons, in order:
+>
+> 1. **It cannot survive app suspension.** `Storage::S3` drives `object_store`/reqwest/rustls/tokio
+>    — its own networking stack. iOS only completes an upload after the app suspends when the
+>    transfer belongs to a background `URLSession`. `Storage::Http` has a **pluggable transport
+>    seam** (`#[uniffi::export(with_foreign)] HttpClient`) that lets Swift supply the request —
+>    i.e. the app's own background `URLSession`. That is the difference between a sync that
+>    finishes in the background and one that dies at suspension.
+> 2. **It puts bucket-write credentials on the device.** Litestream's model assumes a trusted
+>    server. `Storage::Http` uses `Authorization: Bearer <token>`, matching the existing scheme.
+> 3. **Binary size.** The `s3` feature is off by default precisely because it "pulls in
+>    `object_store` + the reqwest/hyper/rustls/tokio async stack (several MB of `.so`) that a
+>    mobile app following over HTTP never uses" (`crates/liters-ffi/Cargo.toml:17-19`).
+>
+> ### What this costs, honestly
+>
+> **There is no `liters` CLI binary.** The only `[[bin]]` in the workspace is `uniffi-bindgen`.
+> The server half is a library, so the Fly machine needs a small Rust program VK writes and
+> maintains (serve the push endpoint, run `Replica::sync()` to keep `replica.db` current),
+> plus a Rust toolchain in the Docker build and a second process next to Node. That is the real
+> price of adoption and it is not zero — but `Replica::sync()` does produce a plain on-disk SQLite
+> file that `better-sqlite3` opens read-only, so **all 19 MCP call sites stay unchanged.**
+>
+> **Licence caveat, worth closing before shipping:** as of 2026-07-27 the public repo still has
+> **no LICENSE file**, GitHub's licence metadata is `null`, `Cargo.toml` says `Apache-2.0` (not
+> MIT), and issue #1 has no reply. Kurt's grant to VK is real but currently out-of-band. Ask him to
+> push the file and reconcile the `Cargo.toml` field before this becomes load-bearing.
+>
+> The rest of this document is preserved as written. §1 (the physical page protocol) is now the
+> **fallback design**, not the plan; §3.9's verdict on `liters` is withdrawn; everything in §2
+> about why physical beats logical still stands and is in fact the argument *for* `liters`.
+
 Status: **decision document.** Written 2026-07-26/27, after the streaming-ingest fix landed and the
 phone successfully uploaded 153.4 MB (mirror 534 MB → 766 MB, `lastIngestAgeSeconds` back to 167 s,
 9.3 GB free on the extended 10 GB volume). Nothing is on fire. This is an architecture call made
