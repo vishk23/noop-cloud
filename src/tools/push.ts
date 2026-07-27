@@ -25,12 +25,21 @@ export async function requestSync(cfg: Config, send?: SendFn) {
     return { throttled: true, retryInSec: THROTTLE_S - (now - last) };
   }
   setLastPushAt(cfg, now);
-  const { pushed } = await sendSyncPush(cfg, send);
+  const { pushed, pruned } = await sendSyncPush(cfg, send);
+  // `pushed` alone cannot distinguish a live phone from a zombie token: APNs answers 200 for a token
+  // it has not yet marked Unregistered, so a stale token left by an earlier install reports
+  // `pushed: 1` while nothing syncs (seen 2026-07-26, when the app shipped without `aps-environment`
+  // and so never re-registered). Reporting the pre-push `devices` count and how many tokens APNs
+  // rejected as dead (sendSyncPush prunes on 410/BadDeviceToken) makes that state readable.
   return {
+    devices,
     pushed,
+    pruned,
     mirrorAgeSeconds: dataFreshness(cfg).mirrorAgeSeconds,
     expectFreshWithinSec: EXPECT_FRESH_WITHIN_S,
-    hint: "poll data_freshness until mirrorAgeSeconds resets",
+    hint: pushed === 0 && pruned > 0
+      ? "every registered token was dead and has been dropped — open NOOP once so the phone re-registers"
+      : "poll data_freshness until mirrorAgeSeconds resets",
   };
 }
 
