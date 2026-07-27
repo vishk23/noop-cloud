@@ -29,6 +29,23 @@ const goodUploadPath = () => { const z = path.join(dataDir, "in.noopbak"); build
 const goodUpload = () => fs.readFileSync(goodUploadPath());
 const staged = () => listStagedArtifacts(dataDir).map((a) => a.name).sort();
 
+/**
+ * Waits (bounded) for the staged set to drain.
+ *
+ * The property under test is "an aborted upload leaves NO orphan behind", which is inherently
+ * eventual: the server only learns the client hung up when the socket closes, and the `finally` that
+ * unlinks the body runs after that. A fixed sleep encodes a guess about how fast that happens, and
+ * on a loaded machine the guess is wrong — which is a flaky test, not a caught bug. Polling asserts
+ * exactly the same property without the guess, and still fails outright if the orphan really is left.
+ */
+async function expectNoStagedOrphans(timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && staged().length > 0) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  expect(staged()).toEqual([]);
+}
+
 /** Runs `fn` against a listening app, always closing the server. */
 async function withApp(cfg: any, fn: (port: number) => Promise<void>): Promise<void> {
   const server = createApp(cfg).listen(0);
@@ -212,9 +229,9 @@ describe("streamed /ingest", () => {
         r.on("error", () => resolve()); // the abort surfaces here on the client side
         r.write(body.subarray(0, body.length >> 1), () => { r.destroy(); resolve(); });
       });
-      await new Promise((r) => setTimeout(r, 300)); // let the server observe the close
+      await expectNoStagedOrphans(); // let the server observe the close, then check
     });
-    expect(staged()).toEqual([]);
+    await expectNoStagedOrphans();
     expect(fs.existsSync(cfg.mirrorPath)).toBe(false); // and nothing was half-swapped into place
   });
 
@@ -232,10 +249,10 @@ describe("streamed /ingest", () => {
         r.on("error", () => resolve());
         r.write(body.subarray(0, 4096), () => { r.destroy(); resolve(); });
       });
-      await new Promise((r) => setTimeout(r, 300));
+      await expectNoStagedOrphans();
       expect(fs.statSync(cfg.mirrorPath).size).toBe(before);
     });
-    expect(staged()).toEqual([]);
+    await expectNoStagedOrphans();
   });
 
   it("sweeps a leaked .noopbak body from a previous crash", async () => {
