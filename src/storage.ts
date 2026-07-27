@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { openServerDb } from "./serverdb.js";
+import { recentPageChurn, type PageChurnRow } from "./pagechurn.js";
 import type { Config } from "./config.js";
 
 // Why this module exists (2026-07-26 outage, post-mortem):
@@ -186,6 +187,16 @@ export interface StorageReport {
   lastIngestError?: string;
   /** Can the volume absorb one more atomic swap (a second full copy of the mirror + headroom)? */
   nextIngestFits: boolean | null;
+  /**
+   * P0 of docs/SYNC_BUILD_VS_BUY.md — the last few page-diff measurements, newest first (see
+   * src/pagechurn.ts). This is how the churn number gets read without SSH-ing to the machine.
+   *
+   * Present ONLY when asked for, because the same report is embedded verbatim in every
+   * `data_freshness` MCP response and in /healthz's liveness check: a ~1.5 KB experiment log has no
+   * business in the tool an agent is told to call first. `GET /status` asks for it; nothing else does.
+   * Deliberately outside the `ok` verdict too — a telemetry fault must never turn a health check red.
+   */
+  pageChurn?: PageChurnRow[];
   warnings: string[];
 }
 
@@ -198,7 +209,7 @@ const statOr = (p: string) => { try { return fs.statSync(p); } catch { return nu
  * that opening server.sqlite throws. Every step is individually guarded; this function must not be
  * capable of failing for the reason it exists to diagnose.
  */
-export function storageReport(cfg: StorageCfg): StorageReport {
+export function storageReport(cfg: StorageCfg, opts: { pageChurnLimit?: number } = {}): StorageReport {
   const minFree = cfg.minFreeBytes ?? 268_435_456;
   const disk = diskUsage(cfg.dataDir);
   const mStat = statOr(cfg.mirrorPath);
@@ -209,6 +220,7 @@ export function storageReport(cfg: StorageCfg): StorageReport {
   let lastIngestAt: string | null = null;
   let lastIngestAgeSeconds: number | null = null;
   let lastIngestError: string | undefined;
+  let pageChurn: PageChurnRow[] | undefined;
   try {
     const db = openServerDb(cfg);
     try {
@@ -216,6 +228,11 @@ export function storageReport(cfg: StorageCfg): StorageReport {
       if (r?.receivedAt) {
         lastIngestAt = new Date(r.receivedAt * 1000).toISOString();
         lastIngestAgeSeconds = Math.floor(Date.now() / 1000) - r.receivedAt;
+      }
+      // Its own try, INSIDE the connection: a fault reading the experiment's table must not surface as
+      // `lastIngestError`, which is a warning and would flip storageReport().ok — and /healthz with it.
+      if (opts.pageChurnLimit) {
+        try { pageChurn = recentPageChurn(db, opts.pageChurnLimit); } catch { /* telemetry is never load-bearing */ }
       }
     } finally { db.close(); }
   } catch (e) {
@@ -263,6 +280,7 @@ export function storageReport(cfg: StorageCfg): StorageReport {
     lastIngestAgeSeconds,
     ...(lastIngestError ? { lastIngestError } : {}),
     nextIngestFits,
+    ...(pageChurn ? { pageChurn } : {}),
     warnings,
   };
 }

@@ -61,9 +61,13 @@ export function createApp(cfg: Config): express.Express {
   // Full storage/ingest diagnostics: disk free %, mirror size, orphaned staging bytes, and how long
   // since the last successful ingest — the numbers that would have made the outage visible days
   // early. Behind `ro` because it reports host paths and volume geometry.
+  //
+  // The only caller that asks for `pageChurn` — the P0 page-diff measurements of
+  // docs/SYNC_BUILD_VS_BUY.md. /healthz and the `data_freshness` MCP tool share this report and
+  // deliberately do not carry the experiment's log.
   app.get("/status", requireScope(cfg, "ro"), (_req, res) => {
     try {
-      res.json(storageReport(cfg));
+      res.json(storageReport(cfg, { pageChurnLimit: 20 }));
     } catch (e) {
       res.status(500).json({ ok: false, error: "status_failed", detail: e instanceof Error ? e.message : String(e) });
     }

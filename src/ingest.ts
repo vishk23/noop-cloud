@@ -5,6 +5,7 @@ import type { Config } from "./config.js";
 import { openServerDb } from "./serverdb.js";
 import { diskUsage, formatBytes, sweepStagedArtifacts, removeStagedSet, isVolumeError, isPayloadDbError, storageFailureMessage } from "./storage.js";
 import { readCentralDirectory, extractEntryToFile, ZipError } from "./zipstream.js";
+import { measurePageChurn, recordPageChurn, type PageChurn } from "./pagechurn.js";
 
 export { openServerDb } from "./serverdb.js";
 /**
@@ -165,6 +166,7 @@ export async function ingestNoopbakFile(
 
   const staged = stagedPath(cfg.dataDir, "sqlite");
   let latestDay: string | null = null;
+  let churn: PageChurn | null = null;
   try {
     const written = await extractEntryToFile(uploadPath, fd, uploadBytes, entry, staged,
       { maxBytes: cfg.maxIngestBytes, expectMagic: SQLITE_MAGIC });
@@ -182,6 +184,12 @@ export async function ingestNoopbakFile(
       if (!hasGrdb) throw new IngestError("foreign_db");
       latestDay = (sdb.prepare("SELECT MAX(day) d FROM dailyMetric").get() as any)?.d ?? null;
     } finally { sdb.close(); }
+    // P0 telemetry (docs/SYNC_BUILD_VS_BUY.md §1.3). This instant — validated snapshot staged, live
+    // mirror not yet replaced — is the only moment both versions of the database exist on disk, so it
+    // is the only place the page diff between two real syncs can be counted. Pure reads, no
+    // allocation proportional to either file, and `measurePageChurn` cannot throw: if it fails for
+    // any reason it logs and returns null, and the swap below is byte-for-byte what it always was.
+    churn = measurePageChurn(cfg.mirrorPath, staged);
     // Atomic swap: rename staged -> mirror (same filesystem). Remove stale WAL/SHM sidecars.
     for (const ext of ["-wal", "-shm"]) { const s = cfg.mirrorPath + ext; if (fs.existsSync(s)) fs.rmSync(s); }
     fs.renameSync(staged, cfg.mirrorPath);
@@ -209,6 +217,9 @@ export async function ingestNoopbakFile(
   }
   const db = openServerDb(cfg);
   db.prepare("INSERT INTO ingestLog (receivedAt, bytes, latestDay, phoneTz) VALUES (?,?,?,?)").run(Math.floor(Date.now() / 1000), uploadBytes, latestDay, phoneTz);
+  // After the swap, deliberately: the mirror is already live, so a telemetry write cannot affect it.
+  // recordPageChurn swallows its own errors for the same reason measurePageChurn does.
+  if (churn) recordPageChurn(db, churn, uploadBytes);
   db.close();
   return { ok: true, bytes: uploadBytes, latestDay };
 }

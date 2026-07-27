@@ -39,6 +39,25 @@ export function openServerDb(cfg: Pick<Config, "serverDbPath">): Database.Databa
       UNIQUE (generation, byteStart));
     -- Coverage/window queries range over strap_ts (the second the STRAP stamped), never over receivedAt.
     CREATE INDEX IF NOT EXISTS deepBufferChunk_strap ON deepBufferChunk (firstStrapTs, lastStrapTs);
+    -- P0 of docs/SYNC_BUILD_VS_BUY.md: how many SQLite pages actually differ between the outgoing
+    -- mirror and each incoming snapshot (see src/pagechurn.ts). One row per ingest, ~120 bytes.
+    --
+    -- This is a falsification experiment, so it needs a SERIES, not a reading: the document's entire
+    -- case for page-level replication is the unmeasured claim that a routine sync dirties 1-3% of the
+    -- file, and one sync cannot distinguish "1% every time" from "1% now, 40% after a recompute".
+    -- Kept unbounded on purpose — at VK's cadence a year of syncs is well under a megabyte.
+    CREATE TABLE IF NOT EXISTS ingestPageChurn (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      measuredAt INTEGER NOT NULL,
+      pageSize INTEGER NOT NULL, oldPageSize INTEGER,
+      oldPageCount INTEGER NOT NULL, newPageCount INTEGER NOT NULL,
+      pagesDiffering INTEGER NOT NULL, pagesAdded INTEGER NOT NULL, pagesRemoved INTEGER NOT NULL,
+      firstChangedPage INTEGER, lastChangedPage INTEGER,
+      deltaPages INTEGER NOT NULL, deltaBytes INTEGER NOT NULL, churnPct REAL NOT NULL,
+      -- The compressed body /ingest actually received, beside deltaBytes: the win is this ratio.
+      uploadBytes INTEGER NOT NULL,
+      compareMs INTEGER NOT NULL, bytesRead INTEGER NOT NULL,
+      pageSizeChanged INTEGER NOT NULL DEFAULT 0, bootstrap INTEGER NOT NULL DEFAULT 0);
   `);
   const cols = db.prepare("PRAGMA table_info(editJournal)").all() as any[];
   if (!cols.some((c) => c.name === "ackedAt")) db.exec("ALTER TABLE editJournal ADD COLUMN ackedAt INTEGER");

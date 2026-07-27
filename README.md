@@ -98,6 +98,45 @@ Guardrails, all exercised by `test/storage*.test.ts`, `test/ingest-space-guard.t
 > already been doubled twice (512 MB → 1 GB → 2 GB) for the same failure, each doubling buying only
 > the weeks it took the database to grow into it; streaming removed the scaling instead.
 
+## Page-churn telemetry (`pageChurn` on `/status`)
+
+Stage **P0** of [`docs/SYNC_BUILD_VS_BUY.md`](docs/SYNC_BUILD_VS_BUY.md), and a **falsification
+experiment before it is a feature**. That document proposes replacing the whole-database upload with
+page-level replication — ship only the changed 4 KB SQLite pages — and its entire case rests on one
+number nobody had ever measured: how much of the file actually changes between two syncs. If routine
+churn is ~1–3% the plan is right; if it is above ~10%, the plan is wrong and several weeks of work
+are not worth starting.
+
+At the instant of the atomic swap the server transiently holds **both** databases — the outgoing
+mirror and the validated incoming snapshot — which is the only moment that diff can be counted. So
+`src/pagechurn.ts` walks both files at the page size read from the SQLite header (bytes 16–17
+big-endian; **never assumed to be 4096**) and records one row per ingest in `ingestPageChurn`:
+
+```bash
+curl -sH "Authorization: Bearer $RO_TOKEN" https://<app>.fly.dev/status | jq '.pageChurn[0]'
+```
+
+`deltaBytes` (what a page-diff upload *would* have carried, uncompressed) sits directly beside
+`uploadBytes` (what `/ingest` actually carried, compressed), so the win — or its absence — needs no
+arithmetic. Read the **series**, not one row: a single sync cannot tell "1% every time" apart from
+"1% now, 40% after the next recompute". `bootstrap` and `pageSizeChanged` rows are flagged because
+they are 100% by definition and are not churn evidence.
+
+Two properties are load-bearing and both are pinned by `test/pagechurn.test.ts`:
+
+- **It cannot fail an upload.** The ingest path only ever calls `measurePageChurn`, which converts
+  every possible failure — unreadable mirror, corrupt header, short read, a missing table — into a
+  logged `null`. The atomic swap below it is byte-for-byte unchanged, and a measurement that costs a
+  sync would be worth less than no measurement.
+- **It cannot grow memory.** Both files stream through two reused ~1 MiB buffers via positional
+  `readSync`; neither is ever resident. Measured on a real-sized 776 MB → 786 MB pair: **256–381 ms**
+  to compare (1.55 GB read), and **74 MB peak RSS for the whole process**, of which the comparison
+  itself accounts for ~3 MB. Against a 90–150 s sync the cost is not observable.
+
+The report is scoped to `/status` on purpose: the same object is embedded in every `data_freshness`
+MCP response and in `/healthz`, and an experiment's log does not belong in either. It is also outside
+the `ok` verdict, so a telemetry fault can never turn a health check red.
+
 ## Upload data (iOS Shortcut, no app changes)
 
 In NOOP: **Settings → Backup & Sync → Back up now** to write a `.noopbak`. Then an iOS Shortcut:
