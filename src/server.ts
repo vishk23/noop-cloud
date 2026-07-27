@@ -97,8 +97,19 @@ export function createApp(cfg: Config): express.Express {
       if (Number.isFinite(declared) && declared > 0) requireSpaceFor(declared, cfg, "upload body");
       await receiveUploadBody(req, upload, cfg);
       const phoneTz = normalizePhoneTz(req.header("x-phone-timezone"));
-      const out = await ingestNoopbakFile(upload, cfg, phoneTz, { consume: true });
+      // Collected, not awaited: the page-churn walk is ~54 s on the real mirror pair and the phone
+      // times out after 60 s of inactivity, so it must not sit between the swap and this response.
+      const churnTasks: Array<() => Promise<void>> = [];
+      const out = await ingestNoopbakFile(upload, cfg, phoneTz, {
+        consume: true, deferChurn: (t) => churnTasks.push(t),
+      });
       res.json(out);
+      // AFTER the response, deliberately. The walk yields the event loop every 64 MiB, so /healthz —
+      // Fly's 5 s service check — keeps answering while it runs. Telemetry never escalates: a throw
+      // here would be an unhandled rejection on a request that already succeeded.
+      for (const task of churnTasks) {
+        void task().catch((e) => console.warn("deferred page-churn telemetry failed:", e));
+      }
     } catch (e) {
       // The phone hung up mid-upload (backgrounded, lost signal). There is no socket to answer on
       // and nothing was corrupted — the staged body is removed below like any other failure.

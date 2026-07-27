@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import fs from "node:fs"; import path from "node:path"; import http from "node:http";
 import Database from "better-sqlite3";
 import { buildMirrorSqlite, buildNoopbakFrom } from "./fixtures/make-fixture.js";
-import { ingestNoopbak } from "../src/ingest.js";
+import { ingestNoopbak, ingestNoopbakFile } from "../src/ingest.js";
 import { openServerDb } from "../src/serverdb.js";
 import { storageReport } from "../src/storage.js";
 import { createApp } from "../src/server.js";
@@ -346,6 +346,40 @@ describe("the ingest path", () => {
     m.close();
     const db = openServerDb(c); const rows = recentPageChurn(db); db.close();
     expect(rows).toHaveLength(1); // only the bootstrap row; the failed measurement recorded nothing
+  });
+
+  // The regression this pins is not a wrong number, it is a wrong PLACE. On 2026-07-27 the walk ran
+  // between the swap and the response: `compareMs` was 53.7 s against the phone's 60 s inactivity
+  // timeout, so the server ingested perfectly and the phone recorded "The request timed out", never
+  // advanced `cloudsync.lastUploadToken`, and would have re-uploaded the same ~157 MB on every later
+  // sync forever. Telemetry that must not be able to FAIL an ingest must not be able to TIME ONE OUT.
+  it("defers the churn walk past the response and leaves no preserved-mirror corpse", async () => {
+    const src = f("src.sqlite"); buildMirrorSqlite(src);
+    const c = cfg();
+    const bakPath = (name: string) => { const z = f(name); buildNoopbakFrom(src, z); return z; };
+    await ingestNoopbak(fs.readFileSync(bakPath("one.noopbak")), c); // establishes a mirror to diff
+
+    const tasks: Array<() => Promise<void>> = [];
+    const r = await ingestNoopbakFile(bakPath("two.noopbak"), c, null,
+      { consume: true, deferChurn: (t) => tasks.push(t) });
+    expect(r.ok).toBe(true);
+    expect(tasks).toHaveLength(1);
+
+    // The mirror is already live and correct the instant the call returns, so answering here is
+    // honest — the deferral moves telemetry out, not the swap the response is actually claiming.
+    const m = new Database(c.mirrorPath, { readonly: true });
+    expect((m.prepare("SELECT COUNT(*) n FROM dailyMetric").get() as any).n).toBeGreaterThan(0);
+    m.close();
+
+    const pre = openServerDb(c); const before = recentPageChurn(pre); pre.close();
+    expect(before).toHaveLength(1); // bootstrap only: the walk has NOT run at response time
+
+    await tasks[0]();
+    const post = openServerDb(c); const after = recentPageChurn(post); post.close();
+    expect(after).toHaveLength(2); // …and it still records once it does
+
+    // The outgoing mirror was preserved by rename to run the diff against; it must not outlive it.
+    expect(fs.readdirSync(dataDir).filter((n) => n.startsWith(".staged-"))).toEqual([]);
   });
 
   it("GET /status carries the rows, and a measurement never affects ok/healthz", async () => {

@@ -5,7 +5,7 @@ import type { Config } from "./config.js";
 import { openServerDb } from "./serverdb.js";
 import { diskUsage, formatBytes, sweepStagedArtifacts, removeStagedSet, isVolumeError, isPayloadDbError, storageFailureMessage } from "./storage.js";
 import { readCentralDirectory, extractEntryToFile, ZipError } from "./zipstream.js";
-import { measurePageChurn, recordPageChurn, type PageChurn } from "./pagechurn.js";
+import { measurePageChurn, recordPageChurn } from "./pagechurn.js";
 
 export { openServerDb } from "./serverdb.js";
 /**
@@ -124,7 +124,8 @@ export interface IngestResult { ok: true; bytes: number; latestDay: string | nul
  * passing a fixture path do not.
  */
 export async function ingestNoopbakFile(
-  uploadPath: string, cfg: IngestCfg, phoneTz: string | null = null, opts: { consume?: boolean } = {},
+  uploadPath: string, cfg: IngestCfg, phoneTz: string | null = null,
+  opts: { consume?: boolean; deferChurn?: (task: () => Promise<void>) => void } = {},
 ): Promise<IngestResult> {
   const uploadBytes = fs.statSync(uploadPath).size;
   if (uploadBytes > cfg.maxIngestBytes) throw new IngestError("too_large", `body ${uploadBytes} > ${cfg.maxIngestBytes}`, 413);
@@ -166,7 +167,7 @@ export async function ingestNoopbakFile(
 
   const staged = stagedPath(cfg.dataDir, "sqlite");
   let latestDay: string | null = null;
-  let churn: PageChurn | null = null;
+  let measureChurn: (() => Promise<void>) | null = null;
   try {
     const written = await extractEntryToFile(uploadPath, fd, uploadBytes, entry, staged,
       { maxBytes: cfg.maxIngestBytes, expectMagic: SQLITE_MAGIC });
@@ -184,17 +185,52 @@ export async function ingestNoopbakFile(
       if (!hasGrdb) throw new IngestError("foreign_db");
       latestDay = (sdb.prepare("SELECT MAX(day) d FROM dailyMetric").get() as any)?.d ?? null;
     } finally { sdb.close(); }
-    // P0 telemetry (docs/SYNC_BUILD_VS_BUY.md §1.3). This instant — validated snapshot staged, live
-    // mirror not yet replaced — is the only moment both versions of the database exist on disk, so it
-    // is the only place the page diff between two real syncs can be counted. Pure reads, no
-    // allocation proportional to either file, and `measurePageChurn` cannot throw: if it fails for
-    // any reason it logs and returns null, and the swap below is byte-for-byte what it always was.
-    // Awaited because the walk yields the event loop every 64 MiB — a cold pass over the 766 MB
-    // mirror is ~36 s on this hardware, and Node's one thread owes /healthz an answer meanwhile.
-    churn = await measurePageChurn(cfg.mirrorPath, staged);
-    // Atomic swap: rename staged -> mirror (same filesystem). Remove stale WAL/SHM sidecars.
-    for (const ext of ["-wal", "-shm"]) { const s = cfg.mirrorPath + ext; if (fs.existsSync(s)) fs.rmSync(s); }
-    fs.renameSync(staged, cfg.mirrorPath);
+    // P0 telemetry (docs/SYNC_BUILD_VS_BUY.md §1.3) needs BOTH versions of the database on disk, and
+    // the swap below destroys the outgoing one — so preserve it by RENAME (same filesystem: no copy,
+    // no bytes written, no new preflight) rather than measuring inline. Peak disk is unchanged, since
+    // the volume already held mirror + staged at this same instant; only the window in which the pair
+    // coexists now extends past the response instead of ending at the swap.
+    //
+    // Deliberately a `.staged-<hex>.sqlite` name: that is the one filename shape
+    // `sweepStagedArtifacts` knows how to reclaim, so a process killed mid-measurement leaves a
+    // corpse the next ingest collects rather than a new orphan class that nothing owns.
+    const prevMirror = stagedPath(cfg.dataDir, "sqlite");
+    const hadMirror = fs.existsSync(cfg.mirrorPath);
+    if (hadMirror) fs.renameSync(cfg.mirrorPath, prevMirror);
+    try {
+      // Atomic swap: rename staged -> mirror (same filesystem). Remove stale WAL/SHM sidecars.
+      for (const ext of ["-wal", "-shm"]) { const s = cfg.mirrorPath + ext; if (fs.existsSync(s)) fs.rmSync(s); }
+      fs.renameSync(staged, cfg.mirrorPath);
+    } catch (e) {
+      // Put the outgoing mirror back. A single rename could not leave the server with NO mirror;
+      // preserve-then-swap can, and that state would be worse than the failed upload that caused it.
+      if (hadMirror) { try { fs.renameSync(prevMirror, cfg.mirrorPath); } catch { /* best-effort */ } }
+      throw e;
+    }
+    // The measurement as a TASK, not a call. `compareMs` on the real 766 MB pair is ~54 s (measured
+    // 2026-07-27) and `CloudSyncClient.syncSession` sets `timeoutIntervalForRequest = 60` — 60 s of
+    // INACTIVITY. Running the walk before answering pushed the response past that deadline: the
+    // server ingested perfectly, the phone recorded "The request timed out", never advanced
+    // `cloudsync.lastUploadToken`, and would have re-uploaded the same ~157 MB on every later sync
+    // while the server kept succeeding. Telemetry that must not be able to FAIL an ingest must not be
+    // able to TIME ONE OUT either — the constraint at the top of pagechurn.ts, in the dimension it
+    // did not anticipate.
+    measureChurn = async () => {
+      try {
+        // `prevMirror` unconditionally, even when there was no mirror to preserve: the path then
+        // simply does not exist, and comparePageFiles' own `!fs.existsSync(oldPath)` branch turns
+        // that into the BOOTSTRAP row it exists to record — "a 100% row that is NOT evidence against
+        // page replication". Guarding on `hadMirror` here would drop the first sync on a fresh volume
+        // silently, which is the exact outcome that branch was written to prevent.
+        const c = await measurePageChurn(prevMirror, cfg.mirrorPath);
+        if (c) {
+          const cdb = openServerDb(cfg);
+          try { recordPageChurn(cdb, c, uploadBytes); } finally { cdb.close(); }
+        }
+      } finally {
+        removeStagedSet(prevMirror);
+      }
+    };
   } catch (e) {
     removeStagedSet(staged);
     if (e instanceof ZipError) throw zipToIngestError(e);
@@ -219,10 +255,14 @@ export async function ingestNoopbakFile(
   }
   const db = openServerDb(cfg);
   db.prepare("INSERT INTO ingestLog (receivedAt, bytes, latestDay, phoneTz) VALUES (?,?,?,?)").run(Math.floor(Date.now() / 1000), uploadBytes, latestDay, phoneTz);
-  // After the swap, deliberately: the mirror is already live, so a telemetry write cannot affect it.
-  // recordPageChurn swallows its own errors for the same reason measurePageChurn does.
-  if (churn) recordPageChurn(db, churn, uploadBytes);
   db.close();
+  // Hand the churn walk to the caller when it has somewhere better to run it: the /ingest handler
+  // schedules it AFTER res.json, so what the phone waits on is bounded by the swap, not by telemetry.
+  // With no scheduler (the Buffer overload, fixture callers, tests) it runs inline and every caller
+  // downstream observes the recorded row immediately — the behaviour this had before it was deferred.
+  if (measureChurn) {
+    if (opts.deferChurn) opts.deferChurn(measureChurn); else await measureChurn();
+  }
   return { ok: true, bytes: uploadBytes, latestDay };
 }
 
