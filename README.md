@@ -96,6 +96,23 @@ it as `phoneTz`, and `sleep_summary` attaches a per-night `tzId` by resolving ea
 day (across the UTC-day boundary) against the phone's per-day `phoneTimezone` table when present.
 Mirrors uploaded before that table shipped simply omit the field.
 
+## Delta sync: page replication (`/liters/*`, optional, off by default)
+
+Alongside the whole-database `POST /ingest`, the server can receive **page-level replication**: the
+phone pushes changed 4 KB SQLite pages as LTX files — a few hundred KB per sync instead of 766 MB —
+over [liters](https://github.com/mrkurt/liters)' own HTTP replication protocol. A small Rust sidecar
+(`noop-liters-sink`, shipped in the image, embedding `liters_storage::HttpServer`) receives them and
+materializes them into `mirror.sqlite`. All 19 MCP read call sites are unchanged: the result is a
+plain on-disk SQLite file that `better-sqlite3` opens read-only, exactly as before.
+
+**It is off unless `LITERS_SINK_ENABLED=1`**, and `POST /ingest` remains the fallback and the
+recovery path whether it is on or not. With it off, `/liters/*` answers a legible 503 and no sidecar
+process runs.
+
+Read [`docs/LITERS_RECEIVE.md`](./docs/LITERS_RECEIVE.md) before turning it on — in particular the
+lock hazard (a Node reader holding a SQLite transaction against a mirror being written in place), the
+journal-mode invariant, and how `/ingest` and the liters lineage are kept from splicing.
+
 ## Storage health (`GET /status`)
 
 `/ingest` performs an atomic swap: it stages a **second full copy** of the database next to the live

@@ -11,6 +11,9 @@ import { upsertDeviceToken } from "./push/registry.js";
 import { ingestDeepBufferChunk, DeepBufError, parseChunkHeaders } from "./deepbuf.js";
 import { makeObjectStore } from "./objectstore.js";
 import { storageReport, sweepStagedArtifacts, isVolumeError, storageFailureMessage } from "./storage.js";
+import { litersProxy, litersDisabled } from "./liters/proxy.js";
+import { startLitersSink, type SinkHandle } from "./liters/sink.js";
+import { readStatus as readLitersStatus } from "./liters/state.js";
 
 const DEVICE_TOKEN_RE = /^[0-9a-fA-F]{32,100}$/;
 
@@ -41,6 +44,40 @@ export function createApp(cfg: Config): express.Express {
     const swept = sweepStagedArtifacts(cfg.dataDir, { olderThanMs: cfg.stagedSweepAgeMs });
     if (swept.removed) console.log(`swept ${swept.removed} orphaned staging artifact(s), reclaimed ${swept.bytes} bytes`);
   } catch { /* best-effort */ }
+
+  // The receive-side sidecar. `null` when LITERS_SINK_ENABLED is unset (the default) or the binary
+  // is absent — in both cases the server runs exactly as it did before, and /liters answers a
+  // legible 503. Nothing about /ingest changes either way.
+  const sink: SinkHandle | null = startLitersSink(cfg);
+  if (sink) {
+    const shutdown = () => sink.stop();
+    process.once("SIGTERM", shutdown);
+    process.once("SIGINT", shutdown);
+    process.once("exit", shutdown);
+  }
+
+  /**
+   * What the sidecar says about itself, for `GET /status`.
+   *
+   * `stalled` is the number worth reading: the sink republishes its status after EVERY round
+   * (default 1s), so a status file that has stopped moving means the apply loop is wedged or the
+   * process is gone — which is a different failure from "replication is behind", and the two would
+   * otherwise be indistinguishable from the outside.
+   */
+  const litersReport = () => {
+    if (!cfg.liters?.enabled) return { enabled: false as const };
+    const st = readLitersStatus(cfg);
+    const ageSeconds = st ? Math.floor((Date.now() - Math.max(st.lastSyncAtMs, st.startedAtMs)) / 1000) : null;
+    return {
+      enabled: true as const,
+      running: sink?.running() ?? false,
+      restarts: sink?.restarts() ?? 0,
+      lastExit: sink?.lastExit() ?? null,
+      status: st,
+      behind: st ? Math.max(0, st.bucketMax - st.position) : null,
+      stalled: st !== null && ageSeconds !== null && ageSeconds > cfg.liters.staleStatusSeconds,
+    };
+  };
 
   // Liveness, plus an honest verdict on whether this process can actually SERVE — but deliberately
   // still 200 when it cannot.
@@ -73,11 +110,21 @@ export function createApp(cfg: Config): express.Express {
   // deliberately do not carry the experiment's log.
   app.get("/status", requireScope(cfg, "ro"), (_req, res) => {
     try {
-      res.json(storageReport(cfg, { pageChurnLimit: 20, probeMirror: true }));
+      res.json({ ...storageReport(cfg, { pageChurnLimit: 20, probeMirror: true }), liters: litersReport() });
     } catch (e) {
       res.status(500).json({ ok: false, error: "status_failed", detail: e instanceof Error ? e.message : String(e) });
     }
   });
+
+  // ---- liters page replication (docs/LITERS_RECEIVE.md) ------------------------------------
+  //
+  // Registered BEFORE any body parser and with no `express.json`/`express.raw` anywhere near it: an
+  // LTX push is a stream, and buffering it is the mistake `/ingest` already paid for once (the
+  // 200-400 MB `express.raw` that OOM-killed the machine on 2026-07-26).
+  //
+  // `app.use` rather than `app.all` so Express strips the `/liters` prefix from `req.url` — the sink
+  // runs `base_path: None` and expects to see the endpoint grammar at its root.
+  app.use("/liters", cfg.liters?.enabled ? litersProxy(cfg) : litersDisabled(cfg));
 
   // NO express.raw. The whole-DB body is 200-400 MB compressed and buffering it was the first of the
   // three full copies that OOM-killed the machine on 2026-07-26 (see src/zipstream.ts). The body is

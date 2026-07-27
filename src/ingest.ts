@@ -6,6 +6,7 @@ import { openServerDb } from "./serverdb.js";
 import { diskUsage, formatBytes, sweepStagedArtifacts, removeStagedSet, isVolumeError, isPayloadDbError, storageFailureMessage } from "./storage.js";
 import { readCentralDirectory, extractEntryToFile, ZipError } from "./zipstream.js";
 import { measurePageChurn, recordPageChurn } from "./pagechurn.js";
+import { invalidateLitersLineage } from "./liters/state.js";
 
 export { openServerDb } from "./serverdb.js";
 /**
@@ -40,7 +41,7 @@ export function normalizePhoneTz(raw: unknown): string | null {
 }
 
 type IngestCfg = Pick<Config, "dataDir" | "mirrorPath" | "serverDbPath" | "maxIngestBytes">
-  & Partial<Pick<Config, "minFreeBytes" | "stagedSweepAgeMs">>;
+  & Partial<Pick<Config, "minFreeBytes" | "stagedSweepAgeMs" | "liters">>;
 
 const minFreeOf = (cfg: IngestCfg) => cfg.minFreeBytes ?? 268_435_456;
 
@@ -206,6 +207,18 @@ export async function ingestNoopbakFile(
       // preserve-then-swap can, and that state would be worse than the failed upload that caused it.
       if (hadMirror) { try { fs.renameSync(prevMirror, cfg.mirrorPath); } catch { /* best-effort */ } }
       throw e;
+    }
+    // The mirror the liters replica thought it owned no longer exists — this rename replaced it with
+    // a database from a different lineage. Its `-txid` sidecar and its LTX bucket now describe a
+    // file that is gone, and applying them onto this one would splice two histories together. Sever
+    // both, bucket first (see invalidateLitersLineage for why that order is the safe one).
+    //
+    // A no-op on a server that has never enabled the liters path, which is every server today.
+    if (cfg.liters) {
+      const cut = invalidateLitersLineage({ liters: cfg.liters, mirrorPath: cfg.mirrorPath });
+      if (cut.bucketRemoved || cut.sidecarRemoved) {
+        console.log(`ingest reset the liters lineage (bucket=${cut.bucketRemoved} sidecar=${cut.sidecarRemoved}); the phone's next push re-baselines with a snapshot`);
+      }
     }
     // The measurement as a TASK, not a call. `compareMs` on the real 766 MB pair is ~54 s (measured
     // 2026-07-27) and `CloudSyncClient.syncSession` sets `timeoutIntervalForRequest = 60` — 60 s of
