@@ -131,6 +131,10 @@ export function healthSnapshot(cfg: Config, args: { days?: number }) {
 // that ISN'T in this map surfaces as a gap rather than silently looking covered.
 const STREAM_READERS: Record<string, string> = {
   hrSample: "hr_series", rrInterval: "hrv_series", skinTempSample: "temp_series",
+  // ppgHrSample IS read by hr_series: the query unions it with the same NOT EXISTS anti-join the phone
+  // uses, so a second the strap never reported is filled by the v26 optical estimate and a measured
+  // second never is. Listing it here is what stops `streams` telling an agent to ignore live data.
+  ppgHrSample: "hr_series",
   sleepStateSample: "sleep_state_series", gravitySample: "motion_series", stepSample: "motion_series",
   appleStepHour: "motion_series", imuActivity: "imu_series / imu_coverage", battery: "battery_series",
   event: "device_events", sleepSession: "sleep_summary / sleep_detail", workout: "workout_summary",
@@ -139,16 +143,16 @@ const STREAM_READERS: Record<string, string> = {
 };
 // Per-stream caveats, so a 0-row or deliberately-unread stream isn't misread as a build target.
 const STREAM_NOTES: Record<string, string> = {
-  ppgHrSample: "experimental PPG→HR, withdrawn (#194) — instrumentation only, intentionally unread",
   spo2Sample: "not emitted by the WHOOP 5/MG — expect 0 rows",
   respSample: "no per-sample respiratory rate captured — expect 0 rows",
 };
 // Populated members of this set with no reader are reported as `gaps` (capture-without-a-reader). Rollup
-// tables (dailyMetric/metricSeries) and internal/bookkeeping tables are deliberately out of scope, as is
-// ppgHrSample (annotated experimental above rather than flagged).
+// tables (dailyMetric/metricSeries) and internal/bookkeeping tables are deliberately out of scope.
+// ppgHrSample used to be excluded here on the grounds that it was "annotated experimental" — it is now in
+// STREAM_READERS because hr_series genuinely reads it, so it needs no exclusion.
 const GAP_CANDIDATES = new Set([
-  "hrSample", "rrInterval", "skinTempSample", "sleepStateSample", "gravitySample", "stepSample",
-  "imuActivity", "battery", "event", "sleepSession", "workout",
+  "hrSample", "ppgHrSample", "rrInterval", "skinTempSample", "sleepStateSample", "gravitySample",
+  "stepSample", "imuActivity", "battery", "event", "sleepSession", "workout",
 ]);
 
 export function streamsInventory(cfg: Config) {
@@ -202,7 +206,7 @@ export function registerCoreTools(server: McpServer, cfg: Config): void {
 
   server.registerTool("streams", {
     title: "Raw stream inventory",
-    description: "The self-describing map of the mirror: every raw table with its row count, time span, contributing deviceIds, and — crucially — WHICH MCP tool reads it (`readBy`), so an agent can see what granular data exists and how to get it without inspecting the DB. `gaps` lists populated biometric streams that have NO reader yet (capture-without-a-reader — a candidate for a new tool); an empty `gaps` means every populated stream is reachable. Per-stream `note` flags the deliberate non-gaps (e.g. spo2Sample is 0 rows on the 5/MG; ppgHrSample is the withdrawn experimental PPG→HR). Rollups (dailyMetric/metricSeries) and bookkeeping tables are listed but excluded from `gaps`. Call this to answer 'what data do we actually have and can I query it' before guessing.",
+    description: "The self-describing map of the mirror: every raw table with its row count, time span, contributing deviceIds, and — crucially — WHICH MCP tool reads it (`readBy`), so an agent can see what granular data exists and how to get it without inspecting the DB. `gaps` lists populated biometric streams that have NO reader yet (capture-without-a-reader — a candidate for a new tool); an empty `gaps` means every populated stream is reachable. Per-stream `note` flags the deliberate non-gaps (e.g. spo2Sample is 0 rows on the 5/MG). Note `hr_series` reads hrSample UNION ppgHrSample (the v26 optical per-second estimate, admitted only for seconds with no measured row) — the same union the phone applies, so a PPG-heavy stretch is not silently under-reported. Rollups (dailyMetric/metricSeries) and bookkeeping tables are listed but excluded from `gaps`. Call this to answer 'what data do we actually have and can I query it' before guessing.",
     inputSchema: {},
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async () => asTool(streamsInventory(cfg)));

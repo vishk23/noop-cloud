@@ -141,11 +141,45 @@ export class Mirror {
   }
   latestDataDay(): string | null { return (this.db.prepare("SELECT MAX(day) AS d FROM dailyMetric").get() as any)?.d ?? null; }
   hrCoverageDays(deviceId: string): number { return (this.db.prepare("SELECT COUNT(DISTINCT date(ts,'unixepoch')) AS c FROM hrSample WHERE deviceId = ?").get(deviceId) as any).c; }
+  // UNIONs ppgHrSample into the HR read, exactly as the phone does. This is not an enhancement — it is a
+  // correctness fix. `ppgHrSample` holds the per-second HR the v26 optical estimator derives for seconds
+  // the strap never reported a bpm for, and the app treats it as a first-class HR source: Reads.swift
+  // unions it into `hrSamples`, `hrWindowStats` (workout avg/max), `hrBuckets` (the chart), and the
+  // day-has-data gate, and it reaches HealthKit export. Android matches (WhoopDao.kt). Reading `hrSample`
+  // alone made the cloud blind to ~36.8k HR seconds the phone counts, so hr_series and every agent answer
+  // built on it silently under-reported.
+  //
+  // The anti-join is the load-bearing part and is copied from the phone verbatim: a PPG estimate is only
+  // admitted for a second with NO measured row, so a real bpm is never double-counted by, or replaced
+  // with, its estimate. Same rounding too — the phone CASTs to its Int bpm domain, and matching that keeps
+  // a cloud answer byte-comparable with the app's.
+  //
+  // Materially this is ~1.6% of WHOOP-era strap-seconds, so daily averages barely move — but the seconds
+  // are CONCENTRATED in v26-heavy stretches, which is precisely the failure PR #841 hit on Android: a
+  // PPG-heavy workout drew a full chart and reported a blank average.
   hrSamplesRange(opts: { fromTs: number; toTs: number; deviceId?: string; limit: number }): { deviceId: string; ts: number; bpm: number }[] {
     const where = ["ts >= ? AND ts <= ?"]; const args: any[] = [opts.fromTs, opts.toTs];
     if (opts.deviceId) { where.push("deviceId = ?"); args.push(opts.deviceId); }
-    args.push(opts.limit);
-    return this.db.prepare(`SELECT deviceId, ts, bpm FROM hrSample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`).all(...args) as any[];
+    // hasTable-guarded like imuActivity/event: ppgHrSample arrived in a phone migration, so a mirror
+    // ingested from an older backup (or a fixture) may not carry it. Falling back to the measured-only
+    // read keeps those working rather than throwing "no such table" on every HR question.
+    if (!this.hasTable("ppgHrSample")) {
+      return this.db.prepare(`SELECT deviceId, ts, bpm FROM hrSample WHERE ${where.join(" AND ")} ORDER BY ts LIMIT ?`)
+        .all(...args, opts.limit) as any[];
+    }
+    // The PPG leg needs its own copy of the same bounds (and deviceId) — one args array, in leg order.
+    const ppgWhere = ["p.ts >= ? AND p.ts <= ?"]; const ppgArgs: any[] = [opts.fromTs, opts.toTs];
+    if (opts.deviceId) { ppgWhere.push("p.deviceId = ?"); ppgArgs.push(opts.deviceId); }
+    return this.db.prepare(`
+      SELECT deviceId, ts, bpm FROM (
+        SELECT deviceId, ts, bpm FROM hrSample WHERE ${where.join(" AND ")}
+        UNION ALL
+        SELECT p.deviceId, p.ts, CAST(ROUND(p.bpm) AS INTEGER) AS bpm FROM ppgHrSample p
+        WHERE ${ppgWhere.join(" AND ")}
+          AND NOT EXISTS (
+            SELECT 1 FROM hrSample h WHERE h.deviceId = p.deviceId AND h.ts = p.ts)
+      )
+      ORDER BY ts LIMIT ?`).all(...args, ...ppgArgs, opts.limit) as any[];
   }
   // RR granularity is sub-second but ts is not, so two+ real beats routinely share one integer-second
   // ts (common at resting HR: ~800ms RR means roughly every other beat lands in a new second). The

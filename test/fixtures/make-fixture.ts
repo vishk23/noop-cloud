@@ -12,6 +12,9 @@ export function buildMirrorSqlite(target: string): void {
   db.exec(`
     CREATE TABLE grdb_migrations (identifier TEXT PRIMARY KEY);
     CREATE TABLE hrSample (deviceId TEXT, ts INTEGER, bpm INTEGER, PRIMARY KEY(deviceId, ts));
+    -- The v26 optical per-second HR estimate. Real column types from the phone's GRDB migration: bpm and
+    -- conf are REAL there, not INTEGER, which is why hr_series CASTs the union leg to the Int bpm domain.
+    CREATE TABLE ppgHrSample (deviceId TEXT, ts INTEGER, bpm REAL, conf REAL, PRIMARY KEY(deviceId, ts));
     CREATE TABLE rrInterval (deviceId TEXT, ts INTEGER, rrMs INTEGER, seq INTEGER DEFAULT 0,
       synced INTEGER DEFAULT 0, PRIMARY KEY(deviceId, ts, rrMs, seq));
     CREATE TABLE dailyMetric (deviceId TEXT, day TEXT, totalSleepMin INTEGER, efficiency REAL,
