@@ -122,6 +122,34 @@ export function healthSnapshot(cfg: Config, args: { days?: number }) {
       d[fam] = cell;
       byDay.set(r.day, d);
     }
+
+    // metricSeries fallback — the SAME one compare_sources applies (src/tools/compare.ts), and it is
+    // here because the two tools were answering the same question differently.
+    //
+    // The phone's Apple Health import routes steps to metricSeries + appleDaily, and writes a
+    // dailyMetric row carrying only (deviceId, day) — every metric column NULL. Reading dailyMetric
+    // alone therefore produced an `apple` cell that looked present and measured nothing: on
+    // 2026-07-30 compare_sources reported apple steps of 8623 / 6751 / 896 for three consecutive
+    // days while health_snapshot reported `steps: null` for all three, off one mirror. The empty
+    // rows are also why the family shows up at all — `sources: ["apple-health"]` came from a row
+    // with no data in it.
+    //
+    // dailyMetric still WINS wherever it has a value; this only fills cells that are still null, so
+    // no existing answer changes. Family-scoped like compare's, and it honours the same
+    // delete_metric_point overlay, so a deleted point cannot reappear through the fallback.
+    const seriesRows = m.metricSeriesForKeys({ keys: [...FIELDS], from, to });
+    for (const r of seriesRows) {
+      if (!byDay.has(r.day)) byDay.set(r.day, { day: r.day });
+      const d = byDay.get(r.day);
+      const cell = d[r.family as Family] ?? { sources: [] as string[] };
+      const f = r.key as (typeof FIELDS)[number];
+      if (cell[f] === undefined || cell[f] === null) {
+        if (!overlay.deletedMetricPoints.has(pointKeyOf(r.deviceId, r.day, r.key))) cell[f] = r.value;
+      }
+      if (!cell.sources.includes(r.deviceId)) cell.sources.push(r.deviceId);
+      d[r.family as Family] = cell;
+    }
+
     return { from, to, days: [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day)) };
   } finally { m.close(); }
 }
@@ -136,7 +164,14 @@ const STREAM_READERS: Record<string, string> = {
   // second never is. Listing it here is what stops `streams` telling an agent to ignore live data.
   ppgHrSample: "hr_series",
   sleepStateSample: "sleep_state_series", gravitySample: "motion_series", stepSample: "motion_series",
-  appleStepHour: "motion_series", imuActivity: "imu_series / imu_coverage", battery: "battery_series",
+  appleStepHour: "motion_series",
+  // appleDaily IS read by health_snapshot / compare_sources, through the metricSeries fallback the
+  // Apple Health import's daily rollups land in. It was the only populated table missing from this
+  // map while its sibling appleStepHour was listed, so `streams` reported it as reader-less — and
+  // because it is not a GAP_CANDIDATE either, it was not even surfaced as a gap. Unreadable by the
+  // tool's own contract, and invisible.
+  appleDaily: "health_snapshot / compare_sources",
+  imuActivity: "imu_series / imu_coverage", battery: "battery_series",
   event: "device_events", sleepSession: "sleep_summary / sleep_detail", workout: "workout_summary",
   dailyMetric: "health_snapshot / compare_sources / metric_series", metricSeries: "metric_series",
   rawBatch: "deep_buffer_coverage / deep_buffer_window",

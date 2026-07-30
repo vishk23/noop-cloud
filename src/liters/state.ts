@@ -49,6 +49,30 @@ export function readStatus(cfg: LitersCfg): LitersStatus | null {
   }
 }
 
+/**
+ * Age in seconds of the status FILE itself, by mtime, or null when it does not exist.
+ *
+ * This is the liveness signal, and it is deliberately not derived from anything INSIDE the JSON.
+ * The sink rewrites this file after every apply round (default 1 s) whether or not that round had
+ * anything to do, so its mtime moves iff the loop is turning. The fields inside do not: an idle
+ * sink that is perfectly healthy leaves `lastSyncAtMs` at 0 forever, because it has never had a
+ * push to apply.
+ *
+ * Reading the field instead of the file is what made `/healthz` report "the apply loop is wedged"
+ * against a sink that had been running happily for two minutes with an empty queue — a freshly
+ * restored one, which is exactly when someone is watching. A health check that cries wolf on the
+ * healthy case is worse than no health check, so the two are kept apart: `lastSyncAtMs` answers
+ * "when did work last happen", this answers "is it still alive".
+ */
+export function statusAgeSeconds(cfg: LitersCfg): number | null {
+  try {
+    const st = fs.statSync(cfg.liters!.statusPath);
+    return Math.max(0, Math.floor((Date.now() - st.mtimeMs) / 1000));
+  } catch {
+    return null;
+  }
+}
+
 /** `{mirror}-txid` — liters' position sidecar. Its presence is what makes the mirror a replica. */
 export function txidPath(cfg: LitersCfg): string {
   return `${cfg.mirrorPath}-txid`;

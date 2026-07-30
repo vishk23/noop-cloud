@@ -120,3 +120,48 @@ describe("liters deploy guard — /healthz stops answering ok through a dead rep
     expect(body).toEqual({ ok: true });
   });
 });
+
+// Caught live, minutes after the restore deploy: /healthz reported "the apply loop is wedged" against
+// a sink that had been running happily for two minutes. `stalled` was derived from `lastSyncAtMs`
+// INSIDE the status file, which only moves when a push is actually applied — so a healthy sink with an
+// empty queue looked wedged the moment it passed staleStatusSeconds. The sink rewrites the file every
+// round regardless, so the file's mtime is the liveness signal, and config.ts had documented it that
+// way all along ("seconds without a status-file update").
+describe("liters stalled — file mtime, not lastSyncAtMs", () => {
+  /** A sink binary that exists, so startLitersSink returns a real handle rather than null. */
+  const realBin = () => {
+    const p = path.join(dataDir, "fake-sink");
+    fs.writeFileSync(p, "#!/bin/sh\nsleep 300\n", { mode: 0o755 });
+    return p;
+  };
+
+  const writeStatus = (statusPath: string, mtimeMs: number) => {
+    fs.mkdirSync(path.dirname(statusPath), { recursive: true });
+    // lastSyncAtMs: 0 — the idle case. A sink that has never had a push to apply.
+    fs.writeFileSync(statusPath, JSON.stringify({
+      ok: true, position: 4, bucketMax: 4, lastSyncAtMs: 0, lastError: null, lockBusy: false,
+      applies: 0, lockBusyTotal: 0, errorsTotal: 0, freeBytes: 1e10, bucketBytes: 1, mirrorBytes: 1,
+      spaceOk: true, sweptTotal: 0, startedAtMs: Date.now() - 3_600_000, minFreeBytes: 1,
+    }));
+    fs.utimesSync(statusPath, new Date(mtimeMs), new Date(mtimeMs));
+  };
+
+  it("an idle sink whose status file is FRESH is not stalled, even with lastSyncAtMs 0", async () => {
+    delete process.env.LITERS_SINK_ENABLED;
+    const statusPath = path.join(dataDir, "liters-sink-status.json");
+    writeStatus(statusPath, Date.now());   // written just now; never synced
+    const app = createApp(baseCfg({ liters: litersCfg({ binPath: realBin(), statusPath }) }));
+    const body = await healthz(app);
+    expect(body).toEqual({ ok: true });    // NOT degraded — this is the false positive
+  });
+
+  it("a status file that has stopped being rewritten IS stalled", async () => {
+    delete process.env.LITERS_SINK_ENABLED;
+    const statusPath = path.join(dataDir, "liters-sink-status.json");
+    writeStatus(statusPath, Date.now() - 600_000);   // 10 minutes cold, staleStatusSeconds is 120
+    const app = createApp(baseCfg({ liters: litersCfg({ binPath: realBin(), statusPath }) }));
+    const body = await healthz(app);
+    expect(body.degraded).toBe(true);
+    expect(body.warnings.join(" ")).toMatch(/status file has not moved/);
+  });
+});

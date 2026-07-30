@@ -13,7 +13,7 @@ import { makeObjectStore } from "./objectstore.js";
 import { storageReport, sweepStagedArtifacts, isVolumeError, storageFailureMessage } from "./storage.js";
 import { litersProxy, litersDisabled } from "./liters/proxy.js";
 import { startLitersSink, type SinkHandle } from "./liters/sink.js";
-import { readStatus as readLitersStatus } from "./liters/state.js";
+import { readStatus as readLitersStatus, statusAgeSeconds as litersStatusAge } from "./liters/state.js";
 
 const DEVICE_TOKEN_RE = /^[0-9a-fA-F]{32,100}$/;
 
@@ -101,7 +101,13 @@ export function createApp(cfg: Config): express.Express {
   const litersReport = () => {
     if (!cfg.liters?.enabled) return { enabled: false as const };
     const st = readLitersStatus(cfg);
-    const ageSeconds = st ? Math.floor((Date.now() - Math.max(st.lastSyncAtMs, st.startedAtMs)) / 1000) : null;
+    // Age of the status FILE (mtime), not of any field inside it. The sink rewrites the file every
+    // round whether or not the round had work; `lastSyncAtMs` only moves when a push is actually
+    // applied and sits at 0 forever on a healthy sink with an empty queue. Deriving `stalled` from
+    // the field reported "the apply loop is wedged" for a freshly-restored, perfectly-idle sink two
+    // minutes after boot. config.ts has always documented this as "seconds without a status-file
+    // update"; this makes the code agree with it. See statusAgeSeconds in src/liters/state.ts.
+    const ageSeconds = litersStatusAge(cfg);
     return {
       enabled: true as const,
       running: sink?.running() ?? false,
@@ -109,6 +115,9 @@ export function createApp(cfg: Config): express.Express {
       lastExit: sink?.lastExit() ?? null,
       status: st,
       behind: st ? Math.max(0, st.bucketMax - st.position) : null,
+      statusAgeSeconds: ageSeconds,
+      // Never stalled when the sink has not published at all yet: that is "starting", and it is
+      // already covered by `running`. Only a file that once moved and then stopped is a wedge.
       stalled: st !== null && ageSeconds !== null && ageSeconds > cfg.liters.staleStatusSeconds,
     };
   };

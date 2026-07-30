@@ -95,7 +95,21 @@ export class Mirror {
         byDevice.set(r.deviceId, e);
       }
     };
+    // The Apple Health import's real data is in appleDaily/appleStepHour, NOT in dailyMetric: it
+    // writes a dailyMetric row carrying only (deviceId, day) with every metric column NULL. So
+    // freshness derived from the four tables above read apple-health's latestDay off rows that
+    // contain nothing, which is the worst kind of wrong here — this is the "call this first" tool,
+    // and it reported a source as current on the strength of empty placeholders. Both tables are
+    // hasTable-guarded like the rest of the optional streams, since a mirror ingested from an older
+    // backup may predate either.
+    const ad = this.hasTable("appleDaily")
+      ? this.db.prepare(`SELECT deviceId, MAX(day) AS maxDay FROM appleDaily GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[]
+      : [];
+    const ah = this.hasTable("appleStepHour")
+      ? this.db.prepare(`SELECT deviceId, MAX(date(ts, 'unixepoch')) AS maxDay FROM appleStepHour GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[]
+      : [];
     merge(dm, "dailyMetric"); merge(ss, "sleepSession"); merge(hr, "hrSample"); merge(rr, "rrInterval");
+    merge(ad, "appleDaily"); merge(ah, "appleStepHour");
     const brandById = new Map((this.db.prepare("SELECT id, brand FROM pairedDevice").all() as { id: string; brand: string | null }[]).map((b) => [b.id, b.brand]));
     return [...byDevice.entries()].sort((a, b) => a[0].localeCompare(b[0]))
       .map(([deviceId, e]) => ({ deviceId, family: sourceFamily(deviceId), brand: brandById.get(deviceId) ?? null, latestDay: e.latestDay, tables: [...e.tables].sort() }));
