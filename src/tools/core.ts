@@ -174,21 +174,41 @@ const STREAM_READERS: Record<string, string> = {
   imuActivity: "imu_series / imu_coverage", battery: "battery_series",
   event: "device_events", sleepSession: "sleep_summary / sleep_detail", workout: "workout_summary",
   dailyMetric: "health_snapshot / compare_sources / metric_series", metricSeries: "metric_series",
-  rawBatch: "deep_buffer_coverage / deep_buffer_window",
+  // NOTE: `rawBatch` is deliberately absent. It used to be listed as read by deep_buffer_coverage /
+  // deep_buffer_window, which is false: both of those SELECT FROM `deepBufferChunk` — a SERVER-side table
+  // fed by the /deepbuf JSONL endpoint (see tools/deepbuf.ts), not the phone's `rawBatch` mirror table.
+  // The wrong entry also suppressed gap detection for it, since a non-null readBy means "covered".
 };
-// Per-stream caveats, so a 0-row or deliberately-unread stream isn't misread as a build target.
+// Per-stream caveats. A note EXPLAINS a stream; it does not suppress it. A populated table with no reader
+// still shows up in `gaps` even when annotated — the note tells the agent whether the gap is worth
+// closing, which is a different question from whether the gap exists.
 const STREAM_NOTES: Record<string, string> = {
   spo2Sample: "not emitted by the WHOOP 5/MG — expect 0 rows",
   respSample: "no per-sample respiratory rate captured — expect 0 rows",
+  v18AuxSample: "v18 aux bytes banked verbatim before the strap frees history on offload-ack; the app "
+    + "deliberately ships no consumer (WhoopStore Database.swift v31). Capped at 604,800 rows/device on "
+    + "device, and ingest REPLACES the mirror wholesale — so anything the phone prunes is gone here too.",
+  ppgWaveformSample: "raw v26 optical samples, kept so a future estimator can rerun over originals rather "
+    + "than derived bpm; the app deliberately ships no consumer. The DERIVED ppgHrSample is separately "
+    + "read by hr_series — these rows sit on no scoring path.",
+  ouraRaw: "verbatim Oura API page archive (the re-derivation backstop). Its `day` column is NULL on every "
+    + "row: both producers pass day: nil because a page spans many documents and days, so day-keyed reads "
+    + "and the ORDER BY day in the on-device reader are inert.",
+  scoreInputProvenance: "per-day (day, key, sourceId) attribution for NOOP-computed recovery/strain/"
+    + "sleep_performance — i.e. WHICH device's inputs produced each -noop score. Read on device to render "
+    + "the source badge; not yet joined into compare_sources / health_snapshot here.",
+  appleDaily: "Apple Health per-day rollup. dailyMetric already carries the apple-health family that "
+    + "health_snapshot / compare_sources read, so this is a redundant second copy rather than a lost stream.",
 };
-// Populated members of this set with no reader are reported as `gaps` (capture-without-a-reader). Rollup
-// tables (dailyMetric/metricSeries) and internal/bookkeeping tables are deliberately out of scope.
-// ppgHrSample used to be excluded here on the grounds that it was "annotated experimental" — it is now in
-// STREAM_READERS because hr_series genuinely reads it, so it needs no exclusion.
-const GAP_CANDIDATES = new Set([
-  "hrSample", "ppgHrSample", "rrInterval", "skinTempSample", "sleepStateSample", "gravitySample",
-  "stepSample", "imuActivity", "battery", "event", "sleepSession", "workout",
+// Tables that are bookkeeping or registry rather than a captured stream, so "no reader" is the correct
+// resting state and never a gap. Everything NOT listed here is a gap candidate by default — the deny-list
+// direction matters: an allow-list has to be hand-extended for every new table, which is exactly how this
+// check silently degraded to a tautology (the old GAP_CANDIDATES set was a strict subset of
+// STREAM_READERS, so `!readBy && GAP_CANDIDATES.has(table)` could never be true for any database).
+const NON_STREAM_TABLES = new Set([
+  "grdb_migrations", "cursors", "phoneTimezone", "pairedDevice", "device", "dayOwnership", "cloudTombstone",
 ]);
+const isNonStream = (t: string) => NON_STREAM_TABLES.has(t) || t.startsWith("_litestream");
 
 export function streamsInventory(cfg: Config) {
   if (!fs.existsSync(cfg.mirrorPath)) return { streams: [], gaps: [], notIngested: true };
@@ -203,8 +223,8 @@ export function streamsInventory(cfg: Config) {
         ...(s.timeCol ? { timeCol: s.timeCol, first: fmt(s.first), last: fmt(s.last) } : {}),
       };
     }).sort((a, b) => b.rows - a.rows);
-    const gaps = streams.filter((s) => s.rows > 0 && !s.readBy && GAP_CANDIDATES.has(s.table)).map((s) => s.table);
-    return { streams, gaps, note: gaps.length ? "gaps = populated biometric streams with NO MCP reader — candidates for a new tool" : "every populated biometric stream has a reader" };
+    const gaps = streams.filter((s) => s.rows > 0 && !s.readBy && !isNonStream(s.table)).map((s) => s.table);
+    return { streams, gaps, note: gaps.length ? "gaps = populated streams with NO MCP reader — capture that no tool can retrieve. Check each one's `note` before treating it as a build target: some are deliberately-unread instrumentation." : "every populated stream has a reader" };
   } finally { m.close(); }
 }
 

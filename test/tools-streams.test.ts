@@ -45,4 +45,47 @@ describe("streams", () => {
     expect(Array.isArray(r.gaps)).toBe(true);
     expect(r.gaps).toEqual([]); // every populated biometric stream in the fixture has a reader
   });
+
+  // Regression: `gaps` was computed as `!readBy && GAP_CANDIDATES.has(table)` over an allow-list that was
+  // a strict SUBSET of STREAM_READERS, so the predicate was unsatisfiable for every table and every
+  // database — `gaps` was a hardcoded [] computed the long way, and the live mirror reported "every
+  // populated biometric stream has a reader" while carrying 245k unreadable rows. These three tests fail
+  // against that implementation.
+  it("flags a populated table that no tool reads", () => {
+    const db = new Database(cfg.mirrorPath);
+    db.exec(`CREATE TABLE IF NOT EXISTS mysteryStream (deviceId TEXT, ts INTEGER, v REAL, PRIMARY KEY(deviceId, ts));`);
+    db.prepare("INSERT OR REPLACE INTO mysteryStream VALUES (?,?,?)").run("my-whoop", 1780000001, 1.5);
+    db.close();
+    const r = streamsInventory(cfg) as any;
+    expect(r.gaps).toContain("mysteryStream");   // a table added by a future migration must not be invisible
+    expect(r.note).toMatch(/capture that no tool can retrieve/);
+  });
+
+  it("annotates a gap without suppressing it — a note explains, it does not hide", () => {
+    const db = new Database(cfg.mirrorPath);
+    db.exec(`CREATE TABLE IF NOT EXISTS v18AuxSample (deviceId TEXT, ts INTEGER, blob BLOB, PRIMARY KEY(deviceId, ts));`);
+    db.prepare("INSERT OR REPLACE INTO v18AuxSample VALUES (?,?,?)").run("my-whoop", 1780000002, Buffer.from([1]));
+    db.close();
+    const r = streamsInventory(cfg) as any;
+    const aux = r.streams.find((s: any) => s.table === "v18AuxSample");
+    expect(aux.readBy).toBeNull();
+    expect(aux.note).toMatch(/deliberately ships no consumer/);
+    expect(r.gaps).toContain("v18AuxSample");
+  });
+
+  it("never flags bookkeeping tables, and no longer claims deep_buffer_* reads rawBatch", () => {
+    const db = new Database(cfg.mirrorPath);
+    db.exec(`CREATE TABLE IF NOT EXISTS cursors (k TEXT PRIMARY KEY, v TEXT);`);
+    db.prepare("INSERT OR REPLACE INTO cursors VALUES (?,?)").run("last", "1");
+    db.exec(`CREATE TABLE IF NOT EXISTS rawBatch (deviceId TEXT, startTs INTEGER, framesBlob BLOB, PRIMARY KEY(deviceId, startTs));`);
+    db.prepare("INSERT OR REPLACE INTO rawBatch VALUES (?,?,?)").run("my-whoop", 1780000003, Buffer.from([1]));
+    db.close();
+    const r = streamsInventory(cfg) as any;
+    expect(r.gaps).not.toContain("cursors");
+    // deep_buffer_coverage / deep_buffer_window SELECT FROM the server-side deepBufferChunk table, not
+    // this one — the old readBy entry was both false and a gap-detection suppressor.
+    const raw = r.streams.find((s: any) => s.table === "rawBatch");
+    expect(raw.readBy).toBeNull();
+    expect(r.gaps).toContain("rawBatch");
+  });
 });
