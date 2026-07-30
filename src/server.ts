@@ -45,6 +45,40 @@ export function createApp(cfg: Config): express.Express {
     if (swept.removed) console.log(`swept ${swept.removed} orphaned staging artifact(s), reclaimed ${swept.bytes} bytes`);
   } catch { /* best-effort */ }
 
+  // The operator said ON, and this BUILD cannot serve it. Not a degraded runtime — the wrong
+  // artifact is deployed, and no amount of retrying fixes it.
+  //
+  // This is the 2026-07-28 failure, exactly. Release v37 was built from `main`, which carried no
+  // liters code at all (the receive path lived only on `feat/liters-receive` and was never merged),
+  // while the `LITERS_SINK_ENABLED` secret stayed set and marked Deployed. Config said on, code was
+  // gone, and every route under /liters answered 404 — including the `PUT /liters/ltx/0/...` the
+  // phone actually calls. 51 hours, zero pushes, and nothing anywhere said so: a 404 is
+  // indistinguishable from a 503 to the phone's fallback, so /ingest silently carried three full
+  // uploads instead.
+  //
+  // Refusing to boot is the right response ONLY for this case, and it is a deliberate exception to
+  // the rule one line below (a missing BINARY must not be fatal — /ingest is the fallback and a
+  // cloud that will not boot is worse than one missing an optional path). The difference: a missing
+  // binary is a machine that can still be fixed by fixing the machine, whereas a build with no
+  // liters support cannot serve /liters no matter what any operator does to it, so booting it only
+  // buys a silent outage. Fly holds the previous release when a new one will not start, which is the
+  // outcome you want here.
+  //
+  // Keyed on the raw env var and living in server.ts — NOT in src/liters/ — on purpose: the check has
+  // to survive in a build that has no liters module, which is precisely the build it exists to catch.
+  // Note the honest limit: no in-repo assertion can guard a build that does not contain the
+  // assertion. Deploying a tree that predates this line reproduces v37 exactly. The durable guard is
+  // the post-deploy probe in docs/LITERS_RECEIVE.md — a `PUT /liters/ltx/0/...` that answers 404 is
+  // absent code; 503 is code present and switched off.
+  if (process.env.LITERS_SINK_ENABLED === "1" && !cfg.liters) {
+    throw new Error(
+      "LITERS_SINK_ENABLED=1 but this build has no liters configuration — it cannot serve /liters " +
+      "(every path would 404, and the phone would silently fall back to /ingest). This is a build/" +
+      "config mismatch, not a runtime failure: deploy a build that includes the liters receive path, " +
+      "or unset LITERS_SINK_ENABLED.",
+    );
+  }
+
   // The receive-side sidecar. `null` when LITERS_SINK_ENABLED is unset (the default) or the binary
   // is absent — in both cases the server runs exactly as it did before, and /liters answers a
   // legible 503. Nothing about /ingest changes either way.
@@ -79,6 +113,40 @@ export function createApp(cfg: Config): express.Express {
     };
   };
 
+  /**
+   * One line for /healthz when liters is switched ON but is not actually replicating, else `null`.
+   *
+   * Three distinct ways to be enabled-and-not-serving, and they need different fixes, so they are
+   * reported separately rather than as one "liters unhealthy":
+   *
+   *   - the sidecar never started (binary absent — the image was built without the Rust stage);
+   *   - it started and is gone or crash-looping (`running() === false`, `restarts` climbing);
+   *   - it is alive but its status file has stopped moving, i.e. the apply loop is wedged.
+   *
+   * Deliberately NOT reported: `behind > 0`. Being behind is what replication looks like while it
+   * works. Only "has stopped" is a health problem.
+   *
+   * This does not throw and does not read the mirror — /healthz answers on a schedule Fly enforces.
+   */
+  const litersDegradation = (): string | null => {
+    if (!cfg.liters?.enabled) return null;
+    if (!sink) {
+      return `liters enabled but the sidecar did not start (${cfg.liters.binPath} missing) — ` +
+             `page replication is DOWN and every push is falling back to /ingest`;
+    }
+    const r = litersReport();
+    if (r.enabled !== true) return null;
+    if (!r.running) {
+      return `liters enabled but the sidecar is not running (restarts=${r.restarts}, ` +
+             `lastExit=${JSON.stringify(r.lastExit)}) — page replication is DOWN`;
+    }
+    if (r.stalled) {
+      return `liters sidecar is running but its status file has not moved in more than ` +
+             `${cfg.liters.staleStatusSeconds}s — the apply loop is wedged, not merely behind`;
+    }
+    return null;
+  };
+
   // Liveness, plus an honest verdict on whether this process can actually SERVE — but deliberately
   // still 200 when it cannot.
   //
@@ -97,6 +165,16 @@ export function createApp(cfg: Config): express.Express {
     try {
       const s = storageReport(cfg, { probeMirror: true });
       if (!s.ok) degraded = s.warnings;
+    } catch { /* a health probe must not throw */ }
+    // liters rides the same flag, for the reason /healthz probes the mirror at all: "the process is
+    // up" is not the property anyone cares about. Between 2026-07-28 and 2026-07-30 the machine was
+    // enabled-and-not-serving for 51 hours and every signal available said fine — /healthz `{ok:true}`,
+    // the Fly check passing, `errorsTotal: 0` (the sink was not running, so it never observed a
+    // failing push), and /ingest quietly absorbing three full uploads because the phone treats a 404
+    // exactly like a 503. `curl /healthz` is the check that costs seconds; this makes it say something.
+    try {
+      const w = litersDegradation();
+      if (w) degraded = [...(degraded ?? []), w];
     } catch { /* a health probe must not throw */ }
     res.json(degraded ? { ok: true, degraded: true, warnings: degraded } : { ok: true });
   });

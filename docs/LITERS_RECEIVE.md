@@ -251,3 +251,47 @@ and `status.lockBusyTotal`. `noop-liters-sink --apply-once` runs one round by ha
 (applied/current), 3 (reader contention), 4 (no space), 1 (anything else).
 
 To turn it off: unset the secret and redeploy. `/ingest` has been working the whole time.
+
+### 8.1 Probe after EVERY deploy
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT https://vk-noop-cloud.fly.dev/liters/ltx/0/probe
+```
+
+| Answer | Means |
+| --- | --- |
+| **401** | Code present, route mounted. Correct — an unauthenticated push is rejected before anything else. |
+| **503** | Code present, feature switched off. Correct when `LITERS_SINK_ENABLED` is unset. |
+| **404** | **The deployed build has no liters code.** Nothing under `/liters` exists. |
+
+The 404 row is why this section exists. Between 2026-07-28 and 2026-07-30 the machine sat in exactly
+that state for **51 hours**: release v37 was cut from `main`, which had never had the receive path
+merged into it, while the `LITERS_SINK_ENABLED` secret stayed set and marked Deployed. Config said on,
+code was gone.
+
+Nothing else caught it, and it is worth being precise about why, because each signal looked healthy
+for a different reason:
+
+- `/healthz` answered `{ok:true}` and the Fly check passed — the server was genuinely fine, it just
+  could not serve this one path. (`/healthz` now folds in a liters verdict, so this specific hole is
+  closed for builds carrying that code.)
+- `status.errorsTotal` was `0` — not because pushes were succeeding, but because the sidecar was not
+  running and so never observed one fail. **A zero error count from a process that is not running is
+  not evidence of health.**
+- `/ingest` kept working, so the phone never surfaced a problem. Its fallback classifies no HTTP
+  status, so a 404 and a 503 are the same event to it; it quietly uploaded three full databases
+  (169/181/186 MB) instead of deltas.
+
+Two traps for whoever reads the telemetry afterwards:
+
+- **`push-telemetry.json` snapshot rate is meaningless across an outage of this kind.** `/ingest`
+  records `snapshotted: true, snapshotReason: "full-ingest"`, and telemetry rows are written **only on
+  success** — a failed liters push records nothing at all. So the snapshot rate climbs toward 100 %
+  while measuring the server outage, not liters' snapshot behaviour. Discard the window.
+- **`applies` restarts at 0 on every sidecar respawn** (it is process-lifetime state, unlike
+  `position` and `bucketBytes`, which are recomputed from the volume). Node respawns the sidecar with
+  backoff, so `applies` can reset without the machine restarting. The counter that survives a respawn
+  is `restarts` in `GET /status`.
+
+A green deploy is not "the deploy succeeded". It is a 401 from the probe above, and then a new file
+under `/data/ltx-bucket/ltx/0/` with `position` advancing.
