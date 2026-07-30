@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "./config.js";
 import { registerTools } from "./tools/index.js";
-import { isStorageError, storageFailureMessage } from "./storage.js";
+import { isStorageError, isBusyError, storageFailureMessage } from "./storage.js";
 
 /**
  * Make every tool answer a storage fault with an explanation instead of a driver string.
@@ -24,6 +24,21 @@ function installStorageGuard(server: McpServer, cfg: Config): void {
     try {
       return await handler(...args);
     } catch (e) {
+      // SQLITE_BUSY is a NEW possibility, and only when liters page replication is on: the mirror is
+      // then written in place by the sink, which holds SQLite's EXCLUSIVE lock pair while it applies
+      // pages. A reader that waited out its full `busy_timeout` (5 s) and still could not start is
+      // not looking at a broken server — it collided with a large apply. Saying so, and saying
+      // "retry", is the difference between a one-line retry and an incident.
+      //
+      // Kept separate from `isStorageError` deliberately: that message tells the caller the volume
+      // is degraded and the same call will KEEP failing, which is the opposite of true here.
+      if (isBusyError(e)) {
+        console.error(`tool ${name} hit SQLITE_BUSY (mirror apply in progress)`);
+        return { isError: true, content: [{ type: "text" as const, text:
+          "The mirror is locked by an in-progress replication apply and this read could not start within 5 seconds. " +
+          "This is transient and self-clearing — the same call should succeed on retry. Nothing is wrong with the " +
+          "server or the request; GET /status reports the replication position under `liters`." }] };
+      }
       if (!isStorageError(e)) throw e;
       console.error(`tool ${name} storage failure:`, e instanceof Error ? e.message : e);
       return { isError: true, content: [{ type: "text" as const, text: storageFailureMessage(cfg, e) }] };

@@ -1,0 +1,44 @@
+[package]
+name = "noop-liters-sink"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Receive side of NOOP's delta sync: a writable liters HTTP replication endpoint that materializes the pushed bucket into mirror.sqlite."
+
+[[bin]]
+name = "noop-liters-sink"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned by REV, not branch. The receive side is the only thing standing between the phone and a
+# 766 MB mirror; "whatever noop-integration happened to be that day" is not a dependency, it is a
+# rumour. Bump this deliberately.
+#
+# `noop-integration` = mrkurt/liters 108e1df + VK's five branches + fix/replica-lock-deadlock
+# (f358c46), which is the one that matters here: it replaces the applier's `fcntl(F_SETLKW)` with a
+# bounded, cancellable `F_SETLK` poll. Without it a single Node MCP reader holding a read
+# transaction parks the applier in the kernel forever and nothing — not a cancel token, not a
+# SIGTERM handler — can get it back. See docs/LITERS_RECEIVE.md "The lock hazard".
+liters = { git = "https://github.com/vishk23/liters", rev = "cdab02a80753febffee8195eab4fc9cc95c75ee6", features = ["http"] }
+# The HTTP *server* (`HttpServer`/`Mount`) lives here; `liters` only re-exports the client half.
+liters-storage = { git = "https://github.com/vishk23/liters", rev = "cdab02a80753febffee8195eab4fc9cc95c75ee6", features = ["http"] }
+# Same repo, same rev: the preflight reads each pending LTX file's 100-byte header to learn the
+# exact post-apply page count, which is what turns "guess how much room an apply needs" into
+# arithmetic.
+ltx = { git = "https://github.com/vishk23/liters", rev = "cdab02a80753febffee8195eab4fc9cc95c75ee6" }
+# statvfs + sigaction. Already in the tree via liters-storage's `http` feature; declared here
+# because this crate calls it directly.
+libc = "0.2"
+# Already in the graph via liters' default `bundled-sqlite`; declared directly because the sink runs
+# its own `PRAGMA quick_check` after a restore (see main.rs — liters' own check has to be disabled
+# because it runs BEFORE the journal-mode fixup and re-creates the sidecars it just deleted).
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+# The binary ships in a container image next to Node; 3 MB vs 12 MB is worth 90 seconds of build.
+lto = true
+strip = true
+codegen-units = 1

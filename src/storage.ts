@@ -152,6 +152,17 @@ export function isVolumeError(e: unknown): boolean {
   return typeof msg === "string" && STORAGE_MESSAGE_RE.test(msg);
 }
 
+/**
+ * Another process holds the lock right now. Under liters page replication that process is the
+ * applier and this is the system working, not failing — so it must never be classified as a volume
+ * fault (which would say "retry later, the disk is broken") or a payload fault (which would say
+ * "your bytes are corrupt"). It is its own thing: transient, expected, and self-clearing.
+ */
+export function isBusyError(e: unknown): boolean {
+  const code = errCode(e);
+  return !!code && (code === "SQLITE_BUSY" || code.startsWith("SQLITE_BUSY_"));
+}
+
 /** The BYTES of one database file are bad (corrupt / not a database), independent of the volume. */
 export function isPayloadDbError(e: unknown): boolean {
   const code = errCode(e);
@@ -188,12 +199,20 @@ export class StorageDegradedError extends Error {
  * not the file. No PRAGMA integrity/quick_check — those scan the whole database and would turn the
  * health check into 766 MB of I/O every interval.
  */
-export function mirrorReadable(mirrorPath: string): { ok: boolean; error?: string } {
+export function mirrorReadable(mirrorPath: string): { ok: boolean; busy?: boolean; error?: string } {
   try {
-    const m = new Mirror(mirrorPath);
+    // 1.5 s, not the 5 s default. Fly's [[http_service.checks]] gives this whole endpoint 5 s
+    // (fly.toml), so a probe that waited the driver's default would time out the CHECK rather than
+    // return a verdict — and a failed check pulls the machine out of routing. Under liters the
+    // mirror is written in place by the sink, so waiting on a lock is now a normal thing to do here.
+    const m = new Mirror(mirrorPath, { busyTimeoutMs: 1_500 });
     try { m.hasTable("dailyMetric"); } finally { m.close(); }
     return { ok: true };
   } catch (e) {
+    // SQLITE_BUSY is not a degraded mirror. It means another process holds the write lock right
+    // now — i.e. replication is working. Reporting it as a fault would make a healthy apply look
+    // identical to a corrupt database, and would flip /healthz red every time a large delta landed.
+    if (isBusyError(e)) return { ok: true, busy: true };
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }

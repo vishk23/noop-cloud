@@ -1,4 +1,5 @@
 import path from "node:path";
+import crypto from "node:crypto";
 
 export interface Config {
   port: number;
@@ -37,6 +38,30 @@ export interface Config {
   minFreeBytes: number;
   /** A `.staged-*` artifact older than this is a crash corpse and gets swept (see sweepStagedArtifacts). */
   stagedSweepAgeMs: number;
+
+  // --- liters page replication (docs/LITERS_RECEIVE.md) -------------------------------------
+  //
+  // The receive half of delta sync: the phone pushes LTX files instead of a 766 MB database. OFF by
+  // default and deliberately so — deploying this build changes nothing until LITERS_SINK_ENABLED is
+  // set, so the deploy that introduces it is not the deploy that switches protocols. /ingest is
+  // untouched either way and stays the fallback.
+  liters: {
+    enabled: boolean;
+    /** Bearer token Express presents to the loopback sink. NEVER the phone's token. */
+    sinkToken: string;
+    /** Where the sink listens. Loopback only: a writable liters mount serves `DELETE /all`. */
+    sinkAddr: string;
+    /** The `noop-liters-sink` executable. */
+    binPath: string;
+    /** Pushed LTX files, litestream `file` layout. */
+    bucketDir: string;
+    /** JSON status the sink republishes after every apply round. */
+    statusPath: string;
+    /** Largest single LTX body accepted. A snapshot push is the whole database, so this is not small. */
+    maxPushBytes: number;
+    /** Seconds without a status-file update after which the sink counts as stalled. */
+    staleStatusSeconds: number;
+  };
 }
 
 function required(name: string): string {
@@ -98,5 +123,24 @@ export function loadConfig(): Config {
     // 1 hour. ingestNoopbak is synchronous and a ~500 MB stage finishes in seconds, so nothing this
     // old can belong to a live request — but the guard means a sweep can never race a real upload.
     stagedSweepAgeMs: Number(process.env.STAGED_SWEEP_AGE_MS ?? 3_600_000),
+    liters: {
+      enabled: process.env.LITERS_SINK_ENABLED === "1",
+      // Derived, not configured. A second hand-managed secret is a second thing to leak, rotate and
+      // get wrong; this one never leaves the machine (Express -> 127.0.0.1) and is reproducible on
+      // both sides of the fork/exec from a secret that already exists. HMAC rather than the raw
+      // token so that reading a process listing or a core dump of the sink does not hand over the
+      // phone's RW credential.
+      sinkToken: process.env.LITERS_SINK_TOKEN
+        ?? crypto.createHmac("sha256", process.env.RW_TOKEN ?? "").update("liters-sink-v1").digest("hex"),
+      sinkAddr: process.env.LITERS_SINK_ADDR ?? "127.0.0.1:9736",
+      binPath: process.env.LITERS_SINK_BIN ?? "/app/bin/noop-liters-sink",
+      bucketDir: process.env.LITERS_BUCKET_DIR ?? path.join(dataDir, "ltx-bucket"),
+      statusPath: process.env.LITERS_STATUS_PATH ?? path.join(dataDir, "liters-sink-status.json"),
+      // 1 GiB, matching MAX_INGEST_BYTES for the same reason: a `snapshotting = true` push carries
+      // the WHOLE database as one LTX file, so the ceiling on a push is the ceiling on the database,
+      // not on a delta. requireSpaceFor is what refuses a body the volume cannot hold today.
+      maxPushBytes: Number(process.env.LITERS_MAX_PUSH_BYTES ?? 1_073_741_824),
+      staleStatusSeconds: Number(process.env.LITERS_STALE_STATUS_SECONDS ?? 120),
+    },
   };
 }

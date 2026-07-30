@@ -6,3 +6,6 @@ data/
 *.sqlite-wal
 *.sqlite-shm
 test/.tmp/
+# Rust build output for the liters receive sidecar (408 MB of it). Cargo.lock IS committed — this is
+# a binary crate and the whole point of pinning liters by rev is a reproducible receive side.
+liters-sink/target/

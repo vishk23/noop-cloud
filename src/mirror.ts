@@ -54,7 +54,24 @@ function kindFilterSql(kinds: string[]): { sql: string; args: string[] } {
 
 export class Mirror {
   private db: Database.Database;
-  constructor(path: string) { this.db = new Database(path, { readonly: true, fileMustExist: true }); }
+  /**
+   * `busyTimeoutMs` overrides better-sqlite3's default 5000 ms `busy_timeout`. Every one of the 20
+   * tool call sites omits it and therefore behaves exactly as it always has; only the /healthz probe
+   * passes it (see storage.ts::mirrorReadable).
+   *
+   * Why the knob exists at all: under liters page replication the mirror is written IN PLACE by
+   * another process, which holds SQLite's EXCLUSIVE lock pair for the duration of an apply. Readers
+   * therefore wait where they never used to. 5 s is the right ceiling for a tool call — it sits out
+   * any realistic apply — but it is exactly Fly's health-check timeout, so a probe that waited the
+   * full default would fail the check and pull a perfectly healthy machine out of routing.
+   */
+  constructor(path: string, opts: { busyTimeoutMs?: number } = {}) {
+    this.db = new Database(path, {
+      readonly: true,
+      fileMustExist: true,
+      ...(opts.busyTimeoutMs === undefined ? {} : { timeout: opts.busyTimeoutMs }),
+    });
+  }
   close(): void { this.db.close(); }
 
   // Union deviceIds across dailyMetric, sleepSession, hrSample, and rrInterval: a device that only
