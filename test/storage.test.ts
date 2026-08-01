@@ -174,16 +174,35 @@ describe("storageReport", () => {
     expect(r.warnings.some((w) => w.includes("REFUSED"))).toBe(true);
   });
 
-  it("flags a stale ingest as the phone's uploads failing", () => {
+  it("flags a mirror nothing has written for days", () => {
     fs.writeFileSync(cfg().mirrorPath, Buffer.alloc(10));
+    const eightDaysAgo = new Date(Date.now() - 8 * 86_400_000);
+    fs.utimesSync(cfg().mirrorPath, eightDaysAgo, eightDaysAgo);
     const db = new Database(cfg().serverDbPath);
     db.exec("CREATE TABLE IF NOT EXISTS ingestLog (id INTEGER PRIMARY KEY AUTOINCREMENT, receivedAt INTEGER, bytes INTEGER, latestDay TEXT)");
     db.prepare("INSERT INTO ingestLog (receivedAt, bytes, latestDay) VALUES (?,?,?)").run(Math.floor(Date.now() / 1000) - 8 * 86_400, 1, "2026-07-18");
     db.close();
     const r = storageReport(cfg());
     // 8 days is exactly what the outage looked like: mirror present, queries "working", data frozen.
-    expect(r.warnings.some((w) => /no successful ingest for 8\.0 days/.test(w))).toBe(true);
+    expect(r.warnings.some((w) => /mirror has not been updated for 8\.0 days/.test(w))).toBe(true);
     expect(r.ok).toBe(false);
+  });
+
+  // The counterpart, and the reason the trigger moved off `ingestLog`: under liters the phone pushes
+  // page deltas and may not send a whole database for weeks, so keying this on the last /ingest
+  // accused a healthy server of dropping uploads every other day (vk-noop-cloud, 2026-07-31).
+  it("does not flag an old whole-DB ingest when something is still writing the mirror", () => {
+    fs.writeFileSync(cfg().mirrorPath, Buffer.alloc(10)); // written just now, by whichever path
+    const db = new Database(cfg().serverDbPath);
+    db.exec("CREATE TABLE IF NOT EXISTS ingestLog (id INTEGER PRIMARY KEY AUTOINCREMENT, receivedAt INTEGER, bytes INTEGER, latestDay TEXT)");
+    db.prepare("INSERT INTO ingestLog (receivedAt, bytes, latestDay) VALUES (?,?,?)").run(Math.floor(Date.now() / 1000) - 8 * 86_400, 1, "2026-07-18");
+    db.close();
+    const r = storageReport(cfg());
+    expect(r.warnings).toEqual([]);
+    expect(r.ok).toBe(true);
+    // …and the 8-day-old upload is still REPORTED, just no longer mistaken for the mirror's age.
+    expect(r.lastIngestAgeSeconds).toBeGreaterThan(7 * 86_400);
+    expect(r.mirrorAgeSeconds).toBeLessThan(60);
   });
 
   it("still produces a report when server.sqlite is unreadable", () => {
