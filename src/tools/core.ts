@@ -6,6 +6,8 @@ import { Mirror, Family } from "../mirror.js";
 import { latestIngest } from "../ingest.js";
 import { listPending, journalSince } from "../staging.js";
 import { computeOverlay, pointKeyOf } from "../edits/overlay.js";
+import { annotationsOnDay } from "../edits/annotations.js";
+import { annotationSummary } from "./annotations.js";
 import { storageReport, isStorageError, storageFailureMessage } from "../storage.js";
 
 // set_baseline_note is append-only in the journal (staging.ts never deletes/rewrites rows), but
@@ -34,10 +36,17 @@ export function dataFreshness(cfg: Config) {
   // The journal/overlay/pending reads all open server.sqlite, which lives on the same volume as the
   // mirror — so they fail for the same reason and need the same guard.
   let baselineNotes: ReturnType<typeof latestBaselineNotes> = [];
+  // Deliberately a SUMMARY, not the annotations themselves: its only job is to tell an agent that
+  // dated context exists and which tags are in it, so the "call this first" tool advertises the
+  // store. The annotations themselves come from the `annotations` tool, or ride along on the
+  // sleep/day rows they bear on.
+  let annotations: ReturnType<typeof annotationSummary> = { count: 0, tagsInUse: [] };
   let journalSeq = 0, pendingEdits = 0;
   let serverDbError: string | undefined;
   try {
-    baselineNotes = latestBaselineNotes(computeOverlay(cfg).baselineNotes);
+    const overlay = computeOverlay(cfg);
+    baselineNotes = latestBaselineNotes(overlay.baselineNotes);
+    annotations = annotationSummary(overlay.annotations);
     const j = journalSince(cfg, 0);
     journalSeq = j.length ? j[j.length - 1].seq : 0;
     pendingEdits = listPending(cfg).length;
@@ -49,7 +58,7 @@ export function dataFreshness(cfg: Config) {
   const shell = {
     mirrorAgeSeconds: null, lastIngestAt: null, latestDataDay: null,
     sources: [] as any[], dailyMetricColumns: [] as string[], metricSeriesKeys: [] as any[],
-    pendingEdits, journalSeq, baselineNotes, storage,
+    pendingEdits, journalSeq, baselineNotes, annotations, storage,
     ...(serverDbError ? { serverDbError } : {}),
   };
 
@@ -78,6 +87,7 @@ export function dataFreshness(cfg: Config) {
       pendingEdits,
       journalSeq,
       baselineNotes,
+      annotations,
     };
   } catch (e) {
     if (!isStorageError(e)) throw e;
@@ -150,7 +160,13 @@ export function healthSnapshot(cfg: Config, args: { days?: number }) {
       d[r.family as Family] = cell;
     }
 
-    return { from, to, days: [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day)) };
+    // Dated context per day (its own annotations + any span covering it), attached after the
+    // field-wise merge so it is never confused with a source family's cell.
+    const withAnnotations = [...byDay.values()].map((d) => {
+      const anns = annotationsOnDay(overlay.annotations, d.day);
+      return anns.length ? { ...d, annotations: anns } : d;
+    });
+    return { from, to, days: withAnnotations.sort((a, b) => a.day.localeCompare(b.day)) };
   } finally { m.close(); }
 }
 
@@ -233,7 +249,7 @@ const asTool = (obj: unknown) => ({ content: [{ type: "text" as const, text: JSO
 export function registerCoreTools(server: McpServer, cfg: Config): void {
   server.registerTool("data_freshness", {
     title: "Data freshness",
-    description: "How stale the mirror is and which sources it holds (deviceIds that only ever write raw samples, e.g. hrSample-only straps, are included via `tables`), plus discoverable `dailyMetricColumns` and `metricSeriesKeys` (per-family counts) for building compare_sources/metric_series calls. Also returns `storage` — disk free/total, mirror size, orphaned staging bytes, and age of the last successful ingest — so server-side degradation is visible here rather than as an opaque failure in some other tool. `degraded: true` means the mirror could not be READ (empty arrays mean unreachable, not absent). Call this first.",
+    description: "How stale the mirror is and which sources it holds (deviceIds that only ever write raw samples, e.g. hrSample-only straps, are included via `tables`), plus discoverable `dailyMetricColumns` and `metricSeriesKeys` (per-family counts) for building compare_sources/metric_series calls. Also returns `storage` — disk free/total, mirror size, orphaned staging bytes, and age of the last successful ingest — so server-side degradation is visible here rather than as an opaque failure in some other tool. `degraded: true` means the mirror could not be READ (empty arrays mean unreachable, not absent). Two kinds of context ride along: `baselineNotes` is STANDING context true across a whole era (e.g. a supplement protocol that explains the entire WHOOP baseline — read it before calling anything illness), and `annotations` is a COUNT + tag list pointing at the dated life-event store (alcohol, travel, illness, known artifacts) — call the `annotations` tool for the events themselves. Call this first.",
     inputSchema: {},
     // Loose: only fields present in BOTH the mirror and no-mirror branches, with per-item objects left
     // passthrough so conditional keys (phoneTz, notIngested, per-source latestDay, note supersededCount)
@@ -249,6 +265,9 @@ export function registerCoreTools(server: McpServer, cfg: Config): void {
       pendingEdits: z.number(),
       journalSeq: z.number(),
       baselineNotes: z.array(z.object({ note: z.string(), deviceId: z.string().nullable(), at: z.number() }).passthrough()),
+      // Pointer, not payload — see the `annotations` tool. Passthrough because firstDay/lastDay are
+      // absent when the store is empty.
+      annotations: z.object({ count: z.number(), tagsInUse: z.array(z.string()) }).passthrough().optional(),
       // Storage/ingest health, always present. `degraded` + `error` appear only when the mirror could
       // not be read, in which case the arrays above are empty because the DATA IS UNREACHABLE, not
       // because it is absent — a distinction nothing surfaced during the 2026-07-26 outage.
@@ -268,7 +287,7 @@ export function registerCoreTools(server: McpServer, cfg: Config): void {
 
   server.registerTool("health_snapshot", {
     title: "Health snapshot",
-    description: "Recent per-day roll-up (recovery, strain, sleep, resting HR, HRV) grouped by source family. Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads.",
+    description: "Recent per-day roll-up (recovery, strain, sleep, resting HR, HRV) grouped by source family. Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads. A day with dated context (alcohol, illness, travel, a known measurement artifact) carries it as `annotations` — read those before interpreting that day's numbers.",
     inputSchema: { days: z.number().int().min(1).max(31).optional().describe("How many recent days (default 3).") },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (args) => asTool(healthSnapshot(cfg, args)));

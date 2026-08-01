@@ -25,8 +25,8 @@ function buildStages(n: number) {
 beforeAll(async () => { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); const z = path.join(dataDir, "b.noopbak"); buildNoopbak(z); await ingestNoopbak(fs.readFileSync(z), cfg); });
 
 describe("granular edit kinds", () => {
-  it("EDIT_KINDS is 8 and schemas validate", () => {
-    expect(EDIT_KINDS.length).toBe(8);
+  it("EDIT_KINDS is 9 and schemas validate", () => {
+    expect(EDIT_KINDS.length).toBe(9); // + add_annotation (docs/ANNOTATIONS_DESIGN.md)
     expect(payloadSchema("edit_sleep_stages").safeParse({ deviceId: "my-whoop", startTs: NIGHT, stages: NEW_STAGES }).success).toBe(true);
     expect(payloadSchema("edit_sleep_stages").safeParse({ deviceId: "d", startTs: 1, stages: [{ start: 5, end: 4, stage: "deep" }] }).success).toBe(false);
     expect(payloadSchema("delete_hr_range").safeParse({ deviceId: "my-whoop", fromTs: NIGHT, toTs: NIGHT + 30000 }).success).toBe(false); // >6h

@@ -8,6 +8,7 @@ import { registerWriteTools } from "./writes.js";
 import { registerGranularTools } from "./granular.js";
 import { registerPushTools } from "./push.js";
 import { registerDeepBufferTools } from "./deepbuf.js";
+import { registerAnnotationTools } from "./annotations.js";
 
 // "public" is the strict read-only surface served on the no-auth URL-secret route (POST /mcp/:secret):
 // pure reads only, so an anonymous caller (e.g. ChatGPT's "No Auth" connector, or anything that gets
@@ -22,6 +23,13 @@ export function registerTools(server: McpServer, cfg: Config, scope: "public" | 
   // deep_buffer_coverage + deep_buffer_window (#423). Strictly read-only over the raw-buffer archive,
   // so safe on every scope including public; neither can mutate the mirror or the edit journal.
   registerDeepBufferTools(server, cfg);
+  // Read-only over the edit journal's annotation entries. Registered on EVERY scope including the
+  // public URL-secret route on purpose: data_freshness already ships baselineNotes (incl. the
+  // supplement-protocol note) there, and sleep_summary/health_snapshot/compare_sources — all public
+  // — carry annotations inline regardless, so withholding the query tool would hide the store from
+  // exactly the reader it exists for without withholding the data. Writing one still needs a bearer
+  // token to propose and the read-write credential to confirm.
+  registerAnnotationTools(server, cfg);
   if (scope !== "public") {
     registerWriteTools(server, cfg, scope); // propose_edit/list_pending/edit_journal (+ rw-only resolution tools) (Task 4/5)
     registerPushTools(server, cfg); // request_sync — pokes the phone; not for anonymous URL callers

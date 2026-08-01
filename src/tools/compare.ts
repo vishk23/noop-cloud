@@ -4,6 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "../config.js";
 import { Mirror, DailyMetricRow } from "../mirror.js";
 import { computeOverlay, pointKeyOf } from "../edits/overlay.js";
+import { annotationsOnDay } from "../edits/annotations.js";
 
 const DAY = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "YYYY-MM-DD");
 const DEFAULT_METRICS = ["restingHr", "avgHrv", "totalSleepMin"] as const;
@@ -79,7 +80,10 @@ export function compareSources(cfg: Config, args: { from: string; to: string; me
         const spreadPct = vals.length >= 2 ? Math.round(((Math.max(...vals) - Math.min(...vals)) / (vals.reduce((s, x) => s + x, 0) / vals.length)) * 1000) / 10 : 0;
         metricsOut[metric] = multiDevice ? { ...cell, spreadPct, perDevice } : { ...cell, spreadPct };
       }
-      return { day, metrics: metricsOut };
+      // Dated context for this day (its own annotations + any span covering it). Omitted entirely
+      // when there are none, so an unannotated day's shape is unchanged.
+      const anns = annotationsOnDay(overlay.annotations, day);
+      return { day, metrics: metricsOut, ...(anns.length ? { annotations: anns } : {}) };
     });
     return { from: args.from, to: args.to, days };
   } finally { m.close(); }
@@ -88,7 +92,7 @@ export function compareSources(cfg: Config, args: { from: string; to: string; me
 export function registerCompareSources(server: McpServer, cfg: Config): void {
   server.registerTool("compare_sources", {
     title: "Compare sources",
-    description: "Per-day WHOOP vs Oura vs Apple side by side for chosen metrics, with a spread %. The corroboration workhorse. Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads. Falls back to metricSeries keys (e.g. Apple steps) when a source lacks the dailyMetric column. Common dailyMetric columns: restingHr, avgHrv, spo2Pct, steps, totalSleepMin, efficiency, skinTempDevC, recovery, strain. Common metricSeries keys: oura_*/ref_* scores, body_age, fitness_age, sleep_performance, steps_est, vitality. Call data_freshness for the full dailyMetricColumns/metricSeriesKeys lists.",
+    description: "Per-day WHOOP vs Oura vs Apple side by side for chosen metrics, with a spread %. The corroboration workhorse. A day carrying dated context (alcohol, illness, travel, a known measurement artifact) shows it as `annotations` — check that before attributing a spread or a deviation to physiology or to a device. Aggregates the phone's own daily rollups — confirmed edits appear here only after Phase-3 phone sync re-uploads. Falls back to metricSeries keys (e.g. Apple steps) when a source lacks the dailyMetric column. Common dailyMetric columns: restingHr, avgHrv, spo2Pct, steps, totalSleepMin, efficiency, skinTempDevC, recovery, strain. Common metricSeries keys: oura_*/ref_* scores, body_age, fitness_age, sleep_performance, steps_est, vitality. Call data_freshness for the full dailyMetricColumns/metricSeriesKeys lists.",
     inputSchema: { from: DAY, to: DAY, metrics: z.array(z.string()).optional().describe("dailyMetric columns (restingHr, avgHrv, spo2Pct, steps, totalSleepMin, efficiency, skinTempDevC, recovery, strain, ...) or metricSeries keys (oura_*/ref_* scores, body_age, fitness_age, sleep_performance, steps_est, vitality, vo2max, ...) — falls back to metricSeries per-family when a source has no dailyMetric value. See data_freshness for the full lists.") },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(compareSources(cfg, a)));

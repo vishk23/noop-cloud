@@ -12,7 +12,7 @@ const asTool = (obj: unknown) => ({ content: [{ type: "text" as const, text: JSO
 export function registerWriteTools(server: McpServer, cfg: Config, scope: "ro" | "rw"): void {
   server.registerTool("propose_edit", {
     title: "Propose a data edit",
-    description: "Stage a correction (nothing is applied until a human confirms with the read-write credential). Kinds: " + EDIT_KINDS.join(", ") + ". delete_metric_point's key can name either a metricSeries key or one of these dailyMetric columns to blank a single bad value: " + DAILY_METRIC_EDITABLE_COLUMNS.join(", ") + " — column deletes apply immediately to every server-side read (compare_sources, health_snapshot, metric_series fallback paths, fetch) but the phone-side sync doesn't understand column deletes yet (Phase 3 work): it will surface needsAttention and ack without changing local data. Returns a human-readable diff and the proposal id.",
+    description: "Stage a correction (nothing is applied until a human confirms with the read-write credential). Kinds: " + EDIT_KINDS.join(", ") + ". add_annotation records a DATED life event or ground-truth context (day + tags + detail + source=user_reported|agent_inferred, optionally endDay/startTs/endTs/tz/values) — use it for anything that happened on a day, e.g. alcohol, illness, travel, supplement protocol on/off, a hard workout, a known measurement artifact; it is surfaced by the `annotations` tool and attached automatically to sleep_summary/health_snapshot/compare_sources rows. set_baseline_note is NOT the same thing: it is undated STANDING context and only the LATEST note per deviceId is ever surfaced, so a second note for a device hides the first — the proposal's diff warns when that would happen. delete_metric_point's key can name either a metricSeries key or one of these dailyMetric columns to blank a single bad value: " + DAILY_METRIC_EDITABLE_COLUMNS.join(", ") + " — column deletes apply immediately to every server-side read (compare_sources, health_snapshot, metric_series fallback paths, fetch) but the phone-side sync doesn't understand column deletes yet (Phase 3 work): it will surface needsAttention and ack without changing local data. Returns a human-readable diff and the proposal id.",
     inputSchema: {
       kind: z.enum(EDIT_KINDS),
       payload: z.record(z.unknown()).describe("Kind-specific payload; see the kind's schema."),
@@ -32,7 +32,12 @@ export function registerWriteTools(server: McpServer, cfg: Config, scope: "ro" |
     const id = "edit_" + crypto.randomBytes(5).toString("hex");
     const diff = renderDiff(a.kind as EditKind, parsed.data, before);
     createProposal(cfg, { id, kind: a.kind, payloadJSON: JSON.stringify(parsed.data), rationale: a.rationale, beforeJSON: before ? JSON.stringify(before) : null, diffText: diff });
-    return asTool({ id, kind: a.kind, diff, rationale: a.rationale, status: "pending", hint: "confirm_edit requires the read-write credential" });
+    // The diff already carries this, but a caller reading fields rather than prose should not have to
+    // parse it to notice that confirming will make an existing note invisible.
+    const shadowed = a.kind === "set_baseline_note" && (before as any)?.supersedes
+      ? { warning: `this note supersedes the current one for ${(before as any).deviceId ?? "the null-deviceId slot"} — only the latest per deviceId is surfaced; for a DATED event use add_annotation instead` }
+      : {};
+    return asTool({ id, kind: a.kind, diff, rationale: a.rationale, status: "pending", ...shadowed, hint: "confirm_edit requires the read-write credential" });
   });
 
   server.registerTool("list_pending", {

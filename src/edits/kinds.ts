@@ -1,6 +1,7 @@
 import { z } from "zod";
+import { TAG_PATTERN, ANNOTATION_SOURCES } from "./annotations.js";
 
-export const EDIT_KINDS = ["fix_workout", "delete_workout", "add_workout", "adjust_sleep_bounds", "delete_metric_point", "set_baseline_note", "edit_sleep_stages", "delete_hr_range"] as const;
+export const EDIT_KINDS = ["fix_workout", "delete_workout", "add_workout", "adjust_sleep_bounds", "delete_metric_point", "set_baseline_note", "edit_sleep_stages", "delete_hr_range", "add_annotation"] as const;
 export type EditKind = (typeof EDIT_KINDS)[number];
 
 // delete_metric_point's `key` originally only ever named a metricSeries key. It now also accepts
@@ -49,6 +50,32 @@ const schemas: Record<EditKind, z.ZodTypeAny> = {
   delete_hr_range: z.object({
     deviceId: z.string().min(1), fromTs: z.number().int(), toTs: z.number().int(),
   }).strict().refine((p) => p.toTs > p.fromTs && p.toTs - p.fromTs <= 21_600, "toTs must be after fromTs and within 6 hours"),
+  // A dated life event (see docs/ANNOTATIONS_DESIGN.md). Distinct from set_baseline_note, which is
+  // STANDING context with no time and only one visible note per deviceId — a second dated event
+  // written as a baseline note silently hides the first.
+  //
+  // `day` is required and every other time field is optional on purpose: most of what VK reports is
+  // day-grained ("Thursday I drank"), and forcing an instant would mean inventing precision. `day`
+  // stays mandatory so every annotation has exactly one unambiguous anchor to join a night onto.
+  add_annotation: z.object({
+    day: DAY,
+    endDay: DAY.optional().describe("Inclusive last day of a multi-day span (travel, a supplement block)."),
+    startTs: z.number().int().optional(), endTs: z.number().int().optional(),
+    tags: z.array(z.string().regex(TAG_PATTERN, "tags must match ^[a-z][a-z0-9_]{1,31}$")).min(1).max(8),
+    detail: z.string().min(1).max(2000),
+    // Required, and never guessed: user_reported is ground truth VK stated, agent_inferred is a
+    // conclusion drawn from the data. Collapsing them lets an inference harden into a fact across
+    // sessions, which is exactly how a retracted claim gets born.
+    source: z.enum(ANNOTATION_SOURCES),
+    tz: z.string().min(1).max(64).optional().describe("IANA zone that `day` is a calendar day in."),
+    // Flat, scalar-only, and read by no tool today. It exists so the future habit tracker can record
+    // "6 drinks" as 6 rather than buried in prose — the mistake set_baseline_note forces.
+    values: z.record(z.union([z.string().max(200), z.number(), z.boolean()])).optional(),
+  }).strict()
+    .refine((p) => !p.endDay || p.endDay >= p.day, "endDay must not precede day")
+    .refine((p) => p.endTs === undefined || (p.startTs !== undefined && p.endTs > p.startTs), "endTs requires startTs and must be after it")
+    .refine((p) => !p.values || Object.keys(p.values).length <= 20, "values holds at most 20 keys")
+    .refine((p) => new Set(p.tags).size === p.tags.length, "tags must be unique"),
 };
 
 export function payloadSchema(kind: EditKind): z.ZodTypeAny { return schemas[kind]; }

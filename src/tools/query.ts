@@ -4,6 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Config } from "../config.js";
 import { Mirror } from "../mirror.js";
 import { computeOverlay, workoutKeyOf, sleepKeyOf, pointKeyOf } from "../edits/overlay.js";
+import { annotationsForNight } from "../edits/annotations.js";
 
 const DAY = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "YYYY-MM-DD");
 const range = { from: DAY, to: DAY };
@@ -54,7 +55,15 @@ export function sleepSummary(cfg: Config, args: { from: string; to: string }) {
       const startTs = adj?.newStartTs ?? s.startTs;
       const endTs = adj?.newEndTs ?? s.endTs;
       const tzId = tzForStart(startTs, tzByDay);
-      return { ...s, startTs, endTs, startIso: new Date(startTs * 1000).toISOString(), durationMin: Math.round((endTs - startTs) / 60), ...(tzId ? { tzId } : {}), ...(adj ? { edited: true, editId: adj.editId } : {}) };
+      // Annotations are keyed on the LOCAL day an event happened, so the session's own day must be
+      // local too — a 23:30 ET bedtime is already the next UTC day, and matching on UTC would file a
+      // same-evening event under priorEvening (or miss it entirely at the range edge). Falls back to
+      // the UTC day only when the mirror never stamped a zone for this night.
+      const startDay = (tzId && localDayInTz(startTs, tzId)) || new Date(startTs * 1000).toISOString().slice(0, 10);
+      // Includes the PRIOR evening: VK drank on 2026-07-30, but the session it wrecked starts
+      // 2026-07-31 01:48 ET. See annotationsForNight.
+      const anns = annotationsForNight(overlay.annotations, startDay);
+      return { ...s, startTs, endTs, startIso: new Date(startTs * 1000).toISOString(), durationMin: Math.round((endTs - startTs) / 60), ...(tzId ? { tzId } : {}), ...(adj ? { edited: true, editId: adj.editId } : {}), ...(anns.length ? { annotations: anns } : {}) };
     });
     return { sessions };
   } finally { m.close(); }
@@ -92,7 +101,7 @@ export function registerQueryTools(server: McpServer, cfg: Config): void {
 
   server.registerTool("sleep_summary", {
     title: "Sleep summary",
-    description: "Sleep sessions in a date range with duration and efficiency, per source family. Reflects confirmed server-side edits; dailyMetric-derived numbers update only after Phase-3 phone sync.",
+    description: "Sleep sessions in a date range with duration and efficiency, per source family. Reflects confirmed server-side edits; dailyMetric-derived numbers update only after Phase-3 phone sync. Each session carries any `annotations` bearing on that night — the session's own local start day, the PRIOR EVENING (an evening event bears on a night whose session starts after midnight), and any multi-day span covering it; `matchedOn` says which. Read them before calling a night's deviation physiological.",
     inputSchema: { ...range },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (a) => asTool(sleepSummary(cfg, a)));

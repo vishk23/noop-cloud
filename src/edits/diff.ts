@@ -2,12 +2,14 @@ import fs from "node:fs";
 import Database from "better-sqlite3";
 import type { Config } from "../config.js";
 import { isDailyMetricColumnKey, EditKind } from "./kinds.js";
+import { computeOverlay } from "./overlay.js";
 
 export class EditTargetError extends Error {
   constructor(public code: "target_not_found" | "not_ingested", msg?: string) { super(msg ?? code); }
 }
 
 const iso = (ts: number) => new Date(ts * 1000).toISOString().slice(0, 16).replace("T", " ") + "Z";
+const truncate = (s: string, n: number) => (s.length <= n ? s : s.slice(0, n - 1) + "…");
 
 /** Merge consecutive same-stage segments and sum minutes: "light 60m/deep 120m/rem 120m/light 120m". */
 function stageSummary(stages: { start: number; end: number; stage: string }[] | null | undefined): string {
@@ -22,9 +24,21 @@ function stageSummary(stages: { start: number; end: number; stage: string }[] | 
   return merged.map((m) => `${m.stage} ${m.minutes}m`).join("/");
 }
 
-/** Read-only peek at the mirror for the row an edit targets. null for kinds with no target. */
-export function captureBefore(cfg: Pick<Config, "mirrorPath">, kind: EditKind, payload: any): object | null {
-  if (kind === "add_workout" || kind === "set_baseline_note") return null;
+/** Read-only peek at the mirror for the row an edit targets. null for kinds with no target.
+ *
+ *  set_baseline_note has no mirror row, but it DOES have something worth capturing: the note it is
+ *  about to hide. Every reader (latestBaselineNotes in tools/core.ts) surfaces only the latest note
+ *  per deviceId, so writing a second note for a device makes the first invisible — and until this
+ *  branch existed nothing said so, in the response OR in the diff a human confirms against. */
+export function captureBefore(cfg: Pick<Config, "mirrorPath" | "serverDbPath">, kind: EditKind, payload: any): object | null {
+  if (kind === "add_workout" || kind === "add_annotation") return null;
+  if (kind === "set_baseline_note") {
+    const key = payload.deviceId ?? null;
+    // computeOverlay's baselineNotes are in application order (activeEdits is ORDER BY seq), so the
+    // last match is the one currently surfaced — the same collapse latestBaselineNotes performs.
+    const prior = computeOverlay(cfg).baselineNotes.filter((n) => n.deviceId === key).at(-1);
+    return prior ? { supersedes: prior.note, supersedesAt: prior.at, deviceId: key } : null;
+  }
   if (!fs.existsSync(cfg.mirrorPath)) throw new EditTargetError("not_ingested");
   const db = new Database(cfg.mirrorPath, { readonly: true, fileMustExist: true });
   try {
@@ -75,8 +89,26 @@ export function renderDiff(kind: EditKind, payload: any, before: any): string {
       const label = before.source === "dailyMetric" ? "dailyMetric column" : "metricSeries key";
       return `DELETE ${label} ${payload.key}=${before.value} on ${payload.day} (${payload.deviceId})`;
     }
-    case "set_baseline_note":
-      return `NOTE${payload.deviceId ? ` [${payload.deviceId}]` : ""}: ${payload.note}`;
+    case "set_baseline_note": {
+      const line = `NOTE${payload.deviceId ? ` [${payload.deviceId}]` : ""}: ${payload.note}`;
+      if (!before?.supersedes) return line;
+      // Rendered INTO the diff, not just returned alongside it: list_pending shows only diffText, and
+      // list_pending is where the confirm decision actually gets made.
+      const label = before.deviceId ?? "no deviceId";
+      const day = new Date(before.supersedesAt * 1000).toISOString().slice(0, 10);
+      return [
+        line,
+        `  ⚠ REPLACES the current note for ${label} (${day}): ${JSON.stringify(truncate(before.supersedes, 160))}`,
+        `    Only the latest note per deviceId is surfaced, so the old one becomes invisible.`,
+        `    For a DATED event use add_annotation instead — baseline notes are for STANDING context.`,
+      ].join("\n");
+    }
+    case "add_annotation": {
+      const when = payload.endDay ? `${payload.day}..${payload.endDay}` : payload.day;
+      const at = payload.startTs !== undefined ? ` @ ${iso(payload.startTs)}` : "";
+      const vals = payload.values ? ` ${JSON.stringify(payload.values)}` : "";
+      return `ANNOTATE ${when}${at} [${payload.tags.join(", ")}] (${payload.source}):${vals} ${truncate(payload.detail, 300)}`;
+    }
     case "edit_sleep_stages": {
       const oldStages = before.stagesJSON ? JSON.parse(before.stagesJSON) : null;
       return `RESTAGE sleep @ ${iso(before.startTs)} (${payload.deviceId}): ${stageSummary(oldStages)} ⇒ ${stageSummary(payload.stages)}`;

@@ -16,7 +16,7 @@ describe("edit kinds", () => {
     expect(payloadSchema("delete_workout").safeParse({ deviceId: "my-whoop", startTs: RUN_TS, sport: "running" }).success).toBe(true);
     expect(payloadSchema("adjust_sleep_bounds").safeParse({ deviceId: "my-whoop", startTs: 1 }).success).toBe(false); // needs a new bound
     expect(payloadSchema("add_workout").safeParse({ startTs: 1, endTs: 2, sport: "yoga", deviceId: "my-whoop" }).success).toBe(false); // deviceId not accepted
-    expect(EDIT_KINDS.length).toBe(8);
+    expect(EDIT_KINDS.length).toBe(9); // + add_annotation (docs/ANNOTATIONS_DESIGN.md)
   });
   it("captureBefore snapshots the real row and errors on a missing target", () => {
     const before = captureBefore(cfg, "delete_workout", { deviceId: "my-whoop", startTs: RUN_TS, sport: "running" }) as any;

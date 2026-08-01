@@ -67,9 +67,10 @@ The server listens on `:8080`; `GET /healthz` is the health check. Then `POST /i
 
 ## Tools & prompts
 
-28 MCP tools and 3 prompts, grouped by function (read-token tools are visible to every caller; write-token tools appear only for `RW_TOKEN` clients):
+29 MCP tools and 3 prompts, grouped by function (read-token tools are visible to every caller; write-token tools appear only for `RW_TOKEN` clients):
 
 - **Summaries & trends (read, 6):** `data_freshness`, `health_snapshot`, `metric_series`, `sleep_summary`, `workout_summary`, `compare_sources` (WHOOP vs Oura vs Apple corroboration).
+- **Context (read, 1):** `annotations` — dated life events (alcohol, illness, travel, supplement protocol, known measurement artifacts) that say whether a deviation is physiology or a Tuesday.
 - **Raw sensor evidence (read, 7):** `hr_series` (beat-level heart rate), `sleep_detail` (full hypnogram + in-sleep HR), `sleep_state_series` (the hypnogram as a series), `hrv_series` (RMSSD from R-R intervals), `motion_series` (steps + wrist posture), `imu_series` (WHOOP 5/MG activity), `temp_series` (per-second skin temperature).
 - **Device & capture inventory (read, 4):** `streams` (what raw streams exist and over what span), `battery_series` (strap state-of-charge), `device_events` (the strap's firmware event log), `imu_coverage` (deep-IMU capture availability).
 - **Deep-buffer archive (read, 2):** `deep_buffer_coverage`, `deep_buffer_window` — read-only over the raw-buffer object store, available on every scope.
@@ -313,6 +314,34 @@ clean intervals reports `rmssd:null` rather than a fabricated number.
 Then `edit_sleep_stages` rewrites the night's stage timeline and `delete_hr_range` throws out
 artifact heart-rate stretches — through the same propose → confirm → journal → undo rail as every
 other edit.
+
+### Day annotations — the context that makes a number mean something
+
+A night with resting HR 10 bpm above baseline reads as illness. The same night, labelled *"drank
+and was dehydrated, deliberate validation night"*, reads as a clean experiment. The numbers are
+identical; only the context differs, and without somewhere to keep it the wrong reading wins by
+default the next time anyone looks.
+
+`propose_edit` with kind `add_annotation` records a dated event — a day (or a span, or an instant),
+one or more tags, free-text detail, and a `source` that separates what you reported from what an
+agent inferred. It goes through the same propose → confirm → journal → undo rail as every other
+edit, so a fact attributed to you needs your read-write credential to land.
+
+Reading it back rarely means asking for it. Annotations are attached automatically to the rows they
+bear on: `sleep_summary` sessions (including **the prior evening** — an evening event bears on a
+night whose session starts after midnight), `health_snapshot` days, and `compare_sources` days.
+`data_freshness` reports a count and the tags in use; the `annotations` tool queries by day range,
+tag, or source.
+
+The tag vocabulary is open — `alcohol`, `illness`, `travel`, `supplement_on`/`supplement_off`,
+`late_meal`, `hard_workout`, `medication`, `measurement_artifact` and friends are suggested, not
+enforced — and the tool reports which tags are actually in use, so the vocabulary can grow from
+evidence rather than guesswork.
+
+This is **not** `set_baseline_note`, which is for *standing* context spanning a whole era (e.g. a
+supplement protocol that explains every reading in a dataset) and surfaces only the latest note per
+device. Writing a dated event as a baseline note silently hides the previous one; proposing one now
+warns you before you do. See [docs/ANNOTATIONS_DESIGN.md](docs/ANNOTATIONS_DESIGN.md).
 
 ## License
 
