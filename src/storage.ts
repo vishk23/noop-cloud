@@ -228,6 +228,31 @@ export interface StorageReport {
   mirror: { exists: boolean; bytes: number | null; modifiedAt: string | null; readable: boolean | null };
   serverDb: { exists: boolean; bytes: number | null };
   stagedOrphans: { count: number; bytes: number };
+  /**
+   * How long since ANY writer last wrote the mirror — the ground-truth freshness number, and the one
+   * every staleness verdict is built on.
+   *
+   * It is the mirror's own mtime because the mirror has two writers and only one of them keeps a
+   * marker: `POST /ingest` publishes by rename(2) and appends to `ingestLog`, while the liters
+   * applier writes the same file in place from a separate Rust process that never opens
+   * server.sqlite. Deriving freshness from `ingestLog` therefore froze it at the last whole-DB
+   * upload the moment replication became the live path — 30.8 h of phantom staleness on a mirror
+   * that was seconds old (vk-noop-cloud, 2026-07-31). A marker one writer does not know exists can
+   * always drift; an mtime cannot be forgotten, because writing IS what sets it.
+   *
+   * Safe to read as "was the mirror WRITTEN", not merely "was it touched": every one of the 20
+   * `Mirror` call sites opens `readonly: true`, so no query on this server can move it.
+   */
+  mirrorAgeSeconds: number | null;
+  /** ISO form of the same mtime — when the mirror was last written, by either path. */
+  mirrorUpdatedAt: string | null;
+  /**
+   * When the last WHOLE-DATABASE `POST /ingest` landed. Deliberately still reported, and deliberately
+   * no longer used as the mirror's age: "when did the phone last send the entire database" is a real
+   * operational question (it is what re-baselines the liters lineage), and under replication the
+   * honest answer is "days ago" while the mirror is minutes old. The two disagreeing is now
+   * information rather than a contradiction.
+   */
   lastIngestAt: string | null;
   lastIngestAgeSeconds: number | null;
   /** Set when even the bookkeeping DB could not be read — i.e. the disk problem is total. */
@@ -263,6 +288,10 @@ export function storageReport(cfg: StorageCfg, opts: { pageChurnLimit?: number; 
   const sStat = statOr(cfg.serverDbPath);
   const orphans = listStagedArtifacts(cfg.dataDir);
   const orphanBytes = orphans.reduce((a, b) => a + b.bytes, 0);
+
+  // Ground truth for freshness — see the StorageReport field for why it is the mtime and not a
+  // marker. Clamped at 0: a clock stepping backwards must read as "just written", never as negative.
+  const mirrorAgeSeconds = mStat ? Math.max(0, Math.floor((Date.now() - mStat.mtimeMs) / 1000)) : null;
 
   let lastIngestAt: string | null = null;
   let lastIngestAgeSeconds: number | null = null;
@@ -325,10 +354,17 @@ export function storageReport(cfg: StorageCfg, opts: { pageChurnLimit?: number; 
     if (!probe.ok) warnings.push(`mirror.sqlite EXISTS but cannot be read: ${probe.error} — every mirror-backed MCP tool is failing`);
   }
   if (lastIngestError) warnings.push(`server.sqlite unreadable: ${lastIngestError}`);
-  // 48h: the phone uploads on every background wake, so a day and a half of silence is already an
+  // 48h: the phone syncs on every background wake, so a day and a half of silence is already an
   // outage, not a quiet period.
-  if (lastIngestAgeSeconds !== null && lastIngestAgeSeconds > 172_800) {
-    warnings.push(`no successful ingest for ${(lastIngestAgeSeconds / 86_400).toFixed(1)} days — the phone's uploads are failing`);
+  //
+  // Keyed on the MIRROR's age, not on `lastIngestAgeSeconds`. Under liters the phone pushes LTX
+  // deltas and may not send a whole database for weeks, so the old form accused a perfectly healthy
+  // server of dropping uploads roughly every other day. The question this warning exists to answer
+  // was never "did /ingest run" — it is "has anything reached the mirror", and that is exactly what
+  // an mtime measures, whichever path did the writing.
+  if (mirrorAgeSeconds !== null && mirrorAgeSeconds > 172_800) {
+    warnings.push(`the mirror has not been updated for ${(mirrorAgeSeconds / 86_400).toFixed(1)} days — ` +
+      `neither page replication nor POST /ingest is landing, so every tool is answering with stale data`);
   }
 
   return {
@@ -338,6 +374,8 @@ export function storageReport(cfg: StorageCfg, opts: { pageChurnLimit?: number; 
     mirror: { exists: !!mStat, bytes: mStat?.size ?? null, modifiedAt: mStat ? new Date(mStat.mtimeMs).toISOString() : null, readable: mirrorOk },
     serverDb: { exists: !!sStat, bytes: sStat?.size ?? null },
     stagedOrphans: { count: orphans.length, bytes: orphanBytes },
+    mirrorAgeSeconds,
+    mirrorUpdatedAt: mStat ? new Date(mStat.mtimeMs).toISOString() : null,
     lastIngestAt,
     lastIngestAgeSeconds,
     ...(lastIngestError ? { lastIngestError } : {}),

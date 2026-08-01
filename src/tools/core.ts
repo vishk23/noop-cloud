@@ -6,6 +6,7 @@ import { Mirror, Family } from "../mirror.js";
 import { latestIngest } from "../ingest.js";
 import { listPending, journalSince } from "../staging.js";
 import { computeOverlay, pointKeyOf } from "../edits/overlay.js";
+import { readStatus as readLitersStatus } from "../liters/state.js";
 import { storageReport, isStorageError, storageFailureMessage } from "../storage.js";
 
 // set_baseline_note is append-only in the journal (staging.ts never deletes/rewrites rows), but
@@ -46,8 +47,15 @@ export function dataFreshness(cfg: Config) {
     serverDbError = e instanceof Error ? e.message : String(e);
   }
 
+  // Taken from the storage report rather than hardcoded null: the mirror's mtime comes from stat(2),
+  // which keeps working when the DATABASE cannot be opened at all. A degraded server should still be
+  // able to say when its mirror was last written — that is the whole question this tool is called
+  // first to answer, and it is answerable in exactly the situation the shell exists for. Both are
+  // null when there is genuinely no mirror.
   const shell = {
-    mirrorAgeSeconds: null, lastIngestAt: null, latestDataDay: null,
+    mirrorAgeSeconds: storage.mirrorAgeSeconds, mirrorUpdatedAt: storage.mirrorUpdatedAt,
+    lastIngestAt: null, lastReplicationAt: null,
+    lastWriteSource: null, latestSampleAt: null, dataAgeSeconds: null, latestDataDay: null,
     sources: [] as any[], dailyMetricColumns: [] as string[], metricSeriesKeys: [] as any[],
     pendingEdits, journalSeq, baselineNotes, storage,
     ...(serverDbError ? { serverDbError } : {}),
@@ -59,17 +67,52 @@ export function dataFreshness(cfg: Config) {
   try {
     m = new Mirror(cfg.mirrorPath);
     const li = latestIngest(cfg);
-    const now = Math.floor(Date.now() / 1000);
+    const sources = m.sources();
+    // Newest raw sample in the mirror, in seconds. The mtime says the FILE was written; this says
+    // DATA arrived, and only the second one justifies "the answer describes old data". Free: it
+    // comes off the same GROUP BYs `sources()` already runs, so nothing new is scanned.
+    //
+    // Scope is exactly the timestamp-keyed tables sources() aggregates — hrSample, rrInterval,
+    // sleepSession, appleStepHour. A mirror whose only new rows are ppgHrSample (the v26 optical
+    // estimate) therefore reads slightly older here than it truly is; `mirrorUpdatedAt` is the
+    // unconditional signal, and this is the corroborating one.
+    const latestTs = sources.reduce<number | null>((a, s) => (s.latestTs != null && (a === null || s.latestTs > a) ? s.latestTs : a), null);
+    const nowMs = Date.now();
+    // Each writer's own stamp, used ONLY to name the writer. `lastIngestAt` is the ingestLog row;
+    // `lastReplicationAt` is `lastSyncAtMs` out of the status file the Rust sink republishes after
+    // every apply round (src/liters/state.ts) — the sink's own account of when it last wrote.
+    // Deliberately not load-bearing: `mirrorAgeSeconds` above is the mtime and stays right even when
+    // both of these are missing, which is the whole point of deriving freshness from ground truth.
+    const litersSyncMs = cfg.liters?.enabled ? (readLitersStatus(cfg)?.lastSyncAtMs || null) : null;
+    const ingestMs = li ? li.receivedAt * 1000 : null;
     return {
       storage,
-      mirrorAgeSeconds: li ? now - li.receivedAt : null,
-      lastIngestAt: li ? new Date(li.receivedAt * 1000).toISOString() : null,
+      // From the mirror's own mtime (storageReport), NOT from `ingestLog`. The mirror has two
+      // writers — `POST /ingest` and the liters applier — and only the first appends an ingestLog
+      // row, so the old derivation reported the age of the last WHOLE-DB upload under the name
+      // "mirrorAge". Once replication went live in production that read 30.8 h stale against a
+      // mirror written 40 seconds earlier, and this is the tool whose >36 h branch tells the agent
+      // to warn that the answer describes old data. See StorageReport.mirrorAgeSeconds.
+      mirrorAgeSeconds: storage.mirrorAgeSeconds,
+      mirrorUpdatedAt: storage.mirrorUpdatedAt,
+      // Kept, and now unambiguous: the last time the phone sent the ENTIRE database. Under page
+      // replication this is legitimately days older than `mirrorUpdatedAt` on a perfectly healthy
+      // server — the gap between them is the replication story, not a fault.
+      lastIngestAt: ingestMs ? new Date(ingestMs).toISOString() : null,
+      lastReplicationAt: litersSyncMs ? new Date(litersSyncMs).toISOString() : null,
+      // Which path last wrote the mirror — the line whose absence made the production report look
+      // self-contradictory rather than merely two-sided. null when neither path has stamped itself.
+      lastWriteSource: litersSyncMs || ingestMs
+        ? ((litersSyncMs ?? 0) > (ingestMs ?? 0) ? "replication" : "ingest")
+        : null,
+      latestSampleAt: latestTs != null ? new Date(latestTs * 1000).toISOString() : null,
+      dataAgeSeconds: latestTs != null ? Math.max(0, Math.floor(nowMs / 1000 - latestTs)) : null,
       // The phone's IANA timezone as of the most recent upload (X-Phone-Timezone header). null when the
       // uploading build predates the header or sent a malformed value. Every timestamp in the mirror is
       // epoch-UTC, so this is the anchor for any wall-clock reading of the latest data.
       phoneTz: li?.phoneTz ?? null,
       latestDataDay: m.latestDataDay(),
-      sources: m.sources().map((s) => ({ deviceId: s.deviceId, family: s.family, latestDay: s.latestDay, tables: s.tables })),
+      sources: sources.map((s) => ({ deviceId: s.deviceId, family: s.family, latestDay: s.latestDay, tables: s.tables })),
       // Discoverability (post-hoc audit: a whole agent-run was wasted failing to find
       // skinTempDevC because nothing listed valid names). Introspected/aggregated fresh on every
       // call rather than hardcoded, so a phone-side schema change surfaces automatically.
@@ -233,14 +276,19 @@ const asTool = (obj: unknown) => ({ content: [{ type: "text" as const, text: JSO
 export function registerCoreTools(server: McpServer, cfg: Config): void {
   server.registerTool("data_freshness", {
     title: "Data freshness",
-    description: "How stale the mirror is and which sources it holds (deviceIds that only ever write raw samples, e.g. hrSample-only straps, are included via `tables`), plus discoverable `dailyMetricColumns` and `metricSeriesKeys` (per-family counts) for building compare_sources/metric_series calls. Also returns `storage` — disk free/total, mirror size, orphaned staging bytes, and age of the last successful ingest — so server-side degradation is visible here rather than as an opaque failure in some other tool. `degraded: true` means the mirror could not be READ (empty arrays mean unreachable, not absent). Call this first.",
+    description: "How stale the mirror is and which sources it holds (deviceIds that only ever write raw samples, e.g. hrSample-only straps, are included via `tables`), plus discoverable `dailyMetricColumns` and `metricSeriesKeys` (per-family counts) for building compare_sources/metric_series calls. STALENESS: judge it by `mirrorAgeSeconds`/`mirrorUpdatedAt` (when the mirror was last WRITTEN, by any path) and `dataAgeSeconds`/`latestSampleAt` (the newest raw sample) — NOT by `lastIngestAt`, which means only the last WHOLE-DATABASE upload and is legitimately days older on a healthy server that receives page-replication deltas. `lastWriteSource` names which path wrote last. Also returns `storage` — disk free/total, mirror size, orphaned staging bytes — so server-side degradation is visible here rather than as an opaque failure in some other tool. `degraded: true` means the mirror could not be READ (empty arrays mean unreachable, not absent). Call this first.",
     inputSchema: {},
     // Loose: only fields present in BOTH the mirror and no-mirror branches, with per-item objects left
     // passthrough so conditional keys (phoneTz, notIngested, per-source latestDay, note supersededCount)
     // never fail validation. Documents the shape without constraining the variable parts.
     outputSchema: {
       mirrorAgeSeconds: z.number().nullable(),
+      mirrorUpdatedAt: z.string().nullable(),
       lastIngestAt: z.string().nullable(),
+      lastReplicationAt: z.string().nullable().optional(),
+      lastWriteSource: z.string().nullable().optional(),
+      latestSampleAt: z.string().nullable().optional(),
+      dataAgeSeconds: z.number().nullable().optional(),
       phoneTz: z.string().nullable().optional(),
       latestDataDay: z.string().nullable(),
       sources: z.array(z.object({ deviceId: z.string(), family: z.string(), tables: z.array(z.string()) }).passthrough()),

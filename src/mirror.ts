@@ -42,6 +42,22 @@ export interface EventKindCount { kind: string; n: number; firstTs: number; last
 
 const withFamily = <T extends { deviceId: string }>(r: T) => ({ ...r, family: sourceFamily(r.deviceId) });
 
+/**
+ * An epoch-seconds value JS `Date` can actually represent, or null.
+ *
+ * The mirror's `ts` columns are whatever the phone wrote, and a corrupt or garbage row is not
+ * hypothetical. SQLite's `date(ts,'unixepoch')` answers NULL for a timestamp out of range;
+ * `new Date(ts*1000).toISOString()` throws `RangeError: Invalid time value` instead — so moving the
+ * day formatting from SQL into JS quietly armed one bad row to take down `data_freshness`, the tool
+ * the noop-health contract calls FIRST and the one that has to survive whatever else is broken.
+ * This restores SQLite's answer: unrepresentable reads as unknown, not as a failure.
+ */
+const MAX_EPOCH_MS = 8.64e15; // ECMA-262 time-value range: ±100,000,000 days from the epoch
+function representableTs(ts: number | null | undefined): number | null {
+  return typeof ts === "number" && Number.isFinite(ts) && Math.abs(ts * 1000) <= MAX_EPOCH_MS ? ts : null;
+}
+const dayOf = (ts: number | null) => (ts === null ? null : new Date(ts * 1000).toISOString().slice(0, 10));
+
 // Match a caller-supplied kind either EXACTLY ("WRIST_ON(9)") or by its bare LABEL ("WRIST_ON"), so an
 // agent that never saw the "(opcode)" suffix can still filter. Deliberately substr/instr rather than
 // `kind LIKE ? || '('`: event labels are full of underscores (WRIST_ON, BLE_CONNECTION_UP) and `_` is a
@@ -81,17 +97,30 @@ export class Mirror {
   // deviceId-prefixed primary key), unioned in JS; `tables` records which of the four a source
   // actually appears in — rrInterval's presence there is how a caller learns which deviceIds carry
   // beat-to-beat R-R data (WHOOP-only; see hrv_series in src/tools/granular.ts).
+  // `latestTs` rides along on the timestamp-keyed tables at no extra cost, and is what
+  // data_freshness reports as `latestSampleAt`: the mirror's mtime says the FILE was written, which
+  // is a different claim from "new data arrived" — an apply that touches only bookkeeping pages
+  // moves one and not the other. Null for the day-keyed tables (dailyMetric, appleDaily), which
+  // carry no timestamp to take a MAX of.
+  //
+  // Taking `MAX(ts)` and formatting the day in JS, rather than `MAX(date(ts,'unixepoch'))`, is not a
+  // rewrite: `date()` is monotonic non-decreasing in `ts`, so the max commutes with it and the day
+  // is identical. It is also strictly cheaper — one conversion per GROUP rather than per ROW — and
+  // `.toISOString()` renders the same UTC calendar day SQLite's `date(…,'unixepoch')` does.
   sources() {
+    const tsRows = (sql: string) => (this.db.prepare(sql).all() as { deviceId: string; maxTs: number | null }[])
+      .map((r) => { const ts = representableTs(r.maxTs); return { deviceId: r.deviceId, maxDay: dayOf(ts), maxTs: ts }; });
     const dm = this.db.prepare(`SELECT deviceId, MAX(day) AS maxDay FROM dailyMetric GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[];
-    const ss = this.db.prepare(`SELECT deviceId, MAX(date(startTs, 'unixepoch')) AS maxDay FROM sleepSession GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[];
-    const hr = this.db.prepare(`SELECT deviceId, MAX(date(ts, 'unixepoch')) AS maxDay FROM hrSample GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[];
-    const rr = this.db.prepare(`SELECT deviceId, MAX(date(ts, 'unixepoch')) AS maxDay FROM rrInterval GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[];
-    const byDevice = new Map<string, { tables: Set<string>; latestDay: string | null }>();
-    const merge = (rows: { deviceId: string; maxDay: string | null }[], table: string) => {
+    const ss = tsRows(`SELECT deviceId, MAX(startTs) AS maxTs FROM sleepSession GROUP BY deviceId`);
+    const hr = tsRows(`SELECT deviceId, MAX(ts) AS maxTs FROM hrSample GROUP BY deviceId`);
+    const rr = tsRows(`SELECT deviceId, MAX(ts) AS maxTs FROM rrInterval GROUP BY deviceId`);
+    const byDevice = new Map<string, { tables: Set<string>; latestDay: string | null; latestTs: number | null }>();
+    const merge = (rows: { deviceId: string; maxDay: string | null; maxTs?: number | null }[], table: string) => {
       for (const r of rows) {
-        const e = byDevice.get(r.deviceId) ?? { tables: new Set<string>(), latestDay: null };
+        const e = byDevice.get(r.deviceId) ?? { tables: new Set<string>(), latestDay: null, latestTs: null };
         e.tables.add(table);
         if (r.maxDay && (!e.latestDay || r.maxDay > e.latestDay)) e.latestDay = r.maxDay;
+        if (r.maxTs != null && (e.latestTs === null || r.maxTs > e.latestTs)) e.latestTs = r.maxTs;
         byDevice.set(r.deviceId, e);
       }
     };
@@ -106,13 +135,13 @@ export class Mirror {
       ? this.db.prepare(`SELECT deviceId, MAX(day) AS maxDay FROM appleDaily GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[]
       : [];
     const ah = this.hasTable("appleStepHour")
-      ? this.db.prepare(`SELECT deviceId, MAX(date(ts, 'unixepoch')) AS maxDay FROM appleStepHour GROUP BY deviceId`).all() as { deviceId: string; maxDay: string | null }[]
+      ? tsRows(`SELECT deviceId, MAX(ts) AS maxTs FROM appleStepHour GROUP BY deviceId`)
       : [];
     merge(dm, "dailyMetric"); merge(ss, "sleepSession"); merge(hr, "hrSample"); merge(rr, "rrInterval");
     merge(ad, "appleDaily"); merge(ah, "appleStepHour");
     const brandById = new Map((this.db.prepare("SELECT id, brand FROM pairedDevice").all() as { id: string; brand: string | null }[]).map((b) => [b.id, b.brand]));
     return [...byDevice.entries()].sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([deviceId, e]) => ({ deviceId, family: sourceFamily(deviceId), brand: brandById.get(deviceId) ?? null, latestDay: e.latestDay, tables: [...e.tables].sort() }));
+      .map(([deviceId, e]) => ({ deviceId, family: sourceFamily(deviceId), brand: brandById.get(deviceId) ?? null, latestDay: e.latestDay, latestTs: e.latestTs, tables: [...e.tables].sort() }));
   }
   // PRAGMA-introspected dailyMetric columns minus the two identity columns — lets callers (and
   // data_freshness, see tools/core.ts) discover real column names instead of guessing (post-hoc
