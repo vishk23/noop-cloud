@@ -222,6 +222,23 @@ describe("the report names which path last wrote the mirror", () => {
     expect(r.lastReplicationAt).toBeNull();
   });
 
+  // Caught in production one minute after this fix deployed. The sink republishes `lastSyncAtMs: 0`
+  // until its FIRST apply of the process — documented behaviour, see statusAgeSeconds in
+  // src/liters/state.ts — so every deploy resets it. That made a mirror the applier had written 5.9 h
+  // earlier report `lastWriteSource: "ingest"` against a 2.1-day-old upload: a field stating
+  // something the two timestamps beside it flatly contradict, which is the exact defect class this
+  // whole change exists to remove. The stamps are hints; the mtime is the evidence.
+  it("attributes to replication after a sink restart has zeroed lastSyncAtMs", async () => {
+    await ingestPath();
+    backdateIngestLog(51);              // the last whole-DB upload, 2.1 days ago
+    litersApplyPath(Math.floor(Date.now() / 1000));
+    publishLitersStatus(0);             // a restarted, idle, perfectly healthy sink
+
+    const r: any = dataFreshness(cfg());
+    expect(r.lastWriteSource).toBe("replication");
+    expect(r.lastReplicationAt).toBeNull(); // honest: the sink has not applied in THIS process
+  });
+
   it("attributes a newer liters apply to replication, using the sink's own published status", async () => {
     await ingestPath();
     backdateIngestLog(30.8);

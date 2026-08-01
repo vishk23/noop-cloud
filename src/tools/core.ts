@@ -85,6 +85,20 @@ export function dataFreshness(cfg: Config) {
     // both of these are missing, which is the whole point of deriving freshness from ground truth.
     const litersSyncMs = cfg.liters?.enabled ? (readLitersStatus(cfg)?.lastSyncAtMs || null) : null;
     const ingestMs = li ? li.receivedAt * 1000 : null;
+    // The MTIME arbitrates which path wrote last — not the two stamps above.
+    //
+    // `/ingest` renames the mirror and appends its ingestLog row microseconds later, so its stamp is
+    // never meaningfully older than the mtime it produced. A mirror newer than that stamp was
+    // therefore written by something that is not `/ingest`. The tolerance absorbs that ordering gap
+    // and the whole-second truncation of `receivedAt`.
+    //
+    // Deriving this from `lastSyncAtMs` alone was wrong, and production said so a minute after this
+    // change deployed: the sink republishes `lastSyncAtMs: 0` until its first apply of the process,
+    // so a sidecar restart made a mirror the applier had written 5.9 h earlier report "ingest"
+    // against a 2.1-day-old upload. Same lesson as the bug this commit fixes, one level up — a
+    // marker that resets is not evidence, and the mtime is.
+    const mirrorMs = storage.mirrorUpdatedAt ? Date.parse(storage.mirrorUpdatedAt) : null;
+    const notWrittenByIngest = mirrorMs !== null && (ingestMs === null || mirrorMs > ingestMs + 60_000);
     return {
       storage,
       // From the mirror's own mtime (storageReport), NOT from `ingestLog`. The mirror has two
@@ -101,10 +115,12 @@ export function dataFreshness(cfg: Config) {
       lastIngestAt: ingestMs ? new Date(ingestMs).toISOString() : null,
       lastReplicationAt: litersSyncMs ? new Date(litersSyncMs).toISOString() : null,
       // Which path last wrote the mirror — the line whose absence made the production report look
-      // self-contradictory rather than merely two-sided. null when neither path has stamped itself.
-      lastWriteSource: litersSyncMs || ingestMs
-        ? ((litersSyncMs ?? 0) > (ingestMs ?? 0) ? "replication" : "ingest")
-        : null,
+      // self-contradictory rather than merely two-sided. "unknown" rather than a guess when the
+      // mirror demonstrably moved without `/ingest` on a server where replication is switched OFF:
+      // something wrote it and this server cannot say what, which is worth reporting as such.
+      lastWriteSource: (litersSyncMs ?? 0) > (ingestMs ?? 0) || notWrittenByIngest
+        ? (cfg.liters?.enabled ? "replication" : "unknown")
+        : (ingestMs ? "ingest" : null),
       latestSampleAt: latestTs != null ? new Date(latestTs * 1000).toISOString() : null,
       dataAgeSeconds: latestTs != null ? Math.max(0, Math.floor(nowMs / 1000 - latestTs)) : null,
       // The phone's IANA timezone as of the most recent upload (X-Phone-Timezone header). null when the
