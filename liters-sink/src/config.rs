@@ -6,6 +6,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::retention::Policy;
+
 pub struct Config {
     /// Where the pushed LTX bucket lives — a plain directory in litestream's `file` layout.
     pub bucket_dir: PathBuf,
@@ -28,6 +30,9 @@ pub struct Config {
     pub min_free_bytes: u64,
     /// A bucket `*.ltx.<pid>-<seq>.tmp` older than this is a crash corpse (see `sweep.rs`).
     pub tmp_sweep_age: Duration,
+    /// How much committed LTX history the bucket may hold. Distinct from `tmp_sweep_age` in every
+    /// way that matters — see `retention.rs` and the 2026-08-03 outage it documents.
+    pub retention: Policy,
     /// `PRAGMA quick_check` after a full restore. Cheap relative to a restore, and it is the only
     /// thing that distinguishes "restored" from "wrote 766 MB of plausible garbage".
     pub integrity_check: bool,
@@ -93,6 +98,13 @@ impl Config {
             lock_timeout: Duration::from_millis(env_u64("LITERS_LOCK_TIMEOUT_MS", 5_000)?),
             min_free_bytes: env_u64("LITERS_MIN_FREE_BYTES", 268_435_456)?,
             tmp_sweep_age: Duration::from_millis(env_u64("LITERS_TMP_SWEEP_AGE_MS", 3_600_000)?),
+            retention: Policy {
+                enabled: env_bool("LITERS_LTX_RETENTION", true),
+                keep: env_u64("LITERS_LTX_KEEP", Policy::default().keep)?,
+                max_bytes: env_u64("LITERS_LTX_MAX_BYTES", 0)?,
+                max_age: Duration::from_millis(env_u64("LITERS_LTX_MAX_AGE_MS", 0)?),
+                grace: Duration::from_millis(env_u64("LITERS_LTX_PRUNE_GRACE_MS", 60_000)?),
+            },
             integrity_check: env_bool("LITERS_INTEGRITY_CHECK", true),
             adopt_existing_mirror: env_bool("LITERS_ADOPT_EXISTING_MIRROR", true),
         })

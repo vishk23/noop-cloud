@@ -21,6 +21,13 @@
 //!
 //! Hence this module, and hence its age guard: a temp file whose mtime is seconds old belongs to a
 //! push happening right now, and unlinking it would corrupt a legitimate transfer.
+//!
+//! What this module is NOT is a size bound on the bucket. Committed `.ltx` files are replication
+//! history and are deliberately invisible to it — see the assertion in
+//! `matches_the_shapes_liters_actually_writes`, which is load-bearing and must stay. Bounding the
+//! committed bucket is [`crate::retention`]'s job, added after the 2026-08-03 outage in which this
+//! sweeper correctly reported `sweptTotal: 0` (there were zero corpses) while 7.8 GB of real
+//! segments filled the volume. The two counters stay separate in the status file for that reason.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -38,6 +45,14 @@ fn is_bucket_tmp(name: &str) -> bool {
 
 fn is_spool(name: &str) -> bool {
     name.starts_with("liters-http-") && name.ends_with(".spool")
+}
+
+/// Whether this sweeper claims `name` at all. Exposed so [`crate::retention`] can assert the two
+/// reclaim mechanisms partition the bucket rather than overlapping — the confusion that made
+/// `sweptTotal: 0` read as "cleanup found nothing wrong" on 2026-08-03.
+#[cfg(test)]
+pub(crate) fn is_reclaimable_corpse(name: &str) -> bool {
+    is_bucket_tmp(name) || is_spool(name)
 }
 
 fn sweep_dir(dir: &Path, older_than: Duration, matches: fn(&str) -> bool, out: &mut Swept) {

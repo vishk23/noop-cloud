@@ -36,6 +36,7 @@
 
 mod config;
 mod mirrorfix;
+mod retention;
 mod space;
 mod status;
 mod sweep;
@@ -169,6 +170,7 @@ impl Sink {
             space_ok: true,
             started_at_ms: now_ms(),
             min_free_bytes: cfg.min_free_bytes,
+            ltx_keep: cfg.retention.keep,
             ..Status::default()
         };
         Ok(Sink {
@@ -279,8 +281,6 @@ impl Sink {
     fn round(&mut self) -> bool {
         let max = bucket_max(self.client.as_ref());
         self.st.bucket_max = max;
-        self.st.free_bytes = space::free_bytes(&self.cfg.tmp_dir).unwrap_or(0);
-        self.st.bucket_bytes = dir_bytes(&self.cfg.bucket_dir);
         self.st.mirror_bytes = std::fs::metadata(&self.cfg.mirror_path)
             .map(|m| m.len())
             .unwrap_or(0);
@@ -305,6 +305,19 @@ impl Sink {
 
         let pos = self.replica.position().map(|t| t.0).unwrap_or(0);
         self.st.position = pos;
+
+        // RETENTION, and its placement is the whole point. It runs BEFORE the up-to-date check and
+        // BEFORE the preflight, on every round, unconditionally. On 2026-08-03 the preflight was the
+        // early return — `refusing apply: needs 665131152 …, 0 free`, 79,024 times — so anything
+        // downstream of it never executed and the process sat wedged against a full volume it was
+        // itself responsible for filling. A reclaim path reachable only on the healthy path is not a
+        // reclaim path. See retention.rs; `pos` is what makes it safe, so it is read first.
+        self.prune(Txid(pos));
+
+        // Measured AFTER retention, so the preflight and the status file describe the volume as it
+        // now is rather than as it was before this round reclaimed anything.
+        self.st.free_bytes = space::free_bytes(&self.cfg.tmp_dir).unwrap_or(0);
+        self.st.bucket_bytes = dir_bytes(&self.cfg.bucket_dir);
 
         if max <= pos && !adopted {
             self.st.ok = true;
@@ -471,6 +484,23 @@ impl Sink {
             return Err(format!("post-restore quick_check: {verdict}"));
         }
         Ok(())
+    }
+
+    /// Bound the committed bucket. Never fails and never logs a steady state, so a healthy machine
+    /// stays silent and a reclaim leaves exactly one legible line.
+    fn prune(&mut self, position: Txid) {
+        let p = retention::prune(self.client.as_ref(), position, &self.cfg.retention);
+        if p.removed > 0 {
+            self.st.pruned_total += p.removed;
+            self.st.pruned_bytes_total += p.bytes;
+            log(
+                "pruned",
+                &format!(
+                    "{} committed LTX segment(s) below position {}, reclaimed {} bytes (keep={})",
+                    p.removed, position.0, p.bytes, self.cfg.retention.keep
+                ),
+            );
+        }
     }
 
     fn sweep(&mut self) {

@@ -31,9 +31,19 @@ pub struct Status {
     pub mirror_bytes: u64,
     /// Last preflight verdict. False = an apply is pending but the volume cannot hold it.
     pub space_ok: bool,
+    /// Crash corpses reclaimed by `sweep.rs` — `.ltx.<pid>-<seq>.tmp` and orphaned spools ONLY.
     pub swept_total: u64,
+    /// Committed LTX segments dropped by `retention.rs`. Deliberately a second counter rather than a
+    /// bigger `swept_total`: on 2026-08-03 the bucket held 7.8 GB of real segments and zero corpses,
+    /// so a truthful `sweptTotal: 0` read as "cleanup ran and found nothing wrong". One number
+    /// answering two questions is how that happens.
+    pub pruned_total: u64,
+    pub pruned_bytes_total: u64,
     pub started_at_ms: u64,
     pub min_free_bytes: u64,
+    /// Committed segments retained per level. Published so the active policy is visible next to the
+    /// bucket size it is meant to bound, rather than only in the deploy's environment.
+    pub ltx_keep: u64,
 }
 
 fn escape(s: &str) -> String {
@@ -65,7 +75,8 @@ impl Status {
                 "{{\"ok\":{},\"position\":{},\"bucketMax\":{},\"lastSyncAtMs\":{},",
                 "\"lastError\":{},\"lockBusy\":{},\"applies\":{},\"lockBusyTotal\":{},",
                 "\"errorsTotal\":{},\"freeBytes\":{},\"bucketBytes\":{},\"mirrorBytes\":{},",
-                "\"spaceOk\":{},\"sweptTotal\":{},\"startedAtMs\":{},\"minFreeBytes\":{}}}"
+                "\"spaceOk\":{},\"sweptTotal\":{},\"prunedTotal\":{},\"prunedBytesTotal\":{},",
+                "\"startedAtMs\":{},\"minFreeBytes\":{},\"ltxKeep\":{}}}"
             ),
             self.ok,
             self.position,
@@ -81,8 +92,11 @@ impl Status {
             self.mirror_bytes,
             self.space_ok,
             self.swept_total,
+            self.pruned_total,
+            self.pruned_bytes_total,
             self.started_at_ms,
             self.min_free_bytes,
+            self.ltx_keep,
         )
     }
 
@@ -124,6 +138,25 @@ mod tests {
             !j.contains('\n'),
             "raw newlines would break a JSON line reader: {j}"
         );
+    }
+
+    /// The two reclaim mechanisms report separately. `sweptTotal: 0` alongside `prunedTotal: 24` is
+    /// the reading that was unavailable on 2026-08-03, when one counter had to answer both "were
+    /// there crash corpses?" and "is the bucket bounded?".
+    #[test]
+    fn swept_and_pruned_are_separate_fields() {
+        let j = Status {
+            swept_total: 0,
+            pruned_total: 24,
+            pruned_bytes_total: 6_700_000_000,
+            ltx_keep: 3,
+            ..Status::default()
+        }
+        .to_json();
+        assert!(j.contains("\"sweptTotal\":0"), "{j}");
+        assert!(j.contains("\"prunedTotal\":24"), "{j}");
+        assert!(j.contains("\"prunedBytesTotal\":6700000000"), "{j}");
+        assert!(j.contains("\"ltxKeep\":3"), "{j}");
     }
 
     #[test]

@@ -87,7 +87,17 @@ impl Layout {
     // returned struct. The panic path below drops nothing only because it aborts the test process.
     #[allow(clippy::zombie_processes)]
     fn serve(&self, token: &str) -> Sink {
-        let mut child = self.command(token).spawn().unwrap();
+        self.serve_with(token, &[])
+    }
+
+    /// [`Layout::serve`] with extra environment, for tests that drive a non-default policy.
+    #[allow(clippy::zombie_processes)]
+    fn serve_with(&self, token: &str, extra: &[(&str, &str)]) -> Sink {
+        let mut cmd = self.command(token);
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         {
@@ -213,6 +223,21 @@ fn wait_for_round(status_path: &Path, min_position: u64) {
         || status_field(status_path, "position").is_some_and(|p| p >= min_position),
         "a completed apply round",
     );
+}
+
+/// Committed level-0 segments, ascending — the files retention is allowed to have an opinion about.
+fn l0_txids(bucket: &Path) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(bucket.join("ltx").join("0")) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some((_, max)) = ltx::parse_filename(&name) {
+                out.push(max.0);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
 }
 
 fn bucket_tmp_files(bucket: &Path) -> Vec<String> {
@@ -566,4 +591,136 @@ fn refuses_to_start_without_a_usable_token() {
         let out = l.apply_once(bad);
         assert_eq!(out.status.code(), Some(2), "token {bad:?} must be refused");
     }
+}
+
+/// The 2026-08-03 outage, prevented end to end.
+///
+/// Eight pushes against a bucket nothing prunes is what took `/data/ltx-bucket` to 7.8 GB across 27
+/// segments and the volume to zero. With retention on, the sink drops applied history down to the
+/// configured window while the round is running — and then, which is the part worth pinning, the
+/// SAME `Writer` keeps pushing into the pruned bucket.
+///
+/// That last assertion is the production risk, not a formality. The phone's
+/// `Writer::ensure_lineage_checked` compares the bucket's max L0 TXID against its own verified
+/// position, so a pruner that took the head would present as a foreign writer and force a
+/// rebaseline — a fresh full-database snapshot push, i.e. the 967 MB upload delta sync exists to
+/// avoid, triggered by the mechanism meant to save disk. This test fails if that invariant is ever
+/// relaxed.
+#[test]
+fn retention_bounds_the_bucket_without_breaking_the_pusher() {
+    let l = Layout::new();
+    let conn = create_source(&l.source());
+    // keep=2 with no grace: a deterministic window, reached within one test rather than one day.
+    let sink = l.serve_with(TOKEN, &[("LITERS_LTX_KEEP", "2"), ("LITERS_LTX_PRUNE_GRACE_MS", "0")]);
+    let mut w = writer_for(&sink, &l.source(), Some(TOKEN)).unwrap();
+
+    let mut last = 0u64;
+    for i in 0..8 {
+        insert(&conn, &format!("batch{i}"), 20);
+        last = w.push().unwrap().txid.0;
+        wait_for_round(&l.status(), last);
+    }
+    assert!(last >= 8, "expected one L0 file per push, got up to {last}");
+
+    // The newest two, the head among them: eight pushes, a bounded bucket.
+    wait_for(
+        || l0_txids(&l.bucket()).len() <= 2,
+        "retention to bound the bucket",
+    );
+    let kept = l0_txids(&l.bucket());
+    assert_eq!(
+        kept,
+        vec![last - 1, last],
+        "retention must keep a contiguous newest window, not an arbitrary subset"
+    );
+    assert!(
+        status_field(&l.status(), "prunedTotal").unwrap() >= 5,
+        "prunedTotal must count what left the volume"
+    );
+    assert_eq!(
+        status_field(&l.status(), "sweptTotal").unwrap(),
+        0,
+        "no crash corpses existed; the corpse sweeper must not claim retention's work"
+    );
+
+    // The mirror is whole, and the pusher is undisturbed by the bucket having shrunk underneath it.
+    assert_eq!(rows(&l.mirror()), rows(&l.source()));
+    insert(&conn, "after-prune", 20);
+    let r = w.push().unwrap();
+    assert_eq!(
+        r.uploaded, 1,
+        "a rebaseline would re-upload the whole database instead of one delta"
+    );
+    wait_for_round(&l.status(), r.txid.0);
+    assert_eq!(rows(&l.mirror()), rows(&l.source()));
+}
+
+/// The other half of the invariant: an unapplied segment is never a candidate, whatever the policy
+/// says. With the mirror deleted the position is zero, so the entire chain is what a full restore
+/// would plan across — retention must take nothing and the restore must still succeed.
+#[test]
+fn retention_never_touches_what_the_mirror_has_not_applied() {
+    let l = Layout::new();
+    let conn = create_source(&l.source());
+    {
+        let sink = l.serve(TOKEN);
+        let mut w = writer_for(&sink, &l.source(), Some(TOKEN)).unwrap();
+        for i in 0..5 {
+            insert(&conn, &format!("b{i}"), 10);
+            let r = w.push().unwrap();
+            wait_for_round(&l.status(), r.txid.0);
+        }
+    }
+    let before = l0_txids(&l.bucket());
+    assert!(before.len() >= 5);
+
+    // Position 0, and a policy that would otherwise strip the bucket to its head.
+    std::fs::remove_file(l.mirror()).unwrap();
+    let out = l
+        .command(TOKEN)
+        .arg("--apply-once")
+        .env("LITERS_LTX_KEEP", "0")
+        .env("LITERS_LTX_PRUNE_GRACE_MS", "0")
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+
+    assert_eq!(
+        l0_txids(&l.bucket()),
+        before,
+        "an unapplied chain must survive intact"
+    );
+    let json = String::from_utf8_lossy(&out.stdout);
+    assert!(json.contains("\"prunedTotal\":0"), "{json}");
+    assert_eq!(rows(&l.mirror()).len(), 50, "the restore must still be possible");
+}
+
+/// The kill switch, proven off rather than assumed off.
+#[test]
+fn retention_can_be_turned_off_entirely() {
+    let l = Layout::new();
+    let conn = create_source(&l.source());
+    let sink = l.serve_with(
+        TOKEN,
+        &[
+            ("LITERS_LTX_RETENTION", "0"),
+            ("LITERS_LTX_KEEP", "1"),
+            ("LITERS_LTX_PRUNE_GRACE_MS", "0"),
+        ],
+    );
+    let mut w = writer_for(&sink, &l.source(), Some(TOKEN)).unwrap();
+
+    let mut last = 0u64;
+    for i in 0..5 {
+        insert(&conn, &format!("b{i}"), 10);
+        last = w.push().unwrap().txid.0;
+        wait_for_round(&l.status(), last);
+    }
+    assert_eq!(
+        l0_txids(&l.bucket()).len(),
+        last as usize,
+        "with retention off the bucket must keep every segment"
+    );
+    assert_eq!(status_field(&l.status(), "prunedTotal").unwrap(), 0);
 }
