@@ -184,7 +184,13 @@ describe("liters sink supervisor", () => {
 
     const c = cfg({ minFreeBytes: 123456789 });
     const h = startLitersSink({ ...c, liters: { ...c.liters, binPath: envDump } } as any)!;
-    await new Promise((r) => setTimeout(r, 400));
+    // Poll rather than sleep a fixed 400ms: under a fully loaded suite the fake sink may not have
+    // written its env dump yet, and reading it early fails on an empty file.
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      try { if (fs.statSync(out).size > 0) break; } catch { /* not written yet */ }
+      await new Promise((r) => setTimeout(r, 50));
+    }
     h.stop();
 
     const env = fs.readFileSync(out, "utf8");
