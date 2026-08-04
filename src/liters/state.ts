@@ -25,9 +25,19 @@ export interface LitersStatus {
   bucketBytes: number;
   mirrorBytes: number;
   spaceOk: boolean;
+  /** Crash corpses reclaimed: `.ltx.<pid>-<seq>.tmp` and orphaned spools ONLY (liters-sink/src/sweep.rs). */
   sweptTotal: number;
+  /**
+   * Committed LTX segments dropped by retention (liters-sink/src/retention.rs). Separate from
+   * `sweptTotal` on purpose: during the 2026-08-03 full-volume outage the bucket held 7.8 GB of real
+   * segments and zero corpses, so a truthful `sweptTotal: 0` read as "cleanup found nothing wrong".
+   */
+  prunedTotal: number;
+  prunedBytesTotal: number;
   startedAtMs: number;
   minFreeBytes: number;
+  /** Committed segments the sink retains per level. `bucketBytes` should stay near this many. */
+  ltxKeep: number;
 }
 
 export type LitersCfg = Pick<Config, "liters" | "mirrorPath">;

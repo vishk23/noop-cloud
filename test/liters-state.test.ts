@@ -123,9 +123,14 @@ describe("liters status file", () => {
     fs.writeFileSync(statusPath, JSON.stringify({
       ok: true, position: 42, bucketMax: 42, lastSyncAtMs: 1, lastError: null, lockBusy: false,
       applies: 7, lockBusyTotal: 0, errorsTotal: 0, freeBytes: 1, bucketBytes: 2, mirrorBytes: 3,
-      spaceOk: true, sweptTotal: 0, startedAtMs: 1, minFreeBytes: 4,
+      spaceOk: true, sweptTotal: 0, prunedTotal: 24, prunedBytesTotal: 6_700_000_000,
+      startedAtMs: 1, minFreeBytes: 4, ltxKeep: 3,
     }));
     expect(readStatus(cfg())?.position).toBe(42);
+    // The two reclaim counters stay distinct all the way out to /status. `sweptTotal: 0` next to a
+    // non-zero `prunedTotal` is the reading that was unavailable during the 2026-08-03 outage.
+    expect(readStatus(cfg())?.sweptTotal).toBe(0);
+    expect(readStatus(cfg())?.prunedTotal).toBe(24);
   });
 
   it("treats a missing or torn status file as 'no status', never as a throw", () => {
